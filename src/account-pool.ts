@@ -182,20 +182,33 @@ export class AccountPool {
     const now = Date.now();
     const live = this.accounts.filter((a) => a.enabled && !a.error && !excluded.has(a.id));
     const resets: Array<{ at: number; label: string }> = [];
-    let fableSpent = 0; let overLimit = 0; let coolingDown = 0;
+    let fableSpent = 0; let overLimit = 0; let coolingDown = 0; let benched = 0;
+    const benches: number[] = [];
     for (const account of live) {
       const fable = AccountPool.fableWindow(account);
       if (wantsFable && AccountPool.fableSpent(account, 1)) { fableSpent++; if (fable?.resetsAt) resets.push({ at: fable.resetsAt, label: `${account.label} Fable weekly` }); continue; }
       if (account.usage !== null && account.usage >= 1) { overLimit++; if (account.resetsAt) resets.push({ at: account.resetsAt, label: `${account.label} session` }); continue; }
-      if (account.cooldownUntil && account.cooldownUntil > now) { coolingDown++; resets.push({ at: account.cooldownUntil, label: `${account.label} cooldown` }); }
+      if (account.cooldownUntil && account.cooldownUntil > now) {
+        // A network bench is not a rejection: one connection attempt failed
+        // and the account is back in seconds. Counted apart, so the client is
+        // told to wait rather than that its budget is gone — that wording sent
+        // Codex (which does not retry a 429 under the relay) home for nothing.
+        if (account.cooldownReason === 'network') { benched++; benches.push(account.cooldownUntil); continue; }
+        coolingDown++; resets.push({ at: account.cooldownUntil, label: `${account.label} cooldown` });
+      }
     }
-    const next = resets.filter((r) => r.at > now).sort((a, b) => a.at - b.at)[0];
     const parts: string[] = [];
+    if (benched) parts.push(`${benched} paused after a connection failure`);
     if (fableSpent) parts.push(`${fableSpent} spent the Fable weekly budget`);
     if (overLimit) parts.push(`${overLimit} used up the session window`);
     if (coolingDown) parts.push(`${coolingDown} cooling down after an upstream rejection`);
-    const what = wantsFable ? `No ${label} account can serve Fable right now` : `No ${label} account has budget left`;
     const detail = parts.length ? ` (${live.length} accounts: ${parts.join(', ')})` : ` (${live.length} accounts)`;
+    if (benched) {
+      const retryAfterMs = Math.max(1, Math.min(...benches) - now);
+      return { reason: 'upstream_unreachable', retryAfterMs, message: `No ${label} account is reachable right now${detail}. Retry in ${Math.ceil(retryAfterMs / 1000)}s.` };
+    }
+    const next = resets.filter((r) => r.at > now).sort((a, b) => a.at - b.at)[0];
+    const what = wantsFable ? `No ${label} account can serve Fable right now` : `No ${label} account has budget left`;
     const when = next ? ` Earliest reset in ${AccountPool.formatDuration(next.at - now)}: ${next.label}.` : '';
     const hint = wantsFable && fableSpent ? ' Other models are still served: switch model or wait.' : '';
     return { reason: 'quota_exhausted', retryAfterMs: next ? next.at - now : null, message: `${what}${detail}.${when}${hint}` };

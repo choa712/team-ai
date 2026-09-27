@@ -19,3 +19,17 @@ test('stores credentials separately with restrictive permissions and deduplicate
   const bulk = await storage.loadConfig(); assert.equal(bulk.accounts.length, 2); assert.equal(bulk.accounts[0]?.label, 'renamed-again');
   delete process.env.TEAMAI_HOME;
 });
+
+test('the activity log appends, and rotates once a write would carry it past its cap', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-log-'));
+  const storage = await import(`../src/storage.js?log=${Date.now()}`);
+  const path = join(root, 'events.log');
+  await storage.appendLog(path, ['one', 'two'], 40);
+  assert.equal(await readFile(path, 'utf8'), 'one\ntwo\n');
+  await storage.appendLog(path, ['three'], 40);
+  assert.equal(await readFile(path, 'utf8'), 'one\ntwo\nthree\n');
+  await storage.appendLog(path, ['a much longer line that carries the file past the cap'], 40);
+  assert.equal(await readFile(path, 'utf8'), 'a much longer line that carries the file past the cap\n');
+  assert.equal(await readFile(`${path}.1`, 'utf8'), 'one\ntwo\nthree\n', 'the previous file is kept as .1');
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+});
