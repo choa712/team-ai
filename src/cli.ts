@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, open, readFile, writeFile, lstat, symlink } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, rm, writeFile, lstat, symlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { importAuth, loginClaude, loginCodex } from './auth.js';
 import { captureDashboard } from './capture.js';
+import { pullAccounts, pushAccounts } from './cloud-fleet.js';
+import { DEFAULT_CLOUD_URL, linkFromTeamClaude, loadCloudLink, maskKey, saveCloudLink } from './cloud-sync.js';
 import { bindCodexApp, codexAppStatus, unbindCodexApp } from './codex-app.js';
 import { relayedCodexConfig } from './codex-config.js';
 import { isRedactLevel } from './redact.js';
@@ -36,6 +38,7 @@ async function main(): Promise<void> {
       break;
     }
     case 'accounts': await accounts(args[0] ? provider(args[0]) : undefined); break;
+    case 'cloud': await cloudCommand(args[0]); break;
     case 'enable': await toggle(true); break;
     case 'disable': await toggle(false); break;
     case 'priority': await priority(); break;
@@ -92,6 +95,42 @@ async function stop(quiet = false): Promise<void> {
   process.kill(pid, 'SIGTERM');
   for (let i = 0; i < 30 && await recordedServerPid(); i++) await new Promise((r) => setTimeout(r, 100));
   if (!quiet) console.log(await recordedSupervisorPid() ? `Stopped TeamAI server ${pid}; the active supervisor will replace it` : `Stopped TeamAI server ${pid}`);
+}
+
+// TeamClaude Cloud as an account registry: pull and push accounts and tokens.
+// Refreshing and switching stay with this relay (see cloud-sync.ts).
+async function readStdin(): Promise<string> { const chunks: Buffer[] = []; for await (const chunk of process.stdin) chunks.push(chunk as Buffer); return Buffer.concat(chunks).toString('utf8').trim(); }
+async function requireLink(): Promise<NonNullable<Awaited<ReturnType<typeof loadCloudLink>>>> { const link = await loadCloudLink(); if (!link) throw new Error('No cloud key linked. Run "teamai cloud link --from-teamclaude [PATH]" or "teamai cloud link --key-stdin"'); return link; }
+// The running relay reads the link at startup; under a supervisor a stop is a restart.
+async function reloadServer(reason: string): Promise<void> {
+  if (!await recordedServerPid()) return;
+  if (await recordedSupervisorPid()) { await stop(true); console.log(`Restarted the TeamAI server to ${reason}`); }
+  else console.log(`Restart the TeamAI server ("teamai restart") to ${reason}`);
+}
+async function cloudCommand(action = 'status'): Promise<void> {
+  if (action === 'link') {
+    const url = flag('--url') ?? DEFAULT_CLOUD_URL;
+    const link = hasFlag('--key-stdin') ? { url, key: await readStdin() } : await linkFromTeamClaude(flag('--from-teamclaude') ?? '~/.config/teamclaude.json');
+    if (!link.key) throw new Error('Empty cloud key');
+    await saveCloudLink(link); console.log(`Linked TeamClaude Cloud ${link.url} (key ${maskKey(link.key)})`);
+    await reloadServer('start syncing tokens with the cloud'); return;
+  }
+  if (action === 'unlink') { await rm(join(dataDir(), 'cloud.json'), { force: true }); console.log('Unlinked TeamClaude Cloud'); await reloadServer('stop syncing tokens with the cloud'); return; }
+  if (action === 'status') {
+    const link = await loadCloudLink();
+    console.log(link ? `TeamClaude Cloud: ${link.url} (key ${maskKey(link.key)}${process.env.TEAMAI_CLOUD_KEY ? ', from TEAMAI_CLOUD_KEY' : ''})` : 'TeamClaude Cloud: not linked');
+    return;
+  }
+  if (action === 'pull') {
+    const result = await pullAccounts(await requireLink());
+    for (const label of result.added) console.log(`Added claude account: ${label}`);
+    for (const label of result.updated) console.log(`Took newer cloud token: ${label}`);
+    console.log(`Cloud pull: ${result.added.length} added, ${result.updated.length} updated, ${result.unchanged} already current${result.tokenless ? `, ${result.tokenless} without a token skipped` : ''}`);
+    if (result.added.length) await reloadServer('load the added accounts');
+    return;
+  }
+  if (action === 'push') { console.log(`Cloud push: sent ${await pushAccounts(await requireLink())} claude account(s); the cloud keeps the newer token per account`); return; }
+  throw new Error('cloud action must be link, unlink, status, pull or push');
 }
 
 async function codexApp(action = 'status'): Promise<void> {
@@ -178,6 +217,9 @@ Usage:
   teamai accounts [claude|codex]
   teamai start|restart|status|stop|supervise
   teamai codex-app bind|unbind|status
+  teamai cloud link [--from-teamclaude PATH | --key-stdin] [--url URL]
+  teamai cloud pull|push|status|unlink  Share accounts via TeamClaude Cloud;
+                                       refresh and switching stay in TeamAI
   teamai enable|disable <provider> <account>
   teamai priority <provider> <account> <rank|auto>
   teamai capture [--redact partial|full|none] [--out DIR]

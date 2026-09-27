@@ -13,6 +13,10 @@ export class AccountPool {
   readonly maxWarmupTries = 3;
   private refreshes = new Map<string, Promise<void>>();
   private sweepInFlight = false;
+  // Replaces a plain rotation when the accounts are shared with other machines
+  // (see cloud-sync.ts): the hook decides whether to rotate at all and publishes
+  // what it rotated. Null keeps the local-only behaviour.
+  refreshVia: ((account: RuntimeAccount, rotate: (credential: OAuthCredential) => Promise<OAuthCredential>) => Promise<OAuthCredential>) | null = null;
 
   // Accounts still holding Fable budget are kept for Fable. An account measured
   // below this line reserves its remainder; at or above it, it is the preferred
@@ -344,7 +348,9 @@ export class AccountPool {
     if (!force && account.credential.expiresAt && account.credential.expiresAt > Date.now() + 5 * 60_000) return;
     const existing = this.refreshes.get(account.id);
     if (existing) return existing;
-    const promise = this.provider.refresh(account.credential).then((next) => { account.credential = next; account.error = null; }).finally(() => this.refreshes.delete(account.id));
+    const rotate = (credential: OAuthCredential): Promise<OAuthCredential> => this.provider.refresh(credential);
+    const work = this.refreshVia ? this.refreshVia(account, rotate) : rotate(account.credential);
+    const promise = work.then((next) => { account.credential = next; account.error = null; }).finally(() => this.refreshes.delete(account.id));
     this.refreshes.set(account.id, promise);
     return promise;
   }

@@ -58,6 +58,13 @@ this to the user rather than attempting it:
 teamai login      # prompts: [1] Claude  [2] Codex
 ```
 
+Linking a cloud key is non-interactive and never needs the key on the command line:
+
+```bash
+teamai cloud link --from-teamclaude ~/.config/teamclaude.json
+teamai cloud pull
+```
+
 Import is non-interactive, but only works when an exportable credential file
 exists (recent Claude Code versions use the macOS Keychain instead):
 
@@ -81,6 +88,7 @@ teamai server                             # run relay in the foreground (for a s
 teamai supervise                          # run relay with authenticated health recovery
 teamai tui                                # dashboard only (needs a TTY)
 teamai codex-app bind|unbind|status       # manage Codex App routing
+teamai cloud pull|push|status|unlink       # share accounts via TeamClaude Cloud
 teamai enable  <claude|codex> <account>
 teamai disable <claude|codex> <account>
 teamai priority <claude|codex> <account> <rank|auto>
@@ -145,6 +153,8 @@ before speculating; a port conflict is the common cause.
 | `src/storage.ts` | Config/state persistence, paths |
 | `src/auth.ts` | Login and credential import |
 | `src/codex-app.ts` | Reversible Codex App config binding |
+| `src/cloud-sync.ts` | TeamClaude Cloud client and the refresh coordinator (adopt newer, publish after rotating, recover a refused refresh) |
+| `src/cloud-fleet.ts` | Periodic token sync, `teamai cloud pull` / `push` |
 | `src/supervisor.ts` | Health-based relay process supervision |
 | `test/` | `node --test` suites |
 

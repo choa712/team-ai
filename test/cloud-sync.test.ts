@@ -1,0 +1,160 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtemp, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { AccountPool } from '../src/account-pool.js';
+import { assertSecureUrl, CloudClient, CloudCoordinator, normalizeExpiry, type CloudAccount } from '../src/cloud-sync.js';
+import { syncFromCloud } from '../src/cloud-fleet.js';
+import type { OAuthCredential, Provider, StoredAccount } from '../src/types.js';
+
+const NOW = 1_000_000_000_000;
+const HOUR = 60 * 60_000;
+const cred = (access: string, refresh: string, expiresAt: number, accountId = 'acc'): OAuthCredential => ({ accessToken: access, refreshToken: refresh, expiresAt, accountId });
+const remote = (access: string | null, refresh: string | null, expiresAt: number, accountUuid = 'acc'): CloudAccount => ({ accountUuid, name: accountUuid, accessToken: access, refreshToken: refresh, expiresAt });
+
+// A fake cloud holding one list; push applies freshest-token-wins like the real one.
+function fakeCloud(initial: CloudAccount[], opts: { pullFails?: boolean; pushFails?: number } = {}) {
+  let accounts = [...initial]; let pushFailures = opts.pushFails ?? 0; const pushes: OAuthCredential[] = []; let pulls = 0;
+  return {
+    pushes, get pulls() { return pulls; }, set(list: CloudAccount[]) { accounts = [...list]; },
+    async pull() { pulls++; if (opts.pullFails) throw new Error('Cloud pull failed (503)'); return accounts.map((a) => ({ ...a })); },
+    async push(list: Array<{ label: string; credential: OAuthCredential }>) {
+      if (pushFailures > 0) { pushFailures--; throw new Error('Cloud push failed (503)'); }
+      for (const { credential } of list) {
+        pushes.push(credential);
+        const held = accounts.find((a) => a.accountUuid === credential.accountId);
+        if (!held) accounts.push(remote(credential.accessToken, credential.refreshToken, credential.expiresAt ?? 0, credential.accountId));
+        else if ((credential.expiresAt ?? 0) > held.expiresAt) Object.assign(held, { accessToken: credential.accessToken, refreshToken: credential.refreshToken, expiresAt: credential.expiresAt ?? 0 });
+      }
+    },
+  };
+}
+const refused = () => Promise.reject(new Error('OAuth refresh failed (400)'));
+
+test('adopts a newer token another machine published instead of rotating', async () => {
+  const cloud = fakeCloud([remote('a2', 'r2', NOW + 8 * HOUR)]);
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
+  let rotations = 0;
+  const next = await coordinator.refresh('acc', cred('a1', 'r1', NOW + 60_000), async (c) => { rotations++; return c; });
+  assert.equal(rotations, 0);
+  assert.deepEqual([next.accessToken, next.refreshToken, next.expiresAt], ['a2', 'r2', NOW + 8 * HOUR]);
+  assert.equal(cloud.pushes.length, 0);
+});
+
+test('rotates when the cloud is not newer and publishes the new pair', async () => {
+  const cloud = fakeCloud([remote('a1', 'r1', NOW + 60_000)]);
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
+  const next = await coordinator.refresh('acc', cred('a1', 'r1', NOW + 60_000), async (c) => ({ ...c, accessToken: 'a2', refreshToken: 'r2', expiresAt: NOW + 8 * HOUR }));
+  assert.equal(next.refreshToken, 'r2');
+  assert.equal(cloud.pushes.at(-1)?.refreshToken, 'r2');
+});
+
+test('continues from the cloud chain when its access token lapsed but its refresh token is newer', async () => {
+  const cloud = fakeCloud([remote('a2', 'r2', NOW + 60_000)]);
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
+  let used = '';
+  await coordinator.refresh('acc', cred('a1', 'r1', NOW - HOUR), async (c) => { used = c.refreshToken!; return { ...c, accessToken: 'a3', refreshToken: 'r3', expiresAt: NOW + 8 * HOUR }; });
+  assert.equal(used, 'r2', 'must rotate the chain the cloud holds, not the spent local one');
+});
+
+test('a refused refresh recovers from the pair the winner published', async () => {
+  const cloud = fakeCloud([remote('a1', 'r1', NOW - HOUR)]);
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
+  const next = await coordinator.refresh('acc', cred('a1', 'r1', NOW - HOUR), async () => {
+    // Another machine rotates and publishes while this refresh is in flight.
+    cloud.set([remote('a2', 'r2', NOW + 8 * HOUR)]);
+    return refused();
+  });
+  assert.deepEqual([next.accessToken, next.refreshToken], ['a2', 'r2']);
+});
+
+test('a refused refresh with nothing newer in the cloud still fails', async () => {
+  const cloud = fakeCloud([remote('a1', 'r1', NOW - HOUR)]);
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
+  await assert.rejects(coordinator.refresh('acc', cred('a1', 'r1', NOW - HOUR), refused), /OAuth refresh failed \(400\)/);
+});
+
+test('transport errors are not treated as a moved chain', async () => {
+  const cloud = fakeCloud([remote('a2', 'r2', NOW - 1)]);
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
+  const before = cloud.pulls;
+  await assert.rejects(coordinator.refresh('acc', cred('a1', 'r1', NOW - HOUR), () => Promise.reject(new Error('OAuth refresh failed (503)'))), /503/);
+  assert.equal(cloud.pulls - before, 1, 'only the pre-refresh read, no recovery pull');
+});
+
+test('an unreachable cloud never blocks a local refresh, and the pair is published later', async () => {
+  const cloud = fakeCloud([remote('a1', 'r1', NOW)], { pushFails: 1 });
+  const logs: string[] = [];
+  const coordinator = new CloudCoordinator(cloud, (m) => logs.push(m), 20_000, () => NOW);
+  const next = await coordinator.refresh('acc', cred('a1', 'r1', NOW), async (c) => ({ ...c, refreshToken: 'r2', expiresAt: NOW + 8 * HOUR }));
+  assert.equal(next.refreshToken, 'r2');
+  assert.equal(coordinator.unpublished.size, 1);
+  assert.ok(logs.some((m) => m.includes('deferred')));
+  assert.equal(await coordinator.retryUnpublished(), 1);
+  assert.equal(coordinator.unpublished.size, 0);
+  const down = new CloudCoordinator(fakeCloud([], { pullFails: true }), () => {}, 20_000, () => NOW);
+  assert.equal((await down.refresh('acc', cred('a1', 'r1', NOW), async (c) => ({ ...c, refreshToken: 'r9' }))).refreshToken, 'r9');
+});
+
+const provider: Provider = {
+  id: 'claude', label: 'Claude', upstreamBase: 'https://example.test', normalizePath: (p) => p,
+  buildHeaders: (h) => h, rewriteBody: (b) => b, readQuota: () => null,
+  classifyFailure: () => ({ kind: 'fatal', retryAfterMs: 0 }), refresh: async (c) => ({ ...c, refreshToken: 'local' }),
+};
+const stored = (id: string): StoredAccount => ({ id, provider: 'claude', label: id, enabled: true, priority: null, credentialId: `claude:${id}`, createdAt: new Date().toISOString() });
+
+test('the pool routes refreshes through the hook when one is set', async () => {
+  const pool = new AccountPool(provider, [stored('acc')], { 'claude:acc': cred('a1', 'r1', 0) }, { version: 1, accounts: {} });
+  pool.refreshVia = async (account, rotate) => ({ ...(await rotate(account.credential)), accessToken: 'via-hook' });
+  await pool.refresh(pool.accounts[0]!, true);
+  assert.deepEqual([pool.accounts[0]!.credential.accessToken, pool.accounts[0]!.credential.refreshToken], ['via-hook', 'local']);
+});
+
+test('periodic sync adopts newer tokens, heals the account, and republishes only known accounts', async () => {
+  const later = Date.now() + 8 * HOUR;
+  const pool = new AccountPool(provider, [stored('dead'), stored('ahead'), stored('local-only')], {
+    'claude:dead': cred('d1', 'dr1', Date.now() - HOUR, 'dead'),
+    'claude:ahead': cred('h2', 'hr2', later, 'ahead'),
+    'claude:local-only': cred('l1', 'lr1', later, 'local-only'),
+  }, { version: 1, accounts: {} });
+  pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (400)';
+  const cloud = fakeCloud([remote('d2', 'dr2', later, 'dead'), remote('h1', 'hr1', Date.now(), 'ahead')]);
+  const result = await syncFromCloud(new CloudCoordinator(cloud), pool);
+  assert.deepEqual(result, { adopted: 1, published: 1 });
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'dr2');
+  assert.equal(pool.accounts[0]!.error, null);
+  assert.deepEqual(cloud.pushes.map((c) => c.accountId), ['ahead']);
+});
+
+test('the cloud client parses pulls, sends the key only as a header, and refuses plain http', async () => {
+  const calls: Array<{ url: string; headers: Record<string, string>; body?: string }> = [];
+  const client = new CloudClient({ url: 'https://cloud.example', key: 'k-secret' }, async (url, init) => {
+    calls.push({ url, headers: init.headers, body: init.body });
+    return { ok: true, status: 200, json: async () => ({ accounts: [{ accountUuid: 'u1', name: 'one', accessToken: 'a', refreshToken: 'r', expiresAt: 1_700_000_000 }, { name: 'no-uuid' }] }) };
+  });
+  const list = await client.pull();
+  assert.deepEqual(list, [{ accountUuid: 'u1', name: 'one', accessToken: 'a', refreshToken: 'r', expiresAt: 1_700_000_000_000 }]);
+  assert.equal(calls[0]!.url, 'https://cloud.example/functions/v1/cloud/sync/pull');
+  assert.equal(calls[0]!.headers['x-teamclaude-key'], 'k-secret');
+  assert.equal(calls[0]!.url.includes('k-secret'), false);
+  assert.throws(() => assertSecureUrl('http://cloud.example'), /Refusing/);
+  assert.doesNotThrow(() => assertSecureUrl('http://127.0.0.1:9999'));
+  assert.equal(normalizeExpiry('x'), 0);
+});
+
+test('an import never replaces a newer credential with an older copy', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-cloud-')); process.env.TEAMAI_HOME = root;
+  try {
+    const storage = await import(`../src/storage.js?cloud=${Date.now()}`);
+    await storage.upsertAccount('claude', 'acc', cred('new', 'r-new', NOW + HOUR));
+    await storage.upsertAccount('claude', 'acc', cred('old', 'r-old', NOW));
+    assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-new');
+    await storage.upsertAccount('claude', 'acc', cred('newer', 'r-newer', NOW + 2 * HOUR));
+    assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-newer');
+    const cloudSync = await import(`../src/cloud-sync.js?cloud=${Date.now()}`);
+    await cloudSync.saveCloudLink({ url: 'https://cloud.example', key: 'k' });
+    assert.equal((await stat(join(root, 'cloud.json'))).mode & 0o777, 0o600);
+    assert.deepEqual(await cloudSync.loadCloudLink(), { url: 'https://cloud.example', key: 'k' });
+  } finally { delete process.env.TEAMAI_HOME; }
+});

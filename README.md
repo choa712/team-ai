@@ -20,6 +20,8 @@ This is a fork of [soulduse/team-ai](https://github.com/soulduse/team-ai). It tr
 - **Health-aware status and stop.** `status` and `stop` separate a recorded pid from a health-probed one and report the supervisor, so a dead-but-recorded server reads as `unhealthy` rather than `running`.
 - **Launcher rename `tac` to `taic`.** The relayed Claude launcher is `taic`, which avoids clashing with the coreutils `tac`.
 - **Dependency pin.** `js-yaml` is pinned through `overrides`.
+- **Shared accounts through TeamClaude Cloud.** `teamai cloud link|pull|push|status|unlink` uses a TeamClaude Cloud key as an account registry, so the same Claude accounts can be used from several machines. Refreshing and switching stay in TeamAI; see [Sharing accounts across machines](#sharing-accounts-across-machines).
+- **Imports keep the newer token.** Re-importing an account keeps whichever credential expires later, so an older copy can no longer replace a refresh token this machine already rotated.
 
 ## Requirements
 
@@ -154,6 +156,30 @@ teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json
 
 Recent Claude Code versions may store credentials in the macOS Keychain rather than `~/.claude/.credentials.json`; use `teamai login` in that case. `import` never modifies the original TeamClaude, Claude Code, or Codex files. TeamAI uses a persistent isolated Codex home for relayed sessions, so the user's original `~/.codex` remains untouched.
 
+## Sharing accounts across machines
+
+An Anthropic refresh token is single-use: whichever machine rotates it first invalidates every other copy. When the same Claude accounts run on several machines, each one refreshing on its own sooner or later leaves the others holding a dead token, which shows up as repeated re-login prompts.
+
+With a TeamClaude Cloud key linked, TeamAI treats the cloud as a registry and a token mailbox, never as the refresher:
+
+- Before a refresh, it reads the cloud and adopts the token another machine published if that one is newer; nothing is rotated.
+- After a refresh, it pushes the new pair at once. The cloud keeps the pair with the later expiry, so a late or duplicate push cannot overwrite a newer one.
+- When a refresh is refused, the chain moved on elsewhere, so TeamAI re-reads the cloud and continues from the chain it holds.
+- Every ten minutes the server adopts newer tokens (this also revives an account whose refresh was refused here) and re-sends pairs whose push failed. Accounts are never added or removed by this timer.
+
+If the cloud cannot be reached, refreshes still happen locally and the push is retried later.
+
+```bash
+teamai cloud link --from-teamclaude ~/.config/teamclaude.json   # reuse TeamClaude's key; nothing on the command line
+teamai cloud link --key-stdin < key.txt                         # or pass the key on stdin
+teamai cloud pull      # add the cloud's accounts; take a cloud token only when it is newer
+teamai cloud push      # publish this machine's Claude accounts
+teamai cloud status
+teamai cloud unlink
+```
+
+The key is stored in `$TEAMAI_HOME/cloud.json` with mode `0600`, or read from `TEAMAI_CLOUD_KEY`. `link` and `unlink` restart a supervised server so the change takes effect. Every machine that shares the accounts should run TeamAI with the same key linked (a TeamClaude proxy on the same key also works, since both sides publish what they rotate). Only Claude accounts are shared; Codex is unaffected.
+
 ## Operations
 
 ```bash
@@ -168,6 +194,7 @@ teamai tui                                     # dashboard only, no auto-start
 teamai codex-app bind                          # route Codex App through TeamAI
 teamai codex-app status
 teamai codex-app unbind                        # restore the previous provider
+teamai cloud pull|push|status                   # share accounts through TeamClaude Cloud
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # or: auto

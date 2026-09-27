@@ -49,7 +49,12 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     const account: StoredAccount = existing || { id: credential.accountId, provider, label, enabled: true, priority: null, credentialId, createdAt: new Date().toISOString() };
     account.label = label || account.label;
     if (!existing) config.accounts.push(account);
-    credentials[credentialId] = credential;
+    // An import can carry an older copy of a token this machine already rotated
+    // (a stale export, a lagging cloud). Writing it back would replace a live
+    // refresh token with a spent one, so the later expiry wins; a copy with no
+    // known expiry is taken as given, as before.
+    const held = credentials[credentialId];
+    if (!held || held.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= held.expiresAt) credentials[credentialId] = credential;
     return account;
   });
   await saveCredentials(credentials);
