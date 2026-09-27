@@ -219,4 +219,8 @@ test('a failing account never restores an older chain from disk', () => {
   pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (503)';
   assert.equal(pool.adoptCredentials({ 'claude:acc': cred('a1', 'r1', NOW) }), 0);
   assert.equal(pool.accounts[0]!.credential.refreshToken, 'r2');
+  const relogged = poolOf({ acc: { ...cred('new-login', 'r-new', 100), loggedInAt: 2 } });
+  relogged.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (503)';
+  assert.equal(relogged.adoptCredentials({ 'claude:acc': { ...cred('old-login', 'r-old', 200), loggedInAt: 1 } }), 0, 'an earlier login loses whatever its expiry');
+  assert.equal(relogged.accounts[0]!.credential.refreshToken, 'r-new');
 });

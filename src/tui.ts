@@ -96,7 +96,9 @@ export async function runTui(): Promise<void> {
 async function restartDaemon(): Promise<void> {
   const supervised = await recordedSupervisorPid();
   const pid = await recordedServerPid(); if (pid) { try { process.kill(pid, 'SIGTERM'); } catch { /* stale */ } for (let i = 0; i < 30 && await recordedServerPid(); i++) await new Promise((resolve) => setTimeout(resolve, 100)); }
-  if (supervised) { for (let i = 0; i < 100 && !(await runningPid()); i++) await new Promise((resolve) => setTimeout(resolve, 100)); if (await runningPid()) return; }
+  // Under a supervisor the replacement is its to start, however long its
+  // backoff runs: a server started here would take the port from its child.
+  if (supervised) { for (let i = 0; i < 400 && !(await runningPid()); i++) await new Promise((resolve) => setTimeout(resolve, 100)); return; }
   const cli = fileURLToPath(new URL('./cli.js', import.meta.url)); const child = spawn(process.execPath, [cli, 'server'], { detached: true, stdio: 'ignore', env: process.env }); child.unref();
   for (let i = 0; i < 30 && !(await runningPid()); i++) await new Promise((resolve) => setTimeout(resolve, 100));
 }

@@ -607,8 +607,10 @@ export class AccountPool {
       // A failing account still takes only something newer: an older disk copy
       // is a chain it already rotated past, and restoring it would lose the pair
       // it holds now (a transient 503 after a successful rotation, for example).
+      // An earlier login is never newer, whatever its expiry.
       const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
-      const newerForFailing = account.error !== null && (account.credential.expiresAt === null || fresh.expiresAt > account.credential.expiresAt);
+      const sameOrLaterLogin = (fresh.loggedInAt ?? 0) >= (account.credential.loggedInAt ?? 0);
+      const newerForFailing = account.error !== null && sameOrLaterLogin && (account.credential.expiresAt === null || fresh.expiresAt > account.credential.expiresAt);
       if (!relogin && !newerForFailing) continue;
       account.credential = fresh; account.error = null; adopted++;
     }
