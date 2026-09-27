@@ -21,7 +21,8 @@ interface ProviderLine { start: number; end: number; text: string; value: string
 function topLevelProvider(contents: string): ProviderLine | null {
   const firstTable = contents.search(/^\s*\[/m);
   const top = contents.slice(0, firstTable < 0 ? contents.length : firstTable);
-  const matches = [...top.matchAll(/^[ \t]*model_provider[ \t]*=[ \t]*("[^"]*"|'[^']*')[^\r\n]*(?:\r?\n|$)/gm)];
+  // TOML allows the bare key or either quoted form; all three are the same key.
+  const matches = [...top.matchAll(/^[ \t]*(?:model_provider|"model_provider"|'model_provider')[ \t]*=[ \t]*("[^"]*"|'[^']*')[^\r\n]*(?:\r?\n|$)/gm)];
   if (matches.length > 1) throw new Error('Codex config has more than one top-level model_provider');
   const match = matches[0];
   if (!match || match.index === undefined) return null;
@@ -61,7 +62,8 @@ function stripManagedBlock(contents: string): { contents: string; found: boolean
 export function bindCodexAppConfig(contents: string, config: TeamAIConfig, configPath = ''): { contents: string; state: CodexAppBindingState } {
   const stripped = stripManagedBlock(contents);
   if (stripped.found) throw new Error('Codex config is already managed by TeamAI; use the bind command to refresh it');
-  if (/^\s*\[model_providers\.teamai\]\s*$/m.test(contents)) throw new Error('model_providers.teamai already exists outside the managed block');
+  // Same table however it is spelled: quoted segments, inner spaces, a trailing comment.
+  if (/^[ \t]*\[[ \t]*(?:model_providers|"model_providers"|'model_providers')[ \t]*\.[ \t]*(?:teamai|"teamai"|'teamai')[ \t]*\][ \t]*(?:#.*)?$/m.test(contents)) throw new Error('model_providers.teamai already exists outside the managed block');
 
   const existing = topLevelProvider(contents);
   let next: string;
@@ -114,10 +116,21 @@ export async function bindCodexApp(): Promise<string> {
   }
   const result = bindCodexAppConfig(contents, await loadConfig(), target);
   await atomicWrite(paths().codexAppBinding, result.state);
+  let written = false;
   try {
     await atomicWriteText(target, result.contents);
+    written = true;
     await atomicWrite(paths().codexAppBinding, { ...result.state, phase: 'bound' });
-  } catch (error) { await rm(paths().codexAppBinding, { force: true }); throw error; }
+  } catch (error) {
+    // Once the config is written, the prepared state is the only record of the
+    // provider it replaced: keep it (unbind accepts a prepared state). Before
+    // that, the config on disk is still the one the previous state describes.
+    if (!written) {
+      if (previous) await atomicWrite(paths().codexAppBinding, previous).catch(() => {});
+      else await rm(paths().codexAppBinding, { force: true });
+    }
+    throw error;
+  }
   return target;
 }
 

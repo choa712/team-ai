@@ -67,3 +67,19 @@ test('Codex App bind and unbind use restrictive files without touching unrelated
     if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
   }
 });
+
+test('Codex App binding recognises a quoted model_provider key instead of adding a second one', () => {
+  for (const key of ['"model_provider"', "'model_provider'"]) {
+    const original = `${key} = "openai"\n`;
+    const bound = bindCodexAppConfig(original, config());
+    assert.equal(bound.contents.match(/model_provider["']?\s*=/g)?.length, 1);
+    assert.equal(bound.state.insertedModelProvider, false);
+    assert.equal(unbindCodexAppConfig(bound.contents, bound.state), original);
+  }
+});
+
+test('Codex App binding refuses a TeamAI table however it is spelled', () => {
+  for (const table of ['[model_providers."teamai"]', "[ model_providers . 'teamai' ]", '[model_providers.teamai] # mine']) {
+    assert.throws(() => bindCodexAppConfig(`${table}\nname = "custom"\n`, config()), /already exists outside the managed block/, table);
+  }
+});
