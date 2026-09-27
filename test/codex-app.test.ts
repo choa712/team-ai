@@ -85,7 +85,7 @@ test('Codex App binding refuses a TeamAI table however it is spelled', () => {
 });
 
 test('Codex App binding refuses config shapes a line edit cannot rewrite safely', () => {
-  for (const original of ['model_providers = { teamai = { name = "x" } }\n', 'model_providers.teamai.name = "x"\n', 'model_provider = """\nopenai"""\n']) {
+  for (const original of ['model_providers = { teamai = { name = "x" } }\n', 'model_providers.teamai.name = "x"\n', 'model_provider = """\nopenai"""\n', '"model_\\u0070rovider" = "openai"\n']) {
     assert.throws(() => bindCodexAppConfig(original, config()), /add the TeamAI provider by hand/, original);
   }
 });

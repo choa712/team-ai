@@ -187,3 +187,13 @@ test('a running server adopts an explicit re-login even over a healthy token wit
   assert.equal(pool.accounts[0]!.credential.refreshToken, 'r-login');
   assert.equal(pool.adoptCredentials({ 'claude:acc': { ...cred('login', 'r-login', NOW + HOUR), loggedInAt: 2 } }), 0, 'no churn once adopted');
 });
+
+test('adopting a cloud token keeps the login stamp, so the older logged-in copy on disk is not brought back', async () => {
+  const later = Date.now() + 8 * HOUR;
+  const onDisk = { ...cred('login', 'r-login', Date.now() - HOUR), loggedInAt: 5 };
+  const pool = new AccountPool(provider, [stored('acc')], { 'claude:acc': onDisk }, { version: 1, accounts: {} });
+  await syncFromCloud(new CloudCoordinator(fakeCloud([remote('c2', 'rc2', later)])), pool);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'rc2');
+  assert.equal(pool.accounts[0]!.credential.loggedInAt, 5);
+  assert.equal(pool.adoptCredentials({ 'claude:acc': onDisk }), 0);
+});

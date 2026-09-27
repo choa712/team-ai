@@ -46,9 +46,11 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
   const config = await loadConfig();
   const credentials = await loadCredentials();
   const accounts = values.map(({ label, credential: given }) => {
-    const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;
-    const existing = config.accounts.find((a) => a.provider === provider && a.id === credential.accountId);
-    const credentialId = existing?.credentialId || `${provider}:${credential.accountId}`;
+    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId);
+    const credentialId = existing?.credentialId || `${provider}:${given.accountId}`;
+    const current = credentials[credentialId];
+    // A copy keeps the login stamp of what it replaces; see OAuthCredential.loggedInAt.
+    const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : current?.loggedInAt !== undefined && given.loggedInAt === undefined ? { ...given, loggedInAt: current.loggedInAt } : given;
     const account: StoredAccount = existing || { id: credential.accountId, provider, label, enabled: true, priority: null, credentialId, createdAt: new Date().toISOString() };
     account.label = label || account.label;
     if (!existing) config.accounts.push(account);
@@ -56,8 +58,7 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     // (a stale export, a lagging cloud). Writing it back would replace a live
     // refresh token with a spent one, so the later expiry wins; a copy with no
     // known expiry is taken as given, as before.
-    const held = credentials[credentialId];
-    if (policy === 'replace' || !held || held.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= held.expiresAt) credentials[credentialId] = credential;
+    if (policy === 'replace' || !current || current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt) credentials[credentialId] = credential;
     return account;
   });
   await saveCredentials(credentials);

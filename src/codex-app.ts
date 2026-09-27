@@ -65,6 +65,7 @@ export function bindCodexAppConfig(contents: string, config: TeamAIConfig, confi
   // by the managed table; either way Codex would reject the result. Refuse and
   // leave the file untouched rather than write a config Codex cannot parse.
   if (/"""|'''/.test(contents)) throw new Error('Codex config uses multi-line strings; add the TeamAI provider by hand');
+  if (/^[ \t]*"[^"\n]*\\[^\n]*=/m.test(contents)) throw new Error('Codex config uses escaped quoted keys; add the TeamAI provider by hand');
   if (/^[ \t]*(?:model_providers|"model_providers"|'model_providers')[ \t]*[.=]/m.test(contents)) throw new Error('Codex config defines model_providers inline or with dotted keys; add the TeamAI provider by hand');
   const stripped = stripManagedBlock(contents);
   if (stripped.found) throw new Error('Codex config is already managed by TeamAI; use the bind command to refresh it');
