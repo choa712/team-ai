@@ -60,6 +60,12 @@ function stripManagedBlock(contents: string): { contents: string; found: boolean
 }
 
 export function bindCodexAppConfig(contents: string, config: TeamAIConfig, configPath = ''): { contents: string; state: CodexAppBindingState } {
+  // The edit below works line by line. A multi-line string can hide or fake a
+  // line, and an inline or dotted model_providers definition would be redefined
+  // by the managed table; either way Codex would reject the result. Refuse and
+  // leave the file untouched rather than write a config Codex cannot parse.
+  if (/"""|'''/.test(contents)) throw new Error('Codex config uses multi-line strings; add the TeamAI provider by hand');
+  if (/^[ \t]*(?:model_providers|"model_providers"|'model_providers')[ \t]*[.=]/m.test(contents)) throw new Error('Codex config defines model_providers inline or with dotted keys; add the TeamAI provider by hand');
   const stripped = stripManagedBlock(contents);
   if (stripped.found) throw new Error('Codex config is already managed by TeamAI; use the bind command to refresh it');
   // Same table however it is spelled: quoted segments, inner spaces, a trailing comment.

@@ -597,7 +597,8 @@ export class AccountPool {
       if (!fresh || fresh.expiresAt === null || fresh.accessToken === account.credential.accessToken) continue;
       // An account whose refresh was refused holds a dead token whatever its
       // expiry says, so a different credential on disk (a re-login) replaces it.
-      if (account.error === null && account.credential.expiresAt !== null && fresh.expiresAt <= account.credential.expiresAt) continue;
+      const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
+      if (!relogin && account.error === null && account.credential.expiresAt !== null && fresh.expiresAt <= account.credential.expiresAt) continue;
       account.credential = fresh; account.error = null; adopted++;
     }
     return adopted;

@@ -30,9 +30,10 @@ function closed(child: ChildProcess): Promise<void> {
   });
 }
 
-async function terminate(child: ChildProcess, graceMs: number): Promise<void> {
+async function terminate(child: ChildProcess, graceMs: number, alreadySignalled = false): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill('SIGTERM');
+  // The server handles SIGTERM once; a repeat would interrupt its drain and final save.
+  if (!alreadySignalled) child.kill('SIGTERM');
   await Promise.race([closed(child), unrefWait(graceMs)]);
   if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await closed(child); }
 }
@@ -66,12 +67,13 @@ export async function runSupervisor(cliPath: string, options: { signal?: AbortSi
   if (existing && existing !== process.pid) throw new Error(`TeamAI supervisor already running (pid ${existing})`);
   await atomicWrite(paths().supervisor, { pid: process.pid, startedAt: new Date().toISOString() });
   let stopping = options.signal?.aborted ?? false; let child: ChildProcess | null = null; let backoffMs = initialBackoffMs;
-  const stop = (): void => { stopping = true; if (child) { try { child.kill('SIGTERM'); } catch { /* already stopped */ } } };
+  let signalled = false;
+  const stop = (): void => { stopping = true; if (child && !signalled) { try { child.kill('SIGTERM'); signalled = true; } catch { /* already stopped */ } } };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   options.signal?.addEventListener('abort', stop, { once: true });
   try {
     while (!stopping) {
-      child = spawn(process.execPath, [cliPath, 'server'], { stdio: 'inherit', env: process.env });
+      child = spawn(process.execPath, [cliPath, 'server'], { stdio: 'inherit', env: process.env }); signalled = false;
       const ended = closed(child); const health = new HealthFailureWindow(maxFailures, startupGraceMs);
       let restartForHealth = false;
       while (!stopping && child.exitCode === null && child.signalCode === null) {
@@ -82,7 +84,7 @@ export async function runSupervisor(cliPath: string, options: { signal?: AbortSi
         if (health.observe(healthy)) { restartForHealth = true; break; }
         if (healthy) backoffMs = initialBackoffMs;
       }
-      if (stopping) { await terminate(child, stopGraceMs); break; }
+      if (stopping) { await terminate(child, stopGraceMs, signalled); break; }
       if (restartForHealth) {
         console.error(`[TeamAI] supervisor restarting unhealthy server pid=${child.pid ?? 'unknown'}`);
         await terminate(child, stopGraceMs);

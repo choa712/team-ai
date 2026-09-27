@@ -179,3 +179,11 @@ test('an errored account adopts a re-login even when its dead token expires late
   assert.equal(pool.accounts[0]!.credential.refreshToken, 'r-fresh');
   assert.equal(pool.accounts[0]!.error, null);
 });
+
+test('a running server adopts an explicit re-login even over a healthy token with a later expiry', () => {
+  const pool = new AccountPool(provider, [stored('acc')], { 'claude:acc': { ...cred('old', 'r-old', NOW + 8 * HOUR), loggedInAt: 1 } }, { version: 1, accounts: {} });
+  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('copy', 'r-copy', NOW + HOUR) }), 0, 'a plain copy with an earlier expiry is ignored');
+  assert.equal(pool.adoptCredentials({ 'claude:acc': { ...cred('login', 'r-login', NOW + HOUR), loggedInAt: 2 } }), 1);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'r-login');
+  assert.equal(pool.adoptCredentials({ 'claude:acc': { ...cred('login', 'r-login', NOW + HOUR), loggedInAt: 2 } }), 0, 'no churn once adopted');
+});

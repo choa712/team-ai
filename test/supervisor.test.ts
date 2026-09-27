@@ -76,3 +76,31 @@ test('supervisor restarts a server process that exits', { timeout: 10_000 }, asy
     for (const pid of seen) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
   }
 });
+
+test('supervisor sends one SIGTERM so a draining server can finish its final save', { timeout: 10_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'teamai-supervisor-term-')); const log = join(home, 'pids.log'); const terms = join(home, 'terms.log'); const script = join(home, 'slow-server.mjs');
+  const config = defaultConfig(); config.proxy.controlPort = await freePort();
+  await writeFile(join(home, 'config.json'), JSON.stringify(config));
+  await writeFile(script, `
+    import { appendFileSync, readFileSync } from 'node:fs';
+    import { createServer } from 'node:http';
+    const config = JSON.parse(readFileSync(process.env.TEAMAI_HOME + '/config.json', 'utf8'));
+    appendFileSync(process.env.TEAMAI_TEST_PID_LOG, String(process.pid) + '\\n');
+    const server = createServer((req, res) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'ok', pid: process.pid })));
+    server.listen(config.proxy.controlPort, config.proxy.host);
+    // Count every SIGTERM and take a while to exit, like a server draining a stream.
+    process.on('SIGTERM', () => { appendFileSync(process.env.TEAMAI_TEST_TERM_LOG, 'T\\n'); setTimeout(() => process.exit(0), 400); });
+  `);
+  const names = ['TEAMAI_HOME', 'TEAMAI_TEST_PID_LOG', 'TEAMAI_TEST_TERM_LOG', 'TEAMAI_SUPERVISOR_INTERVAL_MS', 'TEAMAI_SUPERVISOR_STARTUP_GRACE_MS'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, { TEAMAI_HOME: home, TEAMAI_TEST_PID_LOG: log, TEAMAI_TEST_TERM_LOG: terms, TEAMAI_SUPERVISOR_INTERVAL_MS: '50', TEAMAI_SUPERVISOR_STARTUP_GRACE_MS: '10000' });
+  const controller = new AbortController(); const supervising = runSupervisor(script, { signal: controller.signal }); let seen: number[] = [];
+  try {
+    seen = await pids(log, 1);
+    controller.abort(); await supervising;
+    assert.equal((await readFile(terms, 'utf8')).trim().split('\n').length, 1);
+  } finally {
+    for (const name of names) { const value = previous[name]; if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    for (const pid of seen) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+  }
+});

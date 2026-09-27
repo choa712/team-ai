@@ -83,3 +83,9 @@ test('Codex App binding refuses a TeamAI table however it is spelled', () => {
     assert.throws(() => bindCodexAppConfig(`${table}\nname = "custom"\n`, config()), /already exists outside the managed block/, table);
   }
 });
+
+test('Codex App binding refuses config shapes a line edit cannot rewrite safely', () => {
+  for (const original of ['model_providers = { teamai = { name = "x" } }\n', 'model_providers.teamai.name = "x"\n', 'model_provider = """\nopenai"""\n']) {
+    assert.throws(() => bindCodexAppConfig(original, config()), /add the TeamAI provider by hand/, original);
+  }
+});

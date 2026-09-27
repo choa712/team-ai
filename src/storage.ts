@@ -45,7 +45,8 @@ export async function saveState(value: PersistedState): Promise<void> { await at
 export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' = 'keep-newer'): Promise<StoredAccount[]> {
   const config = await loadConfig();
   const credentials = await loadCredentials();
-  const accounts = values.map(({ label, credential }) => {
+  const accounts = values.map(({ label, credential: given }) => {
+    const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;
     const existing = config.accounts.find((a) => a.provider === provider && a.id === credential.accountId);
     const credentialId = existing?.credentialId || `${provider}:${credential.accountId}`;
     const account: StoredAccount = existing || { id: credential.accountId, provider, label, enabled: true, priority: null, credentialId, createdAt: new Date().toISOString() };
