@@ -155,13 +155,27 @@ test('an import never replaces a newer credential with an older copy', async () 
   try {
     const storage = await import(`../src/storage.js?cloud=${Date.now()}`);
     await storage.upsertAccount('claude', 'acc', cred('new', 'r-new', NOW + HOUR));
-    await storage.upsertAccount('claude', 'acc', cred('old', 'r-old', NOW));
+    await storage.upsertAccounts('claude', [{ label: 'acc', credential: cred('old', 'r-old', NOW) }]);
     assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-new');
     await storage.upsertAccount('claude', 'acc', cred('newer', 'r-newer', NOW + 2 * HOUR));
     assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-newer');
+    // A login is explicit and replaces even a credential with a later expiry.
+    await storage.upsertAccount('claude', 'acc', cred('relogin', 'r-relogin', NOW));
+    assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-relogin');
+    await storage.upsertAccounts('claude', [{ label: 'acc', credential: cred('stale', 'r-stale', NOW - HOUR) }]);
+    assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-relogin');
     const cloudSync = await import(`../src/cloud-sync.js?cloud=${Date.now()}`);
     await cloudSync.saveCloudLink({ url: 'https://cloud.example', key: 'k' });
     assert.equal((await stat(join(root, 'cloud.json'))).mode & 0o777, 0o600);
     assert.deepEqual(await cloudSync.loadCloudLink(), { url: 'https://cloud.example', key: 'k' });
   } finally { delete process.env.TEAMAI_HOME; }
+});
+
+test('an errored account adopts a re-login even when its dead token expires later', () => {
+  const pool = new AccountPool(provider, [stored('acc')], { 'claude:acc': cred('dead', 'r-dead', NOW + 8 * HOUR) }, { version: 1, accounts: {} });
+  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + HOUR) }), 0, 'a healthy account keeps its later token');
+  pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (400)';
+  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + HOUR) }), 1);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'r-fresh');
+  assert.equal(pool.accounts[0]!.error, null);
 });

@@ -40,7 +40,9 @@ export async function saveCredentials(value: Record<string, OAuthCredential>): P
 export async function loadState(): Promise<PersistedState> { return readJson(paths().state, { version: 1, accounts: {}, events: [] }); }
 export async function saveState(value: PersistedState): Promise<void> { await atomicWrite(paths().state, value); }
 
-export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>): Promise<StoredAccount[]> {
+// 'keep-newer' is for copies (import, cloud pull); 'replace' is for a login the
+// user just completed, which must win even over a revoked token with a later expiry.
+export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' = 'keep-newer'): Promise<StoredAccount[]> {
   const config = await loadConfig();
   const credentials = await loadCredentials();
   const accounts = values.map(({ label, credential }) => {
@@ -54,7 +56,7 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     // refresh token with a spent one, so the later expiry wins; a copy with no
     // known expiry is taken as given, as before.
     const held = credentials[credentialId];
-    if (!held || held.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= held.expiresAt) credentials[credentialId] = credential;
+    if (policy === 'replace' || !held || held.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= held.expiresAt) credentials[credentialId] = credential;
     return account;
   });
   await saveCredentials(credentials);
@@ -63,7 +65,7 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
 }
 
 export async function upsertAccount(provider: ProviderId, label: string, credential: OAuthCredential): Promise<StoredAccount> {
-  return (await upsertAccounts(provider, [{ label, credential }]))[0]!;
+  return (await upsertAccounts(provider, [{ label, credential }], 'replace'))[0]!;
 }
 
 export async function removeAccount(credentialId: string): Promise<boolean> {

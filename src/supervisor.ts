@@ -57,7 +57,9 @@ export async function runSupervisor(cliPath: string, options: { signal?: AbortSi
   const intervalMs = numberFromEnv('TEAMAI_SUPERVISOR_INTERVAL_MS', 10_000);
   const startupGraceMs = numberFromEnv('TEAMAI_SUPERVISOR_STARTUP_GRACE_MS', 10_000);
   const maxFailures = numberFromEnv('TEAMAI_SUPERVISOR_MAX_FAILURES', 3);
-  const stopGraceMs = numberFromEnv('TEAMAI_SUPERVISOR_STOP_GRACE_MS', 5_000);
+  // Longer than the server's own 5 s drain, so its final save of rotated tokens
+  // runs before a SIGKILL can cut it.
+  const stopGraceMs = numberFromEnv('TEAMAI_SUPERVISOR_STOP_GRACE_MS', 12_000);
   const initialBackoffMs = numberFromEnv('TEAMAI_SUPERVISOR_BACKOFF_MS', 1_000);
   const maxBackoffMs = numberFromEnv('TEAMAI_SUPERVISOR_MAX_BACKOFF_MS', 30_000);
   const existing = await recordedSupervisorPid();
