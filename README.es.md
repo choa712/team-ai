@@ -26,7 +26,7 @@ cd team-ai
 ```
 
 `install.sh` instala las dependencias, compila, enlaza los comandos
-`teamai`/`tai`/`tac`/`tax` y ofrece agregar el bloque de shell. Es idempotente:
+`teamai`/`tai`/`taic`/`tax` y ofrece agregar el bloque de shell. Es idempotente:
 vuelve a ejecutarlo para actualizar. Usa `--no-shell` para omitir el bloque de
 shell, o `--dry-run` para ver qué haría sin aplicar cambios.
 
@@ -54,16 +54,16 @@ tai
 Para iniciar una sesión directa con un proveedor, usa los lanzadores dedicados. Inician el relé de TeamAI automáticamente cuando hace falta y pasan todos los argumentos finales al cliente oficial:
 
 ```bash
-tac                   # Claude Code a través del grupo de cuentas de TeamAI
-tac --resume          # equivale a: teamai claude --resume
+taic                  # Claude Code a través del grupo de cuentas de TeamAI
+taic --resume         # equivale a: teamai claude --resume
 tax                   # Codex a través del grupo de cuentas de TeamAI
 tax resume            # equivale a: teamai codex resume
-teamai claude         # forma larga de tac
+teamai claude         # forma larga de taic
 teamai codex          # forma larga de tax
 teamai session        # elige [1] Claude o [2] Codex de forma interactiva
 ```
 
-Los nombres evitan deliberadamente reemplazar una función de shell `tc` existente de TeamClaude. `tc` puede seguir apuntando a TeamClaude mientras `tac` y `tax` apuntan a TeamAI.
+Los nombres evitan deliberadamente reemplazar una función de shell `tc` existente de TeamClaude y la utilidad de texto estándar `tac`. `tc` puede seguir apuntando a TeamClaude mientras `taic` y `tax` apuntan a TeamAI.
 
 ## Configuración del shell
 
@@ -253,7 +253,7 @@ npm run lint
 
 Consulta [NOTICE](NOTICE) para lo relativo a obra derivada y [SECURITY.md](SECURITY.md) para el modelo de seguridad local.
 
-> Translation update pending: see the canonical English README for nested Codex relay configuration inheritance.
+> Translation update pending: see the canonical English README for codex-multi-auth import, Codex App binding, health supervision, and nested Codex relay configuration inheritance.
 
 <!-- transient-recovery-2026-09-22 -->
 Los errores transitorios conservan el estado HTTP, el cuerpo y Retry-After originales. Tras cambiar de cuenta, el relay permite hasta dos rondas de reintento, con un máximo de 10 segundos de espera por ronda y 20 en total. Las esperas mayores se devuelven al cliente; los streams exitosos no se repiten. Los reintentos HTTP de Codex siguen desactivados para evitar duplicarlos. Reinicia el relay después de compilar para aplicar los cambios.

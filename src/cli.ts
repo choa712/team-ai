@@ -7,30 +7,41 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { importAuth, loginClaude, loginCodex } from './auth.js';
 import { captureDashboard } from './capture.js';
+import { bindCodexApp, codexAppStatus, unbindCodexApp } from './codex-app.js';
 import { relayedCodexConfig } from './codex-config.js';
 import { isRedactLevel } from './redact.js';
-import { runServer, runningPid } from './runtime.js';
-import { dataDir, loadConfig, loadState, saveConfig, upsertAccount } from './storage.js';
+import { recordedServerPid, runServer, runningPid } from './runtime.js';
+import { dataDir, loadConfig, loadState, saveConfig, upsertAccount, upsertAccounts } from './storage.js';
+import { recordedSupervisorPid, runSupervisor } from './supervisor.js';
 import { runTui } from './tui.js';
 import type { ProviderId } from './types.js';
 
 const invokedAs = basename(process.argv[1] || 'teamai');
 const inputArgs = process.argv.slice(2);
-const invocation = invokedAs === 'tai' ? ['start', ...inputArgs] : invokedAs === 'tac' ? ['run', 'claude', ...inputArgs] : invokedAs === 'tax' ? ['run', 'codex', ...inputArgs] : inputArgs;
+const invocation = invokedAs === 'tai' ? ['start', ...inputArgs] : invokedAs === 'taic' ? ['run', 'claude', ...inputArgs] : invokedAs === 'tax' ? ['run', 'codex', ...inputArgs] : inputArgs;
 const [command = 'help', ...args] = invocation;
 
 function provider(value?: string): ProviderId { if (value !== 'claude' && value !== 'codex') throw new Error('Provider must be claude or codex'); return value; }
 function flag(name: string): string | undefined { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; }
+function hasFlag(name: string): boolean { return args.includes(name); }
 
 async function main(): Promise<void> {
   switch (command) {
     case 'login': { const id = args[0] ? provider(args[0]) : await selectProvider('Login provider'); const result = id === 'claude' ? await loginClaude() : await loginCodex(); const account = await upsertAccount(id, result.label, result.credential); console.log(`Added ${id} account: ${account.label}`); break; }
-    case 'import': { const id = provider(args[0]); const results = await importAuth(id, flag('--from')); for (const result of results) { const account = await upsertAccount(id, result.label, result.credential); console.log(`Imported ${id} account: ${account.label}`); } break; }
+    case 'import': {
+      const id = provider(args[0]); const results = await importAuth(id, flag('--from'));
+      if (hasFlag('--dry-run')) { console.log(`Would import ${results.length} ${id} account(s); source and TeamAI state unchanged`); break; }
+      const accounts = await upsertAccounts(id, results);
+      for (const account of accounts) console.log(`Imported ${id} account: ${account.label}`);
+      break;
+    }
     case 'accounts': await accounts(args[0] ? provider(args[0]) : undefined); break;
     case 'enable': await toggle(true); break;
     case 'disable': await toggle(false); break;
     case 'priority': await priority(); break;
     case 'server': await runServer(); break;
+    case 'supervise': await runSupervisor(fileURLToPath(import.meta.url)); break;
+    case 'codex-app': await codexApp(args[0]); break;
     case 'start': await ensureServer(); await runTui(); break;
     case 'status': await status(); break;
     case 'stop': await stop(); break;
@@ -68,8 +79,30 @@ async function accounts(filter?: ProviderId): Promise<void> {
 async function toggle(enabled: boolean): Promise<void> { const id = provider(args[0]); const name = args.slice(1).join(' '); const config = await loadConfig(); const account = config.accounts.find((a) => a.provider === id && (a.id === name || a.label === name)); if (!account) throw new Error('Account not found'); account.enabled = enabled; await saveConfig(config); console.log(`${enabled ? 'Enabled' : 'Disabled'} ${account.label}`); }
 async function priority(): Promise<void> { const id = provider(args[0]); const rankRaw = args.at(-1); const name = args.slice(1, -1).join(' '); const config = await loadConfig(); const account = config.accounts.find((a) => a.provider === id && (a.id === name || a.label === name)); if (!account) throw new Error('Account not found'); if (!rankRaw || (rankRaw !== 'auto' && (!Number.isInteger(Number(rankRaw)) || Number(rankRaw) < 1))) throw new Error('Priority must be a positive integer or auto'); account.priority = rankRaw === 'auto' ? null : Number(rankRaw); await saveConfig(config); console.log(`Priority ${account.priority ?? 'auto'}: ${account.label}`); }
 
-async function status(): Promise<void> { const pid = await runningPid(); console.log(pid ? `TeamAI server running (pid ${pid})` : 'TeamAI server is stopped'); await accounts(); }
-async function stop(quiet = false): Promise<void> { const pid = await runningPid(); if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; } process.kill(pid, 'SIGTERM'); for (let i = 0; i < 30 && await runningPid(); i++) await new Promise((r) => setTimeout(r, 100)); if (!quiet) console.log(`Stopped TeamAI server ${pid}`); }
+async function status(): Promise<void> {
+  const recorded = await recordedServerPid(); const healthy = recorded ? await runningPid() : null; const supervisor = await recordedSupervisorPid();
+  const managed = supervisor ? `, supervisor pid ${supervisor}` : '';
+  console.log(healthy ? `TeamAI server running (pid ${healthy}${managed})` : recorded ? `TeamAI server unhealthy (pid ${recorded}${managed})` : `TeamAI server is stopped${managed}`);
+  await accounts();
+}
+async function stop(quiet = false): Promise<void> {
+  const pid = await recordedServerPid();
+  if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; }
+  process.kill(pid, 'SIGTERM');
+  for (let i = 0; i < 30 && await recordedServerPid(); i++) await new Promise((r) => setTimeout(r, 100));
+  if (!quiet) console.log(await recordedSupervisorPid() ? `Stopped TeamAI server ${pid}; the active supervisor will replace it` : `Stopped TeamAI server ${pid}`);
+}
+
+async function codexApp(action = 'status'): Promise<void> {
+  if (action === 'bind') { console.log(`Bound Codex App to TeamAI in ${await bindCodexApp()}`); return; }
+  if (action === 'unbind') { console.log(`Restored Codex App routing in ${await unbindCodexApp()}`); return; }
+  if (action === 'status') {
+    const result = await codexAppStatus();
+    console.log(`Codex App routing: ${result.bound ? 'TeamAI' : 'not bound'} (${result.configPath})`);
+    return;
+  }
+  throw new Error('codex-app action must be bind, unbind or status');
+}
 
 // Start the relay on demand. This is what makes the launchers work whether or
 // not a LaunchAgent (or any other supervisor) is managing the server: if
@@ -134,15 +167,16 @@ function help(): void { console.log(`TeamAI — multi-account relay for Claude C
 
 Usage:
   tai                                  Open the TeamAI dashboard
-  tac [CLAUDE_ARGS...]                 Start a relayed Claude Code session
+  taic [CLAUDE_ARGS...]                Start a relayed Claude Code session
   tax [CODEX_ARGS...]                  Start a relayed Codex session
   teamai claude [CLAUDE_ARGS...]       Start a relayed Claude Code session
   teamai codex [CODEX_ARGS...]         Start a relayed Codex session
   teamai session [CLIENT_ARGS...]      Choose Claude or Codex interactively
   teamai login [claude|codex]
-  teamai import <claude|codex> [--from PATH]
+  teamai import <claude|codex> [--from PATH] [--dry-run]
   teamai accounts [claude|codex]
-  teamai start|restart|status|stop
+  teamai start|restart|status|stop|supervise
+  teamai codex-app bind|unbind|status
   teamai enable|disable <provider> <account>
   teamai priority <provider> <account> <rank|auto>
   teamai capture [--redact partial|full|none] [--out DIR]

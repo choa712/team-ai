@@ -25,7 +25,7 @@ cd team-ai
 ./scripts/install.sh
 ```
 
-`install.sh` installs dependencies, builds, links the `teamai`/`tai`/`tac`/`tax`
+`install.sh` installs dependencies, builds, links the `teamai`/`tai`/`taic`/`tax`
 commands, and offers to add the shell block. It is idempotent — re-run it to
 upgrade. Pass `--no-shell` to skip the shell block, or `--dry-run` to see what it
 would do.
@@ -53,16 +53,16 @@ tai
 For a direct provider session, use the dedicated launchers. They automatically start the TeamAI relay when necessary and pass every trailing argument to the official client:
 
 ```bash
-tac                   # Claude Code through the TeamAI account pool
-tac --resume          # same as: teamai claude --resume
+taic                  # Claude Code through the TeamAI account pool
+taic --resume         # same as: teamai claude --resume
 tax                   # Codex through the TeamAI account pool
 tax resume            # same as: teamai codex resume
-teamai claude         # long form of tac
+teamai claude         # long form of taic
 teamai codex          # long form of tax
 teamai session        # choose [1] Claude or [2] Codex interactively
 ```
 
-The names intentionally avoid replacing an existing TeamClaude `tc` shell function. `tc` can continue to target TeamClaude while `tac` and `tax` target TeamAI.
+The names intentionally avoid replacing an existing TeamClaude `tc` shell function and the standard `tac` text utility. `tc` can continue to target TeamClaude while `taic` and `tax` target TeamAI.
 
 ## Shell setup
 
@@ -81,11 +81,13 @@ re-running it upgrades rather than appends; every write leaves a timestamped
 backup, and install/uninstall cycles restore the file byte for byte.
 
 A supervisor is optional: `cl`, `co`, `tai` and `teamai run` all start the relay
-themselves when nothing is listening, so they keep working if the LaunchAgent is
-unloaded, fails, or was never installed. A stale `server.json` left by a killed
-process is ignored and replaced. When startup does fail, the reason from the
-server (a port already in use, an unreadable credential file) is reported
-instead of a bare "did not start", and the full output is kept at
+themselves when the authenticated control health check is not answering, so
+they keep working if the LaunchAgent is unloaded, fails, or was never installed.
+`teamai supervise` also watches that health endpoint and replaces a server after
+three consecutive failures, covering the case where a PID survives but its
+listeners do not. When startup does fail, the reason from the server (a port
+already in use, an unreadable credential file) is reported instead of a bare
+"did not start", and the full output is kept at
 `~/.config/teamai/server-start.log`.
 
 ### Running the relay as a login item
@@ -104,7 +106,7 @@ drive a LaunchAgent labeled `com.teamai.proxy`, so use exactly that label:
   <array>
     <string>/usr/local/bin/node</string>
     <string>/ABSOLUTE/PATH/TO/team-ai/dist/src/cli.js</string>
-    <string>server</string>
+    <string>supervise</string>
   </array>
   <key>RunAtLoad</key>      <true/>
   <key>KeepAlive</key>      <true/>
@@ -118,7 +120,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teamai.proxy.plist
 ```
 
 Use `command -v node` for the real Node path; a LaunchAgent does not inherit
-your shell's PATH.
+your shell's PATH. Use `launchctl` to stop a supervised login item; stopping
+only the child relay causes the supervisor to replace it.
 
 ## Accounts
 
@@ -132,6 +135,10 @@ teamai import claude --from ~/.config/teamclaude.json
 
 # Import Codex CLI's current file-based login, when present.
 teamai import codex
+
+# Import every account from codex-multi-auth, preserving each selected workspace.
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json --dry-run
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json
 ```
 
 Recent Claude Code versions may store credentials in the macOS Keychain rather than `~/.claude/.credentials.json`; use `teamai login` in that case. `import` never modifies the original TeamClaude, Claude Code, or Codex files. TeamAI uses a persistent isolated Codex home for relayed sessions, so the user's original `~/.codex` remains untouched.
@@ -145,12 +152,23 @@ teamai start                                   # start relay, open dashboard
 teamai stop                                    # stop the relay
 teamai restart                                 # stop, start, open dashboard
 teamai server                                  # run the relay in the foreground
+teamai supervise                               # run and health-supervise the relay
 teamai tui                                     # dashboard only, no auto-start
+teamai codex-app bind                          # route Codex App through TeamAI
+teamai codex-app status
+teamai codex-app unbind                        # restore the previous provider
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # or: auto
 teamai capture [--redact partial|full|none] [--out DIR]   # dashboard → .txt + .png, no TTY needed
 ```
+
+`codex-app bind` changes only the top-level `model_provider` and appends a
+marked `model_providers.teamai` block to the active Codex config. The prior
+provider is recorded under `~/.config/teamai` and restored by `unbind`; unrelated
+TOML text is left byte-for-byte intact. The managed block contains the local
+relay bearer token, so the Codex config remains mode `0600`. Restart Codex App
+after binding or unbinding. Keep the supervisor running while the app is bound.
 
 Accounts are ordered by how much quota they have left, least-spent first, in
 both the dashboard and the pool's own selection — so the top row is the account
@@ -232,7 +250,7 @@ rather than allowed to take the relay down.
 
 ## Scope and compliance
 
-Version 0.1 targets subscription OAuth accounts and wrapper-launched CLI sessions. It does not expose a public OpenAI-compatible API, convert Claude requests to Codex requests, support Codex Desktop, or pool credentials between different people. You are responsible for complying with provider terms and policies. Production/commercial API workloads should use the providers' official API billing mechanisms.
+Version 0.1 targets subscription OAuth accounts, wrapper-launched CLI sessions, and an explicitly bound Codex App. It does not expose a public OpenAI-compatible API, convert Claude requests to Codex requests, launch or install Codex App itself, or pool credentials between different people. You are responsible for complying with provider terms and policies. Production/commercial API workloads should use the providers' official API billing mechanisms.
 
 ## Development
 

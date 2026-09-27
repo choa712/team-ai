@@ -11,6 +11,8 @@ import type { PersistedState, ProviderId, TeamAIConfig } from './types.js';
 // How long a stopping server waits for in-flight responses before cutting them.
 const DRAIN_MS = 5_000;
 
+export function listenersHealthy(servers: Array<Pick<Server, 'listening'>>): boolean { return servers.length > 1 && servers.every((server) => server.listening); }
+
 // Ports this provider should still answer on besides the configured one:
 // whatever the user listed in proxy.legacyPorts, plus the built-in default,
 // which is the port every session started before the config was edited was
@@ -103,6 +105,12 @@ export async function runServer(): Promise<void> {
   const control = createServer(async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
     if (!secureEqual(token, config.proxy.clientToken)) { res.writeHead(401).end('{}'); return; }
+    if (req.url === '/health') {
+      const healthy = listenersHealthy(servers);
+      res.writeHead(healthy ? 200 : 503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: healthy ? 'ok' : 'degraded', pid: process.pid }));
+      return;
+    }
     if (!req.url?.startsWith('/probe')) { res.writeHead(404).end('{}'); return; }
     // Pick up accounts added or removed by the TUI (a separate process) before
     // measuring, so `R` reflects the current fleet without a server restart.
@@ -141,4 +149,30 @@ export async function runServer(): Promise<void> {
   process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
 }
 
-export async function runningPid(): Promise<number | null> { try { const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number }; if (!value.pid) return null; process.kill(value.pid, 0); return value.pid; } catch { return null; } }
+export async function recordedServerPid(): Promise<number | null> {
+  try {
+    const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number };
+    if (!value.pid) return null;
+    process.kill(value.pid, 0);
+    return value.pid;
+  } catch { return null; }
+}
+
+export async function probeServer(config: TeamAIConfig, expectedPid?: number, timeoutMs = 1_000): Promise<boolean> {
+  try {
+    const port = config.proxy.controlPort ?? config.proxy.claudePort + 100;
+    const response = await fetch(`http://${config.proxy.host}:${port}/health`, {
+      headers: { authorization: `Bearer ${config.proxy.clientToken}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return false;
+    const value = await response.json() as { status?: unknown; pid?: unknown };
+    return value.status === 'ok' && Number.isInteger(value.pid) && (expectedPid === undefined || value.pid === expectedPid);
+  } catch { return false; }
+}
+
+export async function runningPid(): Promise<number | null> {
+  const pid = await recordedServerPid();
+  if (!pid) return null;
+  try { return await probeServer(await loadConfig(), pid) ? pid : null; } catch { return null; }
+}

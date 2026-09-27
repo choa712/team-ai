@@ -279,7 +279,6 @@ export class AccountPool {
   // the next turn for nothing. Only a quota or forbidden cooldown evicts.
   private isHome(account: RuntimeAccount, wantsFable: boolean): boolean {
     if (account.cooldownReason === 'network') {
-      const now = Date.now();
       const still = account.enabled && !account.error && (account.usage === null || account.usage < this.threshold) && !(wantsFable && AccountPool.fableSpent(account, 1));
       return still && !this.divertsOff(account, wantsFable, NO_EXCLUSIONS);
     }

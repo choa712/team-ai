@@ -4,8 +4,9 @@ import { loginClaude, loginCodex } from './auth.js';
 import { captureDashboard } from './capture.js';
 import { copyImageToClipboard, revealInFolder } from './desktop.js';
 import { buildFrame, displayOrder, ESC, type FrameMode } from './frame.js';
-import { runningPid } from './runtime.js';
+import { recordedServerPid, runningPid } from './runtime.js';
 import { loadConfig, loadState, removeAccount, saveConfig, upsertAccount } from './storage.js';
+import { recordedSupervisorPid } from './supervisor.js';
 import type { StoredAccount } from './types.js';
 
 export async function runTui(): Promise<void> {
@@ -93,7 +94,9 @@ export async function runTui(): Promise<void> {
 }
 
 async function restartDaemon(): Promise<void> {
-  const pid = await runningPid(); if (pid) { try { process.kill(pid, 'SIGTERM'); } catch { /* stale */ } for (let i = 0; i < 30 && await runningPid(); i++) await new Promise((resolve) => setTimeout(resolve, 100)); }
+  const supervised = await recordedSupervisorPid();
+  const pid = await recordedServerPid(); if (pid) { try { process.kill(pid, 'SIGTERM'); } catch { /* stale */ } for (let i = 0; i < 30 && await recordedServerPid(); i++) await new Promise((resolve) => setTimeout(resolve, 100)); }
+  if (supervised) { for (let i = 0; i < 100 && !(await runningPid()); i++) await new Promise((resolve) => setTimeout(resolve, 100)); if (await runningPid()) return; }
   const cli = fileURLToPath(new URL('./cli.js', import.meta.url)); const child = spawn(process.execPath, [cli, 'server'], { detached: true, stdio: 'ignore', env: process.env }); child.unref();
   for (let i = 0; i < 30 && !(await runningPid()); i++) await new Promise((resolve) => setTimeout(resolve, 100));
 }

@@ -25,7 +25,7 @@ cd team-ai
 ./scripts/install.sh
 ```
 
-`install.sh` 会安装依赖、执行构建、链接 `teamai`/`tai`/`tac`/`tax` 命令，并询问是否添加 shell 配置块。该脚本是幂等的——升级时重新执行即可。加 `--no-shell` 可跳过 shell 配置块，加 `--dry-run` 则只显示将要执行的操作。
+`install.sh` 会安装依赖、执行构建、链接 `teamai`/`tai`/`taic`/`tax` 命令，并询问是否添加 shell 配置块。该脚本是幂等的——升级时重新执行即可。加 `--no-shell` 可跳过 shell 配置块，加 `--dry-run` 则只显示将要执行的操作。
 
 如果想手动完成同样的步骤：
 
@@ -49,16 +49,16 @@ tai
 若想直接开启某个服务商的会话，请使用专用启动命令。它们会在必要时自动拉起 TeamAI 中继，并把后面跟的所有参数原样传给官方客户端：
 
 ```bash
-tac                   # 经由 TeamAI 账号池的 Claude Code
-tac --resume          # 等同于：teamai claude --resume
+taic                  # 经由 TeamAI 账号池的 Claude Code
+taic --resume         # 等同于：teamai claude --resume
 tax                   # 经由 TeamAI 账号池的 Codex
 tax resume            # 等同于：teamai codex resume
-teamai claude         # tac 的完整写法
+teamai claude         # taic 的完整写法
 teamai codex          # tax 的完整写法
 teamai session        # 交互式选择 [1] Claude 或 [2] Codex
 ```
 
-这些名称是有意取的，以免覆盖已有的 TeamClaude `tc` shell 函数。`tc` 可以继续指向 TeamClaude，而 `tac` 和 `tax` 指向 TeamAI。
+这些名称是有意取的，以免覆盖已有的 TeamClaude `tc` shell 函数和标准 `tac` 文本工具。`tc` 可以继续指向 TeamClaude，而 `taic` 和 `tax` 指向 TeamAI。
 
 ## Shell 配置
 
@@ -195,7 +195,7 @@ npm run lint
 
 衍生作品相关说明见 [NOTICE](NOTICE)，本地安全模型见 [SECURITY.md](SECURITY.md)。
 
-> Translation update pending: see the canonical English README for nested Codex relay configuration inheritance.
+> Translation update pending: see the canonical English README for codex-multi-auth import, Codex App binding, health supervision, and nested Codex relay configuration inheritance.
 
 <!-- transient-recovery-2026-09-22 -->
 临时上游错误保留原始 HTTP 状态、正文和 Retry-After。切换账号后最多重试两轮，每轮等待不超过 10 秒，总等待不超过 20 秒。更长的等待交给客户端，成功的流不会重放。Codex HTTP 重试保持关闭，避免重复重试。构建后需重启中继才能生效。
