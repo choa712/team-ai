@@ -93,6 +93,12 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
   let retryRounds = 0;
   let retryWaitMs = 0;
   let nextRetryAt = 0;
+  // Set once an attempt may have delivered the request (a connection that
+  // died after the body went out). From then on the request is never
+  // re-sent by a retry round, whatever later attempts report: a connect
+  // refusal on the next account would otherwise re-arm the rounds and send
+  // to it what the first account may already have run.
+  let maybeDelivered = false;
   while (!res.destroyed) {
     const account = pool.acquire(session, excluded, wantsFable);
     if (!account) {
@@ -172,17 +178,19 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       const detail = describeFetchError(error);
       const failure = { response: new Response(null, { status: 502, headers: { 'content-type': 'application/json' } }), body: JSON.stringify({ error: `Upstream connection failed: ${detail}` }) };
       pool.release(account); pool.cooldown(account, NETWORK_COOLDOWN_MS, 'network'); excluded.add(account.id);
-      if (requestNeverSent(error)) {
+      if (requestNeverSent(error) && !maybeDelivered) {
         lastFailure = { ...failure, transient: true }; transientAccounts.add(account.id);
         nextRetryAt = Math.max(nextRetryAt, Date.now() + NETWORK_COOLDOWN_MS + 50);
         onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail})`);
         continue;
       }
-      // The connection was made and died later: whether upstream ran the
-      // request is unknown, so no retry round may re-send it — and a retry
-      // that was already earned by an earlier connect failure is forfeited
-      // too. Failover to the next account is unchanged; once every account
-      // has been tried the 502 is final and the client decides.
+      // The connection was made and died later (or an earlier attempt's did):
+      // whether upstream ran the request is unknown, so no retry round may
+      // re-send it — a retry already earned by an earlier connect failure is
+      // forfeited, and a later connect failure does not earn one back.
+      // Failover to the next account is unchanged; once every account has
+      // been tried the 502 is final and the client decides.
+      maybeDelivered = true;
       lastFailure = { ...failure, transient: false }; transientAccounts.clear();
       onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail}; not retried, the request may have reached upstream)`);
       continue;

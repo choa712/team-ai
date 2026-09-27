@@ -468,3 +468,25 @@ test('a connection that dies after the request went out is failed over but never
     assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
   } finally { proxy.close(); upstream.close(); }
 });
+
+test('once an attempt may have delivered the request, a later connect refusal does not re-arm the retry rounds', async () => {
+  // Account a's connection dies after the body went out; the upstream then
+  // stops listening, so account b is refused outright. The refusal used to
+  // re-arm the transient retry and re-send to b what a may already have run.
+  let hits = 0;
+  const upstream = createServer((req) => { req.resume(); req.on('end', () => { hits++; req.socket.destroy(); upstream.close(); }); });
+  await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r)); const up = upstream.address(); assert(up && typeof up !== 'string');
+  const pool = new AccountPool(codexStub(up.port), [codexAccount('a', 1), codexAccount('b', 2)], { a: codexCredential('a'), b: codexCredential('b') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  try {
+    const started = Date.now();
+    const res = await relayCall(pa.port);
+    assert.equal(res.status, 502); await res.text();
+    assert.ok(Date.now() - started < 1_500, 'answered without a retry round');
+    assert.equal(hits, 1, 'the request reached the upstream exactly once');
+    assert.ok(events.some((e) => /→ b network error; failover \(.*ECONNREFUSED.*not retried/.test(e)), `the refusal on b is recorded as unretried: ${events.join(' | ')}`);
+    assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
+  } finally { proxy.close(); }
+});
