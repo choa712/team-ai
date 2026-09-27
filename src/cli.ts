@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { importAuth, loginClaude, loginCodex } from './auth.js';
 import { captureDashboard } from './capture.js';
+import { providers } from './providers.js';
 import { pullAccounts, pushAccounts } from './cloud-fleet.js';
 import { DEFAULT_CLOUD_URL, linkFromTeamClaude, loadCloudLink, maskKey, saveCloudLink } from './cloud-sync.js';
 import { bindCodexApp, codexAppStatus, unbindCodexApp } from './codex-app.js';
@@ -122,7 +123,7 @@ async function cloudCommand(action = 'status'): Promise<void> {
     return;
   }
   if (action === 'pull') {
-    const result = await pullAccounts(await requireLink());
+    const result = await pullAccounts(await requireLink(), undefined, async (credential) => { try { await providers.claude.fetchProfile!(credential); return true; } catch { return false; } });
     for (const label of result.added) console.log(`Added claude account: ${label}`);
     for (const label of result.updated) console.log(`Took newer cloud token: ${label}`);
     console.log(`Cloud pull: ${result.added.length} added, ${result.updated.length} updated, ${result.unchanged} already current${result.tokenless ? `, ${result.tokenless} without a token skipped` : ''}`);

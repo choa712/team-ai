@@ -197,3 +197,42 @@ test('adopting a cloud token keeps the login stamp, so the older logged-in copy 
   assert.equal(pool.accounts[0]!.credential.loggedInAt, 5);
   assert.equal(pool.adoptCredentials({ 'claude:acc': onDisk }), 0);
 });
+
+test('a revoked cloud token with a later expiry is never adopted over a fresh local login', async () => {
+  const cloud = fakeCloud([remote('revoked', 'r-revoked', NOW + 8 * HOUR)]);
+  const verify = async (c: OAuthCredential) => c.accessToken !== 'revoked';
+  const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW, verify);
+  const login = { ...cred('login', 'r-login', NOW + 60_000), loggedInAt: 9 };
+  const rotated: string[] = [];
+  const next = await coordinator.refresh('acc', login, async (c) => { rotated.push(c.refreshToken!); if (c.refreshToken === 'r-revoked') return refused(); return { ...c, accessToken: 'a2', refreshToken: 'r2', expiresAt: NOW + 8 * HOUR }; });
+  assert.equal(next.refreshToken, 'r2');
+  assert.deepEqual(rotated, ['r-revoked', 'r-login'], 'the dead cloud chain is tried, then our own');
+  assert.equal(next.loggedInAt, 9);
+
+  const pool = new AccountPool(provider, [stored('acc')], { 'claude:acc': { ...cred('login', 'r-login', Date.now() + HOUR), loggedInAt: 9 } }, { version: 1, accounts: {} });
+  const result = await syncFromCloud(new CloudCoordinator(fakeCloud([remote('revoked', 'r-revoked', Date.now() + 2 * HOUR)]), () => {}, 20_000, Date.now, verify), pool);
+  assert.equal(result.adopted, 0);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'r-login');
+});
+
+test('periodic sync does not overwrite a credential that changed while the cloud token was being verified', async () => {
+  const later = Date.now() + 8 * HOUR;
+  const pool = new AccountPool(provider, [stored('acc')], { 'claude:acc': cred('old', 'r-old', Date.now() - HOUR) }, { version: 1, accounts: {} });
+  const verify = async () => { pool.accounts[0]!.credential = cred('rotated', 'r-rotated', later + HOUR); return true; };
+  const result = await syncFromCloud(new CloudCoordinator(fakeCloud([remote('c', 'r-cloud', later)]), () => {}, 20_000, Date.now, verify), pool);
+  assert.equal(result.adopted, 0);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'r-rotated');
+});
+
+test('a manual pull replaces a local token only with one that passes verification', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-pull-')); process.env.TEAMAI_HOME = root;
+  try {
+    const storage = await import(`../src/storage.js?pull=${Date.now()}`);
+    const fleet = await import(`../src/cloud-fleet.js?pull=${Date.now()}`);
+    await storage.upsertAccount('claude', 'acc', cred('login', 'r-login', NOW + HOUR));
+    const client = fakeCloud([remote('revoked', 'r-revoked', NOW + 2 * HOUR), remote('new', 'r-new', NOW + HOUR, 'fresh')]);
+    const result = await fleet.pullAccounts({ url: 'https://cloud.example', key: 'k' }, client, async (c: OAuthCredential) => c.accessToken !== 'revoked');
+    assert.deepEqual([result.added, result.updated, result.unchanged], [['fresh'], [], 1]);
+    assert.equal((await storage.loadCredentials())['claude:acc'].refreshToken, 'r-login');
+  } finally { delete process.env.TEAMAI_HOME; }
+});

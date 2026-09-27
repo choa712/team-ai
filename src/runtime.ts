@@ -8,7 +8,7 @@ import { providers } from './providers.js';
 import { CloudClient, CloudCoordinator, loadCloudLink } from './cloud-sync.js';
 import { syncFromCloud } from './cloud-fleet.js';
 import { defaultConfig, loadConfig, loadCredentials, loadState, paths, saveCredentials, saveState } from './storage.js';
-import type { PersistedState, ProviderId, TeamAIConfig } from './types.js';
+import type { OAuthCredential, PersistedState, ProviderId, TeamAIConfig } from './types.js';
 
 // How long a stopping server waits for in-flight responses before cutting them.
 const DRAIN_MS = 5_000;
@@ -42,7 +42,8 @@ export async function runServer(): Promise<void> {
   // is adopted instead of being rotated again (see cloud-sync.ts).
   const claudePool = pools.find((p) => p.provider.id === 'claude' && p.accounts.length);
   const link = await loadCloudLink().catch((error: Error) => { console.log(`[TeamAI] cloud link unreadable: ${error.message}`); return null; });
-  const cloud = link && claudePool ? new CloudCoordinator(new CloudClient(link), (message) => console.log(`[TeamAI] ${message}`)) : null;
+  const verify = async (credential: OAuthCredential): Promise<boolean> => { try { await providers.claude.fetchProfile!(credential); return true; } catch { return false; } };
+  const cloud = link && claudePool ? new CloudCoordinator(new CloudClient(link), (message) => console.log(`[TeamAI] ${message}`), 20_000, Date.now, verify) : null;
   if (cloud && claudePool) claudePool.refreshVia = (account, rotate) => cloud.refresh(account.label, account.credential, rotate);
   const servers: Server[] = [];
   for (const pool of pools) {

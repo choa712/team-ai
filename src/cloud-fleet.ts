@@ -21,7 +21,14 @@ export async function syncFromCloud(cloud: CloudCoordinator, pool: AccountPool):
   let adopted = 0; let published = await cloud.retryUnpublished();
   for (const account of pool.accounts) {
     const remote = snapshot.get(account.id);
-    if (remote && cloudIsNewer(remote, account.credential)) { account.credential = toCredential(remote, account.credential); account.error = null; adopted++; continue; }
+    // Adoption is verified upstream (see CloudCoordinator.verify): a newer expiry
+    // alone could be a revoked token that would undo a fresh login here.
+    // The check is async: a refresh or re-login can land on the account while it
+    // runs, and that newer credential must not be overwritten by the candidate.
+    const before = account.credential;
+    const verified = remote ? await cloud.adoptable(before, remote, 60_000) : null;
+    if (verified && account.credential === before) { account.credential = verified; account.error = null; adopted++; continue; }
+    if (account.credential !== before) continue;
     // The cloud lags a pair rotated here (a push lost to a restart, or rotated
     // before this machine was linked). Only accounts the cloud already has are
     // sent, so a local-only account is never published by a timer.
@@ -36,20 +43,24 @@ export async function syncFromCloud(cloud: CloudCoordinator, pool: AccountPool):
 // `teamai cloud pull`: bring the cloud's accounts onto this machine. New
 // accounts are added; known ones take the cloud token only when it is newer
 // (upsertAccounts keeps the later expiry), so a pull can never undo a rotation.
-export async function pullAccounts(link: CloudLink, client = new CloudClient(link)): Promise<{ added: string[]; updated: string[]; unchanged: number; tokenless: number }> {
+export async function pullAccounts(link: CloudLink, client = new CloudClient(link), verify: (credential: OAuthCredential) => Promise<boolean> = async () => true): Promise<{ added: string[]; updated: string[]; unchanged: number; tokenless: number }> {
   const remote = await client.pull();
   const [config, credentials] = await Promise.all([loadConfig(), loadCredentials()]);
   const known = new Map(config.accounts.filter((a) => a.provider === 'claude').map((a) => [a.id, a]));
   const usable = remote.filter((r) => r.accessToken);
   const added: string[] = []; const updated: string[] = []; let unchanged = 0;
-  const writes = usable.filter((r) => {
+  const writes: Array<{ label: string; credential: OAuthCredential }> = [];
+  for (const r of usable) {
     const label = r.name || r.accountUuid; const existing = known.get(r.accountUuid);
-    if (!existing) { added.push(label); return true; }
-    const held = credentials[existing.credentialId];
-    if (!held || cloudIsNewer(r, held)) { updated.push(label); return true; }
-    unchanged++; return false;
-  });
-  if (writes.length) await upsertAccounts('claude', writes.map((r) => ({ label: r.name || r.accountUuid, credential: toCredential(r) })));
+    const held = existing ? credentials[existing.credentialId] : undefined;
+    if (!held) { (existing ? updated : added).push(label); writes.push({ label, credential: toCredential(r) }); continue; }
+    // Replacing a local token needs proof the cloud one is alive: a revoked copy
+    // keeps its later expiry and would undo a fresh login here.
+    const candidate = cloudIsNewer(r, held) ? toCredential(r, held) : null;
+    if (candidate && await verify(candidate).catch(() => false)) { updated.push(label); writes.push({ label, credential: candidate }); continue; }
+    unchanged++;
+  }
+  if (writes.length) await upsertAccounts('claude', writes);
   return { added, updated, unchanged, tokenless: remote.length - usable.length };
 }
 

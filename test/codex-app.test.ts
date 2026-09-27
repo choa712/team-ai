@@ -85,7 +85,14 @@ test('Codex App binding refuses a TeamAI table however it is spelled', () => {
 });
 
 test('Codex App binding refuses config shapes a line edit cannot rewrite safely', () => {
-  for (const original of ['model_providers = { teamai = { name = "x" } }\n', 'model_providers.teamai.name = "x"\n', 'model_provider = """\nopenai"""\n', '"model_\\u0070rovider" = "openai"\n']) {
-    assert.throws(() => bindCodexAppConfig(original, config()), /add the TeamAI provider by hand/, original);
+  for (const original of ['model_providers = { teamai = { name = "x" } }\n', 'model_providers.teamai.name = "x"\n', 'model_provider = """\nopenai"""\n', '"model_\\u0070rovider" = "openai"\n', '[model_providers."te\\u0061mai"]\nname = "x"\n']) {
+    assert.throws(() => bindCodexAppConfig(original, config()), /add the TeamAI provider by hand|already exists outside the managed block/, original);
   }
+});
+
+test('Codex App binding judges conflicts on parsed TOML and never writes an unparsable result', () => {
+  assert.throws(() => bindCodexAppConfig('[model_providers]\nteamai = { name = "x" }\n', config()), /already exists outside the managed block/);
+  assert.throws(() => bindCodexAppConfig('model_provider = "openai"\n[broken\n', config()), /not valid TOML/);
+  const bound = bindCodexAppConfig('model_provider = "openai"\n\n[model_providers.other]\nname = "o"\n', config());
+  assert.match(bound.contents, /\[model_providers\.other\]/);
 });

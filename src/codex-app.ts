@@ -1,4 +1,5 @@
 import { readFile, rm } from 'node:fs/promises';
+import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWrite, atomicWriteText, loadConfig, paths } from './storage.js';
@@ -60,15 +61,20 @@ function stripManagedBlock(contents: string): { contents: string; found: boolean
 }
 
 export function bindCodexAppConfig(contents: string, config: TeamAIConfig, configPath = ''): { contents: string; state: CodexAppBindingState } {
-  // The edit below works line by line. A multi-line string can hide or fake a
-  // line, and an inline or dotted model_providers definition would be redefined
-  // by the managed table; either way Codex would reject the result. Refuse and
-  // leave the file untouched rather than write a config Codex cannot parse.
-  if (/"""|'''/.test(contents)) throw new Error('Codex config uses multi-line strings; add the TeamAI provider by hand');
-  if (/^[ \t]*"[^"\n]*\\[^\n]*=/m.test(contents)) throw new Error('Codex config uses escaped quoted keys; add the TeamAI provider by hand');
-  if (/^[ \t]*(?:model_providers|"model_providers"|'model_providers')[ \t]*[.=]/m.test(contents)) throw new Error('Codex config defines model_providers inline or with dotted keys; add the TeamAI provider by hand');
   const stripped = stripManagedBlock(contents);
   if (stripped.found) throw new Error('Codex config is already managed by TeamAI; use the bind command to refresh it');
+  // Judge on the parsed file first: an invalid file is left alone, and a teamai
+  // provider defined in any TOML spelling is a conflict. The edit below then
+  // works line by line, which multi-line strings, escaped keys and inline or
+  // dotted model_providers definitions can defeat, so those are refused too;
+  // the parse of the result is the final guard.
+  let original: Record<string, unknown>;
+  try { original = parse(contents) as Record<string, unknown>; } catch (error) { throw new Error(`Codex config is not valid TOML (${(error as Error).message.split('\n')[0]}); fix it before binding`); }
+  const providersTable = original.model_providers;
+  if (providersTable && typeof providersTable === 'object' && 'teamai' in providersTable) throw new Error('model_providers.teamai already exists outside the managed block');
+  if (/"""|'''/.test(contents)) throw new Error('Codex config uses multi-line strings; add the TeamAI provider by hand');
+  if (/^[ \t]*(?:\[[^\n]*)?"[^"\n]*\\/m.test(contents)) throw new Error('Codex config uses escaped quoted keys or table names; add the TeamAI provider by hand');
+  if (/^[ \t]*(?:model_providers|"model_providers"|'model_providers')[ \t]*[.=]/m.test(contents)) throw new Error('Codex config defines model_providers inline or with dotted keys; add the TeamAI provider by hand');
   // Same table however it is spelled: quoted segments, inner spaces, a trailing comment.
   if (/^[ \t]*\[[ \t]*(?:model_providers|"model_providers"|'model_providers')[ \t]*\.[ \t]*(?:teamai|"teamai"|'teamai')[ \t]*\][ \t]*(?:#.*)?$/m.test(contents)) throw new Error('model_providers.teamai already exists outside the managed block');
 
@@ -78,8 +84,14 @@ export function bindCodexAppConfig(contents: string, config: TeamAIConfig, confi
   else next = `model_provider = "teamai"\n${contents ? '\n' : ''}${contents}`;
 
   const separator = next && !next.endsWith('\n\n') ? (next.endsWith('\n') ? '\n' : '\n\n') : '';
+  const result = `${next}${separator}${managedBlock(config)}\n`;
+  // The edit is textual, so its outcome is checked on the parsed result: it must
+  // be valid TOML that selects TeamAI, or the original file stays untouched.
+  let parsed: Record<string, unknown>;
+  try { parsed = parse(result) as Record<string, unknown>; } catch (error) { throw new Error(`Binding would produce invalid Codex config (${(error as Error).message.split('\n')[0]}); add the TeamAI provider by hand`); }
+  if (parsed.model_provider !== 'teamai') throw new Error('Binding would not select the TeamAI provider; add it by hand');
   return {
-    contents: `${next}${separator}${managedBlock(config)}\n`,
+    contents: result,
     state: { version: 1, phase: 'prepared', configPath, previousModelProviderLine: existing?.text ?? null, insertedModelProvider: !existing, blockSeparator: separator },
   };
 }

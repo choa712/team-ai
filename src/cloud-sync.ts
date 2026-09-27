@@ -129,7 +129,18 @@ export class CloudCoordinator {
   // Pairs rotated here that the cloud has not confirmed yet, retried on each sync.
   readonly unpublished = new Map<string, { label: string; credential: OAuthCredential }>();
 
-  constructor(private readonly client: Pick<CloudClient, 'pull' | 'push'>, private readonly log: (message: string) => void = () => {}, private readonly cacheMs = 20_000, private readonly now: () => number = Date.now) {}
+  // verify: whether an access token is actually accepted upstream. A later
+  // expiry does not prove a token is alive (a revoked one keeps its expiry), so
+  // nothing from the cloud replaces a local token without passing it.
+  constructor(private readonly client: Pick<CloudClient, 'pull' | 'push'>, private readonly log: (message: string) => void = () => {}, private readonly cacheMs = 20_000, private readonly now: () => number = Date.now, readonly verify: (credential: OAuthCredential) => Promise<boolean> = async () => true) {}
+
+  // A cloud copy worth adopting: newer than the local one, with access-token
+  // life left, and accepted upstream.
+  async adoptable(local: OAuthCredential, cloud: CloudAccount | undefined, minLifeMs: number): Promise<OAuthCredential | null> {
+    if (!cloud || !cloudIsNewer(cloud, local) || cloud.expiresAt <= this.now() + minLifeMs) return null;
+    const candidate = asCredential(local, cloud);
+    try { return await this.verify(candidate) ? candidate : null; } catch { return null; }
+  }
 
   async snapshot(force = false): Promise<Map<string, CloudAccount>> {
     if (!force && this.cache && this.now() - this.cache.at < this.cacheMs) return this.cache.accounts;
@@ -164,23 +175,26 @@ export class CloudCoordinator {
     const margin = 5 * 60_000;
     const cloud = await this.latest(credential.accountId, true);
     // Another machine already rotated and its access token still has life: take it, rotate nothing.
-    if (cloud && cloudIsNewer(cloud, credential) && cloud.expiresAt > this.now() + margin) return asCredential(credential, cloud);
-    // The cloud holds a newer chain even if its access token lapsed: continue from that chain.
-    const base = cloudIsNewer(cloud, credential) || (cloud?.refreshToken && cloud.expiresAt > (credential.expiresAt ?? 0)) ? asCredential(credential, cloud!) : credential;
-    try {
-      const next = await rotate(base);
-      void this.publish(label, next);
-      return next;
-    } catch (error) {
-      if (!refusedRefresh(error)) throw error;
-      // Refused: someone rotated between our read and our rotation. Their push is the only way back.
-      const fresh = await this.latest(credential.accountId, true);
-      if (!fresh?.refreshToken || fresh.refreshToken === base.refreshToken) throw error;
-      if (fresh.accessToken && fresh.expiresAt > this.now() + 60_000) return asCredential(credential, fresh);
-      const next = await rotate(asCredential(credential, fresh));
-      void this.publish(label, next);
-      return next;
+    const adopted = await this.adoptable(credential, cloud, margin);
+    if (adopted) return adopted;
+    const rotateAndPublish = async (from: OAuthCredential): Promise<OAuthCredential> => { const next = await rotate(from); void this.publish(label, next); return next; };
+    // The cloud holds a newer chain whose access token lapsed: continue from that
+    // chain first, and from our own if the cloud's turns out to be dead.
+    const cloudChain = cloud?.refreshToken && cloud.refreshToken !== credential.refreshToken && cloud.expiresAt > (credential.expiresAt ?? 0) ? asCredential(credential, cloud) : null;
+    const attempts = cloudChain ? [cloudChain, credential] : [credential];
+    let refusal: unknown = null;
+    for (const from of attempts) {
+      if (!from.refreshToken) continue;
+      try { return await rotateAndPublish(from); }
+      catch (error) { if (!refusedRefresh(error)) throw error; refusal = error; }
     }
+    // Every chain we had was refused: someone rotated between our read and our
+    // rotation, and their push is the only way back.
+    const fresh = await this.latest(credential.accountId, true);
+    const recovered = await this.adoptable(credential, fresh, 60_000);
+    if (recovered) return recovered;
+    if (fresh?.refreshToken && !attempts.some((a) => a.refreshToken === fresh.refreshToken)) return await rotateAndPublish(asCredential(credential, fresh));
+    throw refusal ?? new Error('No refresh token');
   }
 
   async retryUnpublished(): Promise<number> {
