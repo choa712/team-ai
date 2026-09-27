@@ -154,7 +154,7 @@ test('a running server adopts an explicit re-login even over a healthy token wit
 
 test('an errored account adopts a re-login even when its dead token expires later', () => {
   const pool = poolOf({ acc: cred('dead', 'r-dead', NOW + 8 * HOUR) });
-  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + HOUR) }), 0, 'a healthy account keeps its later token');
+  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + 9 * HOUR) }), 0, 'a healthy account ignores an unstamped copy, even a later one');
   pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (400)';
   assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + HOUR) }), 1);
   assert.equal(pool.accounts[0]!.error, null);
@@ -196,4 +196,19 @@ test('stored credentials: a login always wins, a copy never beats a login, a pul
     assert.equal((await stat(join(root, 'cloud.json'))).mode & 0o777, 0o600);
     assert.deepEqual(await cloudSync.loadCloudLink(), { url: 'https://cloud.example', key: 'k' });
   } finally { delete process.env.TEAMAI_HOME; }
+});
+
+test('periodic sync replaces only chains that were refused, and a recovery survives the next save', async () => {
+  const later = Date.now() + 8 * HOUR;
+  const pool = poolOf({ refused: cred('r1', 'rr1', later + HOUR, 'refused'), flaky: cred('f1', 'fr1', Date.now() + HOUR, 'flaky') });
+  pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (400)';
+  pool.accounts[1]!.error = 'token refresh failed: OAuth refresh failed (503)';
+  const cloud = fakeCloud([remote('r2', 'rr2', Date.now() + HOUR, 'refused'), remote('f2', 'fr2', later, 'flaky')]);
+  const result = await syncFromCloud(new CloudCoordinator(cloud), pool);
+  assert.equal(result.adopted, 1);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'rr2');
+  assert.equal(pool.accounts[1]!.credential.refreshToken, 'fr1', 'a transient failure keeps its own chain');
+  // The dead chain on disk expires later than the recovered one; the next save must not bring it back.
+  assert.equal(pool.adoptCredentials({ 'claude:refused': cred('r1', 'rr1', later + HOUR, 'refused') }), 0);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'rr2');
 });

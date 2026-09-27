@@ -599,10 +599,13 @@ export class AccountPool {
     for (const account of this.accounts) {
       const fresh = latest[account.credentialId];
       if (!fresh || fresh.expiresAt === null || fresh.accessToken === account.credential.accessToken) continue;
-      // An account whose refresh was refused holds a dead token whatever its
-      // expiry says, so a different credential on disk (a re-login) replaces it.
+      // Only two things replace what this server holds: a login (a later
+      // loggedInAt), and anything different for an account that is failing.
+      // A later expiry alone is not enough: disk can hold a chain this server
+      // already replaced (a token recovered from the cloud expires whenever the
+      // other machine minted it), and adopting it would bring a dead chain back.
       const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
-      if (!relogin && account.error === null && account.credential.expiresAt !== null && fresh.expiresAt <= account.credential.expiresAt) continue;
+      if (!relogin && account.error === null) continue;
       account.credential = fresh; account.error = null; adopted++;
     }
     return adopted;

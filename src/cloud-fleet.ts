@@ -1,5 +1,5 @@
 import type { AccountPool } from './account-pool.js';
-import { CloudClient, type CloudAccount, type CloudCoordinator, type CloudLink } from './cloud-sync.js';
+import { CloudClient, refusedRefresh, type CloudAccount, type CloudCoordinator, type CloudLink } from './cloud-sync.js';
 import { loadConfig, loadCredentials, upsertAccounts } from './storage.js';
 import type { OAuthCredential } from './types.js';
 
@@ -22,7 +22,9 @@ export async function syncFromCloud(cloud: CloudCoordinator, pool: AccountPool):
   let adopted = 0; let published = await cloud.retryUnpublished();
   for (const account of pool.accounts) {
     const remote = snapshot.get(account.id);
-    if (account.error !== null) {
+    // Only a refused refresh (400/401) says another machine took the chain; a
+    // 503 or a network error leaves this chain valid, so it is not replaced.
+    if (account.error !== null && refusedRefresh({ message: account.error })) {
       // The check is async: a refresh or re-login can land on the account while
       // it runs, and that credential must not be overwritten by the candidate.
       const before = account.credential;
@@ -30,6 +32,7 @@ export async function syncFromCloud(cloud: CloudCoordinator, pool: AccountPool):
       if (verified && account.credential === before) { account.credential = verified; account.error = null; adopted++; }
       continue;
     }
+    if (account.error !== null) continue;
     // The cloud lags a pair rotated here (a push lost to a restart, or rotated
     // before this machine was linked). Only accounts the cloud already has are
     // sent, so a local-only account is never published by a timer.
