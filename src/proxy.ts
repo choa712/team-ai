@@ -63,6 +63,17 @@ const NETWORK_COOLDOWN_MS = 2_000;
 // (ECONNREFUSED, ENOTFOUND, ECONNRESET) one level down. Surface it: a relay
 // that only says "fetch failed" cannot be told apart from an upstream outage
 // after the fact — two 2026-09-27 blips had to be reconstructed from client logs.
+// Failure codes that mean the connection was never made — nothing was sent,
+// so re-sending cannot run the request twice. A reset or a closed socket
+// (ECONNRESET, UND_ERR_SOCKET) or a header timeout can come after the body
+// went out, and upstream may have run the request: those are not retried.
+const CONNECT_FAILURE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL', 'EAI_NODATA', 'EAI_NONAME', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'EADDRNOTAVAIL', 'UND_ERR_CONNECT_TIMEOUT']);
+export function requestNeverSent(error: unknown): boolean {
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  const codes = cause instanceof AggregateError ? cause.errors.map((e) => (e as { code?: unknown } | null)?.code) : [(cause as { code?: unknown } | null)?.code];
+  return codes.length > 0 && codes.every((code) => typeof code === 'string' && CONNECT_FAILURE_CODES.has(code));
+}
+
 export function describeFetchError(error: unknown): string {
   const top = error instanceof Error ? error.message : String(error);
   const cause = (error as { cause?: unknown } | null)?.cause;
@@ -159,10 +170,21 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       // request's transient record so the retry rounds above run, timed to the
       // bench so the first round is not spent on accounts still benched.
       const detail = describeFetchError(error);
-      lastFailure = { response: new Response(null, { status: 502, headers: { 'content-type': 'application/json' } }), body: JSON.stringify({ error: `Upstream connection failed: ${detail}` }), transient: true };
-      pool.release(account); pool.cooldown(account, NETWORK_COOLDOWN_MS, 'network'); excluded.add(account.id); transientAccounts.add(account.id);
-      nextRetryAt = Math.max(nextRetryAt, Date.now() + NETWORK_COOLDOWN_MS + 50);
-      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail})`);
+      const failure = { response: new Response(null, { status: 502, headers: { 'content-type': 'application/json' } }), body: JSON.stringify({ error: `Upstream connection failed: ${detail}` }) };
+      pool.release(account); pool.cooldown(account, NETWORK_COOLDOWN_MS, 'network'); excluded.add(account.id);
+      if (requestNeverSent(error)) {
+        lastFailure = { ...failure, transient: true }; transientAccounts.add(account.id);
+        nextRetryAt = Math.max(nextRetryAt, Date.now() + NETWORK_COOLDOWN_MS + 50);
+        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail})`);
+        continue;
+      }
+      // The connection was made and died later: whether upstream ran the
+      // request is unknown, so no retry round may re-send it — and a retry
+      // that was already earned by an earlier connect failure is forfeited
+      // too. Failover to the next account is unchanged; once every account
+      // has been tried the 502 is final and the client decides.
+      lastFailure = { ...failure, transient: false }; transientAccounts.clear();
+      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail}; not retried, the request may have reached upstream)`);
       continue;
     }
     pool.updateQuota(account, response.headers);

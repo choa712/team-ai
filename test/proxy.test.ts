@@ -444,3 +444,27 @@ test('a bench too long to wait out is answered with 503 and a retry-after, not a
     assert.ok(events.some((e) => /→ 503 upstream_unreachable/.test(e)), `the activity log records the 503: ${events.join(' | ')}`);
   } finally { proxy.close(); }
 });
+
+test('a connection that dies after the request went out is failed over but never retried, and the answer names the cause', async () => {
+  // Upstream accepts the connection, reads the body, then drops the socket
+  // without headers. The request may have run there, so no retry round may
+  // send it again; failover to the next account is the pre-existing behaviour.
+  let hits = 0;
+  const upstream = createServer((req) => { req.resume(); req.on('end', () => { hits++; req.socket.destroy(); }); });
+  await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r)); const up = upstream.address(); assert(up && typeof up !== 'string');
+  const pool = new AccountPool(codexStub(up.port), [codexAccount('a', 1), codexAccount('b', 2)], { a: codexCredential('a'), b: codexCredential('b') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  try {
+    const started = Date.now();
+    const res = await relayCall(pa.port);
+    assert.equal(res.status, 502);
+    const body = JSON.parse(await res.text()) as { error: string };
+    assert.match(body.error, /^Upstream connection failed: .*(other side closed|ECONNRESET)/);
+    assert.ok(Date.now() - started < 1_500, 'answered without a retry round');
+    assert.equal(hits, 2, 'each account was tried once');
+    assert.equal(events.filter((e) => /network error; failover \(.*not retried, the request may have reached upstream\)/.test(e)).length, 2, `both attempts are on record as unretried: ${events.join(' | ')}`);
+    assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
+  } finally { proxy.close(); upstream.close(); }
+});
