@@ -31,6 +31,7 @@ function fakeCloud(initial: CloudAccount[], opts: { pullFails?: boolean; pushFai
   };
 }
 const refused = () => Promise.reject(new Error('OAuth refresh failed (400)'));
+const settle = () => new Promise((r) => setImmediate(r));
 
 test('adopts a newer token another machine published instead of rotating', async () => {
   const cloud = fakeCloud([remote('a2', 'r2', NOW + 8 * HOUR)]);
@@ -47,6 +48,7 @@ test('rotates when the cloud is not newer and publishes the new pair', async () 
   const coordinator = new CloudCoordinator(cloud, () => {}, 20_000, () => NOW);
   const next = await coordinator.refresh('acc', cred('a1', 'r1', NOW + 60_000), async (c) => ({ ...c, accessToken: 'a2', refreshToken: 'r2', expiresAt: NOW + 8 * HOUR }));
   assert.equal(next.refreshToken, 'r2');
+  await settle();
   assert.equal(cloud.pushes.at(-1)?.refreshToken, 'r2');
 });
 
@@ -89,6 +91,7 @@ test('an unreachable cloud never blocks a local refresh, and the pair is publish
   const coordinator = new CloudCoordinator(cloud, (m) => logs.push(m), 20_000, () => NOW);
   const next = await coordinator.refresh('acc', cred('a1', 'r1', NOW), async (c) => ({ ...c, refreshToken: 'r2', expiresAt: NOW + 8 * HOUR }));
   assert.equal(next.refreshToken, 'r2');
+  await settle();
   assert.equal(coordinator.unpublished.size, 1);
   assert.ok(logs.some((m) => m.includes('deferred')));
   assert.equal(await coordinator.retryUnpublished(), 1);
@@ -128,9 +131,9 @@ test('periodic sync adopts newer tokens, heals the account, and republishes only
 });
 
 test('the cloud client parses pulls, sends the key only as a header, and refuses plain http', async () => {
-  const calls: Array<{ url: string; headers: Record<string, string>; body?: string }> = [];
+  const calls: Array<{ url: string; headers: Record<string, string>; body?: string; redirect: string }> = [];
   const client = new CloudClient({ url: 'https://cloud.example', key: 'k-secret' }, async (url, init) => {
-    calls.push({ url, headers: init.headers, body: init.body });
+    calls.push({ url, headers: init.headers, body: init.body, redirect: init.redirect });
     return { ok: true, status: 200, json: async () => ({ accounts: [{ accountUuid: 'u1', name: 'one', accessToken: 'a', refreshToken: 'r', expiresAt: 1_700_000_000 }, { name: 'no-uuid' }] }) };
   });
   const list = await client.pull();
@@ -138,6 +141,10 @@ test('the cloud client parses pulls, sends the key only as a header, and refuses
   assert.equal(calls[0]!.url, 'https://cloud.example/functions/v1/cloud/sync/pull');
   assert.equal(calls[0]!.headers['x-teamclaude-key'], 'k-secret');
   assert.equal(calls[0]!.url.includes('k-secret'), false);
+  assert.equal(calls[0]!.redirect, 'error');
+  await client.push([{ label: 'one', credential: cred('a', 'r', 1, 'u1') }]);
+  assert.equal(calls[1]!.redirect, 'error');
+  assert.equal(calls[1]!.headers['x-teamclaude-key'], 'k-secret');
   assert.throws(() => assertSecureUrl('http://cloud.example'), /Refusing/);
   assert.doesNotThrow(() => assertSecureUrl('http://127.0.0.1:9999'));
   assert.equal(normalizeExpiry('x'), 0);

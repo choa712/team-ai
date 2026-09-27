@@ -76,15 +76,17 @@ export async function linkFromTeamClaude(path = '~/.config/teamclaude.json'): Pr
 
 export const maskKey = (key: string): string => key.length <= 8 ? '****' : `${key.slice(0, 4)}…${key.slice(-4)}`;
 
-type FetchLike = (url: string, init: { method?: string; headers: Record<string, string>; body?: string; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+type FetchLike = (url: string, init: { method?: string; headers: Record<string, string>; body?: string; signal: AbortSignal; redirect: 'error' }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 export class CloudClient {
   constructor(readonly link: CloudLink, private readonly fetchImpl: FetchLike = fetch as unknown as FetchLike, private readonly timeoutMs = 8_000) { assertSecureUrl(link.url); }
 
+  // Redirects are refused, not followed: a hop to another origin or to plain
+  // http would carry the key header and, on push, every token with it.
   private endpoint(path: string): string { return `${this.link.url.replace(/\/+$/, '')}/functions/v1/cloud${path}`; }
 
   async pull(): Promise<CloudAccount[]> {
-    const response = await this.fetchImpl(this.endpoint('/sync/pull'), { headers: { 'x-teamclaude-key': this.link.key }, signal: AbortSignal.timeout(this.timeoutMs) });
+    const response = await this.fetchImpl(this.endpoint('/sync/pull'), { headers: { 'x-teamclaude-key': this.link.key }, signal: AbortSignal.timeout(this.timeoutMs), redirect: 'error' });
     if (!response.ok) throw Object.assign(new Error(`Cloud pull failed (${response.status})`), { status: response.status });
     const data = await response.json() as { accounts?: unknown };
     const list = Array.isArray(data.accounts) ? data.accounts : [];
@@ -104,7 +106,7 @@ export class CloudClient {
   async push(accounts: Array<{ label: string; credential: OAuthCredential }>): Promise<void> {
     if (!accounts.length) return;
     const body = JSON.stringify({ accounts: accounts.map(({ label, credential }) => ({ accountUuid: credential.accountId, name: label, tier: null, type: 'oauth', accessToken: credential.accessToken, refreshToken: credential.refreshToken, expiresAt: credential.expiresAt ?? 0 })) });
-    const response = await this.fetchImpl(this.endpoint('/sync/push'), { method: 'POST', headers: { 'x-teamclaude-key': this.link.key, 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(this.timeoutMs) });
+    const response = await this.fetchImpl(this.endpoint('/sync/push'), { method: 'POST', headers: { 'x-teamclaude-key': this.link.key, 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(this.timeoutMs), redirect: 'error' });
     if (!response.ok) throw Object.assign(new Error(`Cloud push failed (${response.status})`), { status: response.status });
   }
 }
@@ -155,6 +157,9 @@ export class CloudCoordinator {
     } catch (error) { this.log(`cloud push deferred for ${label}: ${(error as Error).message}`); }
   }
 
+  // A rotated pair is handed back before it is published: the old refresh token
+  // is already spent, so the new one must reach the pool (and disk) at once. A
+  // push that is slow or lost is retried by the periodic sync.
   async refresh(label: string, credential: OAuthCredential, rotate: (credential: OAuthCredential) => Promise<OAuthCredential>): Promise<OAuthCredential> {
     const margin = 5 * 60_000;
     const cloud = await this.latest(credential.accountId, true);
@@ -164,7 +169,7 @@ export class CloudCoordinator {
     const base = cloudIsNewer(cloud, credential) || (cloud?.refreshToken && cloud.expiresAt > (credential.expiresAt ?? 0)) ? asCredential(credential, cloud!) : credential;
     try {
       const next = await rotate(base);
-      await this.publish(label, next);
+      void this.publish(label, next);
       return next;
     } catch (error) {
       if (!refusedRefresh(error)) throw error;
@@ -173,7 +178,7 @@ export class CloudCoordinator {
       if (!fresh?.refreshToken || fresh.refreshToken === base.refreshToken) throw error;
       if (fresh.accessToken && fresh.expiresAt > this.now() + 60_000) return asCredential(credential, fresh);
       const next = await rotate(asCredential(credential, fresh));
-      await this.publish(label, next);
+      void this.publish(label, next);
       return next;
     }
   }
