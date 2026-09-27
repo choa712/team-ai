@@ -25,7 +25,7 @@ cd team-ai
 ./scripts/install.sh
 ```
 
-`install.sh`는 의존성 설치, 빌드, `teamai`/`tai`/`tac`/`tax` 명령 링크를 수행하고 셸 블록 추가 여부를 묻습니다. 멱등적이므로 업그레이드할 때 다시 실행하면 됩니다. 셸 블록을 건너뛰려면 `--no-shell`, 실제 변경 없이 계획만 보려면 `--dry-run`을 씁니다.
+`install.sh`는 의존성 설치, 빌드, `teamai`/`tai`/`taic`/`tax` 명령 링크를 수행하고 셸 블록 추가 여부를 묻습니다. 멱등적이므로 업그레이드할 때 다시 실행하면 됩니다. 셸 블록을 건너뛰려면 `--no-shell`, 실제 변경 없이 계획만 보려면 `--dry-run`을 씁니다.
 
 수동으로 하려면:
 
@@ -49,8 +49,8 @@ tai
 특정 제공자로 바로 세션을 시작하려면 전용 런처를 씁니다. 필요하면 릴레이를 자동으로 띄우고, 뒤에 붙인 인자를 모두 공식 클라이언트에 그대로 전달합니다.
 
 ```bash
-tac                   # TeamAI 계정 풀을 통한 Claude Code
-tac --resume          # teamai claude --resume 와 동일
+taic                  # TeamAI 계정 풀을 통한 Claude Code
+taic --resume         # teamai claude --resume 와 동일
 tax                   # TeamAI 계정 풀을 통한 Codex
 tax resume            # teamai codex resume 와 동일
 teamai claude         # tac의 긴 형태
@@ -58,7 +58,7 @@ teamai codex          # tax의 긴 형태
 teamai session        # [1] Claude / [2] Codex 대화식 선택
 ```
 
-이름은 기존 TeamClaude의 `tc` 셸 함수를 덮어쓰지 않도록 의도적으로 피했습니다. `tc`는 계속 TeamClaude를, `tac`과 `tax`는 TeamAI를 가리킵니다.
+이름은 기존 TeamClaude의 `tc` 셸 함수와 표준 텍스트 도구 `tac`을 덮어쓰지 않도록 의도적으로 피했습니다. `tc`는 계속 TeamClaude를, `taic`과 `tax`는 TeamAI를 가리킵니다.
 
 ## 셸 설정
 
@@ -70,7 +70,7 @@ teamai session        # [1] Claude / [2] Codex 대화식 선택
 
 풀을 경유하는 `cl`(Claude Code)과 `co`(Codex), 그리고 `tai`, `tais`, LaunchAgent용 `taistart`/`tairestart`/`taistop`을 정의하고, 전역으로 고정된 `ANTHROPIC_BASE_URL`을 해제합니다 — TeamAI는 세션마다 자체 포트를 가리키므로, 남아 있는 전역 값은 이미 죽었을 수도 있는 프록시로 트래픽을 보낼 뿐입니다. 블록은 마커로 구분되어 제자리에서 다시 쓰이므로, 재실행하면 덧붙지 않고 갱신됩니다. 쓸 때마다 타임스탬프가 붙은 백업이 남고, 설치/제거를 반복해도 파일이 바이트 단위로 복원됩니다.
 
-수퍼바이저는 선택 사항입니다. `cl`, `co`, `tai`, `teamai run` 모두 아무것도 리스닝하고 있지 않으면 스스로 릴레이를 띄우므로, LaunchAgent가 내려갔거나 실패했거나 애초에 설치되지 않았어도 계속 동작합니다. 죽은 프로세스가 남긴 오래된 `server.json`은 무시하고 교체합니다. 기동이 실패하면 "did not start"라는 맨 문장 대신 서버가 알려준 이유(포트 사용 중, 읽을 수 없는 자격증명 파일 등)를 보고하며, 전체 출력은 `~/.config/teamai/server-start.log`에 남습니다.
+수퍼바이저는 선택 사항입니다. `cl`, `co`, `tai`, `teamai run`은 인증된 control health가 응답하지 않으면 릴레이를 직접 기동합니다. `teamai supervise`는 같은 health endpoint를 감시하고 3회 연속 실패하면 서버를 교체하므로, PID는 살아 있지만 포트가 죽은 상태도 복구합니다. 기동이 실패하면 "did not start"라는 문장 대신 서버가 알려준 이유(포트 사용 중, 읽을 수 없는 자격증명 파일 등)를 보고하며, 전체 출력은 `~/.config/teamai/server-start.log`에 남습니다.
 
 ### 릴레이를 로그인 항목으로 실행하기
 
@@ -87,7 +87,7 @@ teamai session        # [1] Claude / [2] Codex 대화식 선택
   <array>
     <string>/usr/local/bin/node</string>
     <string>/ABSOLUTE/PATH/TO/team-ai/dist/src/cli.js</string>
-    <string>server</string>
+    <string>supervise</string>
   </array>
   <key>RunAtLoad</key>      <true/>
   <key>KeepAlive</key>      <true/>
@@ -100,7 +100,7 @@ teamai session        # [1] Claude / [2] Codex 대화식 선택
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teamai.proxy.plist
 ```
 
-Node 경로는 `command -v node`로 확인한 실제 경로를 넣으세요. LaunchAgent는 셸의 PATH를 물려받지 않습니다.
+Node 경로는 `command -v node`로 확인한 실제 경로를 넣으세요. LaunchAgent는 셸의 PATH를 물려받지 않습니다. 수퍼바이저가 관리하는 로그인 항목을 멈출 때는 `launchctl`을 사용해야 합니다. 자식 릴레이만 종료하면 수퍼바이저가 다시 기동합니다.
 
 ## 계정
 
@@ -114,6 +114,10 @@ teamai import claude --from ~/.config/teamclaude.json
 
 # Codex CLI의 현재 파일 기반 로그인 가져오기 (존재할 경우)
 teamai import codex
+
+# codex-multi-auth의 모든 계정과 선택된 워크스페이스 가져오기
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json --dry-run
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json
 ```
 
 최근 버전의 Claude Code는 자격증명을 `~/.claude/.credentials.json` 대신 macOS 키체인에 저장할 수 있습니다. 그 경우에는 `teamai login`을 쓰세요. `import`는 원본 TeamClaude·Claude Code·Codex 파일을 절대 수정하지 않습니다. TeamAI는 릴레이 세션용으로 격리된 Codex 홈을 따로 유지하므로 사용자의 원래 `~/.codex`는 그대로 남습니다.
@@ -127,12 +131,18 @@ teamai start                                   # 릴레이 기동 후 대시보�
 teamai stop                                    # 릴레이 중지
 teamai restart                                 # 중지 후 재기동, 대시보드
 teamai server                                  # 릴레이를 포그라운드로 실행
+teamai supervise                               # 릴레이 실행 + health 감시·복구
 teamai tui                                     # 대시보드만 (자동 기동 없음)
+teamai codex-app bind                          # Codex App을 TeamAI로 라우팅
+teamai codex-app status
+teamai codex-app unbind                        # 기존 provider 복원
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # 또는: auto
 teamai capture [--redact partial|full|none] [--out DIR]   # 대시보드를 .txt + .png로 저장 (TTY 불필요)
 ```
+
+`codex-app bind`는 활성 Codex 설정에서 최상위 `model_provider`만 바꾸고 마커가 붙은 `model_providers.teamai` 블록을 추가합니다. 기존 provider는 `~/.config/teamai` 아래에 기록했다가 `unbind`에서 복원하며, 그 밖의 TOML 텍스트는 그대로 유지합니다. 관리 블록에는 로컬 릴레이 bearer token이 들어가므로 Codex 설정 파일은 `0600`으로 저장됩니다. bind/unbind 뒤에는 Codex App을 재시작하고, 바인딩 중에는 수퍼바이저를 계속 실행해야 합니다.
 
 계정은 남은 할당량이 많은 순(적게 쓴 순)으로 정렬되며, 대시보드와 풀의 실제 선택 로직이 같은 순서를 씁니다 — 맨 윗줄이 다음 요청이 나갈 계정입니다. Claude는 전체 주간 창이 아니라 모델별 주간(Fable) 창으로 판정하는데, 최상위 모델을 먼저 거절하는 것이 실제로 그 창이기 때문입니다. 모든 계정이 소진되면 전부 동점이 되고, 그때는 가장 먼저 풀리는 순으로 넘어갑니다 — 오늘 아무도 요청을 처리할 수 없는 상황에서는 리셋까지 남은 시간만이 계정을 구분하는 유일한 기준입니다(Claude는 Fable 창, Codex는 주간 창 기준). 측정되지 않은 계정은 맨 뒤로 갑니다(알 수 없음은 비어 있음과 다릅니다). 고정된 우선순위는 여전히 우선하며, `c`로 설정된 순서로 되돌릴 수 있습니다.
 
@@ -183,7 +193,7 @@ Fable 등급 429(`7d_oi`는 거절됐지만 공유 `5h`/`7d` 창은 아직 허�
 
 ## 범위와 준수 사항
 
-0.1 버전은 구독 OAuth 계정과 래퍼로 실행하는 CLI 세션을 대상으로 합니다. 공개 OpenAI 호환 API를 제공하지 않고, Claude 요청을 Codex 요청으로 변환하지 않으며, Codex Desktop을 지원하지 않고, 서로 다른 사람의 자격증명을 함께 묶지 않습니다. 제공자의 약관과 정책 준수 책임은 사용자에게 있습니다. 프로덕션·상업용 API 워크로드에는 제공자의 공식 API 과금 체계를 쓰세요.
+0.1 버전은 구독 OAuth 계정, 래퍼로 실행한 CLI 세션, 명시적으로 바인딩한 Codex App을 대상으로 합니다. 공개 OpenAI 호환 API를 제공하지 않고, Claude 요청을 Codex 요청으로 변환하지 않으며, Codex App 자체를 설치·실행하지 않고, 서로 다른 사람의 자격증명을 함께 묶지 않습니다. 제공자의 약관과 정책 준수 책임은 사용자에게 있습니다. 프로덕션·상업용 API 워크로드에는 제공자의 공식 API 과금 체계를 쓰세요.
 
 ## 개발
 

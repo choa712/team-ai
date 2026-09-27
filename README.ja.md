@@ -25,7 +25,7 @@ cd team-ai
 ./scripts/install.sh
 ```
 
-`install.sh` は依存関係のインストール、ビルド、`teamai`/`tai`/`tac`/`tax` コマンドのリンクを行い、シェルブロックを追加するかどうかを尋ねます。冪等なので、アップグレードする際は再実行するだけで済みます。シェルブロックを省略するには `--no-shell`、実際には変更せず何が行われるかを確認するには `--dry-run` を渡してください。
+`install.sh` は依存関係のインストール、ビルド、`teamai`/`tai`/`taic`/`tax` コマンドのリンクを行い、シェルブロックを追加するかどうかを尋ねます。冪等なので、アップグレードする際は再実行するだけで済みます。シェルブロックを省略するには `--no-shell`、実際には変更せず何が行われるかを確認するには `--dry-run` を渡してください。
 
 手動で同じことを行う場合:
 
@@ -49,16 +49,16 @@ tai
 特定のプロバイダーで直接セッションを開始するには、専用のランチャーを使います。必要に応じて TeamAI リレーを自動的に起動し、後続の引数はすべて公式クライアントにそのまま渡します。
 
 ```bash
-tac                   # TeamAI のアカウントプール経由の Claude Code
-tac --resume          # teamai claude --resume と同じ
+taic                  # TeamAI のアカウントプール経由の Claude Code
+taic --resume         # teamai claude --resume と同じ
 tax                   # TeamAI のアカウントプール経由の Codex
 tax resume            # teamai codex resume と同じ
-teamai claude         # tac の長い形式
+teamai claude         # taic の長い形式
 teamai codex          # tax の長い形式
 teamai session        # [1] Claude か [2] Codex を対話的に選択
 ```
 
-これらの名前は、既存の TeamClaude の `tc` シェル関数を置き換えないよう意図的に選ばれています。`tc` は引き続き TeamClaude を、`tac` と `tax` は TeamAI を対象にできます。
+これらの名前は、既存の TeamClaude の `tc` シェル関数と標準の `tac` テキストツールを置き換えないよう意図的に選ばれています。`tc` は引き続き TeamClaude を、`taic` と `tax` は TeamAI を対象にできます。
 
 ## シェル設定
 
@@ -195,7 +195,7 @@ npm run lint
 
 派生物については [NOTICE](NOTICE) を、ローカルのセキュリティモデルについては [SECURITY.md](SECURITY.md) を参照してください。
 
-> Translation update pending: see the canonical English README for nested Codex relay configuration inheritance.
+> Translation update pending: see the canonical English README for codex-multi-auth import, Codex App binding, health supervision, and nested Codex relay configuration inheritance.
 
 <!-- transient-recovery-2026-09-22 -->
 一時的な上流エラーのHTTPステータス・本文・Retry-Afterを保持します。アカウント切替後の再試行は最大2ラウンド、待機は各10秒・合計20秒以内です。長い待機はクライアントへ返し、成功したストリームは再実行しません。二重再試行を避けるためCodexのHTTP再試行は無効のままです。ビルド後にリレーを再起動すると適用されます。

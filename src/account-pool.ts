@@ -13,6 +13,10 @@ export class AccountPool {
   readonly maxWarmupTries = 3;
   private refreshes = new Map<string, Promise<void>>();
   private sweepInFlight = false;
+  // Replaces a plain rotation when the accounts are shared with other machines
+  // (see cloud-sync.ts): the hook decides whether to rotate at all and publishes
+  // what it rotated. Null keeps the local-only behaviour.
+  refreshVia: ((account: RuntimeAccount, rotate: (credential: OAuthCredential) => Promise<OAuthCredential>) => Promise<OAuthCredential>) | null = null;
 
   // Accounts still holding Fable budget are kept for Fable. An account measured
   // below this line reserves its remainder; at or above it, it is the preferred
@@ -279,7 +283,6 @@ export class AccountPool {
   // the next turn for nothing. Only a quota or forbidden cooldown evicts.
   private isHome(account: RuntimeAccount, wantsFable: boolean): boolean {
     if (account.cooldownReason === 'network') {
-      const now = Date.now();
       const still = account.enabled && !account.error && (account.usage === null || account.usage < this.threshold) && !(wantsFable && AccountPool.fableSpent(account, 1));
       return still && !this.divertsOff(account, wantsFable, NO_EXCLUSIONS);
     }
@@ -345,7 +348,12 @@ export class AccountPool {
     if (!force && account.credential.expiresAt && account.credential.expiresAt > Date.now() + 5 * 60_000) return;
     const existing = this.refreshes.get(account.id);
     if (existing) return existing;
-    const promise = this.provider.refresh(account.credential).then((next) => { account.credential = next; account.error = null; }).finally(() => this.refreshes.delete(account.id));
+    // A sync or re-login can replace the credential while this runs; that newer
+    // one stays, rather than being overwritten by a result for the old one.
+    const started = account.credential;
+    const rotate = (credential: OAuthCredential): Promise<OAuthCredential> => this.provider.refresh(credential);
+    const work = this.refreshVia ? this.refreshVia(account, rotate) : rotate(started);
+    const promise = work.then((next) => { if (account.credential === started) { account.credential = next; account.error = null; } }).finally(() => this.refreshes.delete(account.id));
     this.refreshes.set(account.id, promise);
     return promise;
   }
@@ -369,6 +377,7 @@ export class AccountPool {
         && (a.error !== null || a.credential.expiresAt === null || a.credential.expiresAt < now + 5 * 60_000));
       let healed = 0; let failed = 0;
       for (const account of due) {
+        const started = account.credential;
         // Force when the account errored or its expiry is unknown: refresh()'s
         // own gate skips a token that still looks valid, but an errored account
         // needs the attempt to heal and a null expiry never trips the gate at
@@ -380,7 +389,7 @@ export class AccountPool {
         // token cannot be renewed cannot serve, so it is benched here until a
         // later sweep — or a re-login adopted by adoptCredentials — heals it.
         try { await this.refresh(account, account.error !== null || account.credential.expiresAt === null); healed++; }
-        catch (error) { failed++; account.error = `token refresh failed: ${(error as Error).message}`; }
+        catch (error) { failed++; if (account.credential === started) account.error = `token refresh failed: ${(error as Error).message}`; }
       }
       return { healed, failed };
     } finally {
@@ -590,7 +599,19 @@ export class AccountPool {
     for (const account of this.accounts) {
       const fresh = latest[account.credentialId];
       if (!fresh || fresh.expiresAt === null || fresh.accessToken === account.credential.accessToken) continue;
-      if (account.credential.expiresAt !== null && fresh.expiresAt <= account.credential.expiresAt) continue;
+      // Only two things replace what this server holds: a login (a later
+      // loggedInAt), and a newer credential for an account that is failing.
+      // A later expiry alone is not enough: disk can hold a chain this server
+      // already replaced (a token recovered from the cloud expires whenever the
+      // other machine minted it), and adopting it would bring a dead chain back.
+      // A failing account still takes only something newer: an older disk copy
+      // is a chain it already rotated past, and restoring it would lose the pair
+      // it holds now (a transient 503 after a successful rotation, for example).
+      // An earlier login is never newer, whatever its expiry.
+      const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
+      const sameOrLaterLogin = (fresh.loggedInAt ?? 0) >= (account.credential.loggedInAt ?? 0);
+      const newerForFailing = account.error !== null && sameOrLaterLogin && (account.credential.expiresAt === null || fresh.expiresAt > account.credential.expiresAt);
+      if (!relogin && !newerForFailing) continue;
       account.credential = fresh; account.error = null; adopted++;
     }
     return adopted;

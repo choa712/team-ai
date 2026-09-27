@@ -35,6 +35,26 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
     const profile = await claudeProfile(data.accessToken);
     return [{ label: profile.label, credential: { accessToken: data.accessToken, refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null, expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null, accountId: profile.id } }];
   }
+  if (Array.isArray(raw.accounts)) {
+    const accounts = raw.accounts.flatMap((entry) => {
+      const data = entry as Record<string, unknown>;
+      if (typeof data.accessToken !== 'string') return [];
+      const workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+      const selectedIndex = typeof data.currentWorkspaceIndex === 'number' ? data.currentWorkspaceIndex : 0;
+      const selected = workspaces[selectedIndex] as Record<string, unknown> | undefined;
+      const accountId = typeof selected?.id === 'string' ? selected.id : typeof data.accountId === 'string' ? data.accountId : null;
+      if (!accountId) return [];
+      const label = typeof data.email === 'string' ? data.email : typeof data.accountLabel === 'string' ? data.accountLabel : accountId;
+      return [{ label, credential: {
+        accessToken: data.accessToken,
+        refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null,
+        expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null,
+        accountId,
+      } }];
+    });
+    if (!accounts.length) throw new Error('No OAuth accounts found in codex-multi-auth config');
+    return [...new Map(accounts.map((account) => [account.credential.accountId, account])).values()];
+  }
   const tokens = (raw.tokens || raw) as Record<string, unknown>;
   if (typeof tokens.access_token !== 'string') throw new Error('Codex access_token is missing');
   const idClaims = decodeJwt(typeof tokens.id_token === 'string' ? tokens.id_token : tokens.access_token);

@@ -5,11 +5,15 @@ import { AccountPool } from './account-pool.js';
 import { createProxy, secureEqual } from './proxy.js';
 import { createServer } from 'node:http';
 import { providers } from './providers.js';
+import { CloudClient, CloudCoordinator, loadCloudLink } from './cloud-sync.js';
+import { syncFromCloud } from './cloud-fleet.js';
 import { defaultConfig, loadConfig, loadCredentials, loadState, paths, saveCredentials, saveState } from './storage.js';
-import type { PersistedState, ProviderId, TeamAIConfig } from './types.js';
+import type { OAuthCredential, PersistedState, ProviderId, TeamAIConfig } from './types.js';
 
 // How long a stopping server waits for in-flight responses before cutting them.
 const DRAIN_MS = 5_000;
+
+export function listenersHealthy(servers: Array<Pick<Server, 'listening'>>): boolean { return servers.length > 1 && servers.every((server) => server.listening); }
 
 // Ports this provider should still answer on besides the configured one:
 // whatever the user listed in proxy.legacyPorts, plus the built-in default,
@@ -33,6 +37,14 @@ export async function runServer(): Promise<void> {
   // interval instead of being overwritten by the stale one it replaced.
   const persistNow = async (): Promise<void> => { const updated = await loadCredentials(); const adopted = pools.reduce((n, p) => n + p.adoptCredentials(updated), 0); if (adopted) events.push({ at: Date.now(), message: `Adopted ${adopted} re-logged credential(s)` }); const next: PersistedState = { version: 1, accounts: {}, events }; pools.forEach((p) => p.exportState(next)); for (const p of pools) for (const a of p.accounts) updated[a.credentialId] = a.credential; await Promise.all([saveState(next), saveCredentials(updated)]); };
   const persist = (event?: string): void => { if (event) { events.push({ at: Date.now(), message: event }); if (events.length > 200) events.splice(0, events.length - 200); } if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; saving = saving.then(persistNow, persistNow); }, 25); };
+  // Shared accounts: when a cloud key is linked, Claude refreshes go through the
+  // coordinator so a token rotated here is published and one rotated elsewhere
+  // is adopted instead of being rotated again (see cloud-sync.ts).
+  const claudePool = pools.find((p) => p.provider.id === 'claude' && p.accounts.length);
+  const link = await loadCloudLink().catch((error: Error) => { console.log(`[TeamAI] cloud link unreadable: ${error.message}`); return null; });
+  const verify = async (credential: OAuthCredential): Promise<boolean> => { try { await providers.claude.fetchProfile!(credential); return true; } catch { return false; } };
+  const cloud = link && claudePool ? new CloudCoordinator(new CloudClient(link), (message) => console.log(`[TeamAI] ${message}`), 20_000, Date.now, verify) : null;
+  if (cloud && claudePool) claudePool.refreshVia = (account, rotate) => cloud.refresh(account.label, account.credential, rotate);
   const servers: Server[] = [];
   for (const pool of pools) {
     if (!pool.accounts.length) continue;
@@ -97,12 +109,33 @@ export async function runServer(): Promise<void> {
   // fleet still adopts a re-login (see persistNow) within five minutes.
   const refreshLapsed = async (): Promise<void> => { const results = await Promise.all(pools.map((pool) => pool.refreshLapsed())); const healed = results.reduce((a, r) => a + r.healed, 0); const failed = results.reduce((a, r) => a + r.failed, 0); if (healed) persist(`Refreshed ${healed} lapsed token(s)`); if (failed) persist(`${failed} token refresh(es) failed — re-login needed`); if (!healed && !failed) persist(); };
   setImmediate(() => void refreshLapsed()); const lapsedTimer = setInterval(() => void refreshLapsed(), 5 * 60_000); lapsedTimer.unref();
+  // Cloud sync: adopt tokens other machines rotated (this is also what revives an
+  // account whose refresh was refused here), publish ones this machine rotated
+  // but could not send. Accounts themselves only move with `teamai cloud pull`.
+  let cloudTimer: NodeJS.Timeout | null = null;
+  if (cloud && claudePool) {
+    const runCloudSync = async (): Promise<void> => {
+      try {
+        const result = await syncFromCloud(cloud, claudePool);
+        const parts = [result.adopted && `adopted ${result.adopted}`, result.published && `published ${result.published}`].filter(Boolean);
+        persist(parts.length ? `Cloud sync: ${parts.join(', ')}` : undefined);
+      } catch (error) { persist(`Cloud sync failed: ${(error as Error).message}`); }
+    };
+    setTimeout(() => void runCloudSync(), 10_000).unref();
+    cloudTimer = setInterval(() => void runCloudSync(), 10 * 60_000); cloudTimer.unref();
+  }
   // Local control channel: the TUI runs in a separate process, so a fleet-wide
   // quota re-measure (R) has to reach the pools living here. Bound to the proxy
   // host and gated by the same client token as the proxies.
   const control = createServer(async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
     if (!secureEqual(token, config.proxy.clientToken)) { res.writeHead(401).end('{}'); return; }
+    if (req.url === '/health') {
+      const healthy = listenersHealthy(servers);
+      res.writeHead(healthy ? 200 : 503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: healthy ? 'ok' : 'degraded', pid: process.pid }));
+      return;
+    }
     if (!req.url?.startsWith('/probe')) { res.writeHead(404).end('{}'); return; }
     // Pick up accounts added or removed by the TUI (a separate process) before
     // measuring, so `R` reflects the current fleet without a server restart.
@@ -132,7 +165,7 @@ export async function runServer(): Promise<void> {
   // moment, then cut what is left: the cut client retries, the rest reconnect
   // to the new process seconds later.
   const shutdown = async (): Promise<void> => {
-    clearInterval(profileTimer); clearInterval(lapsedTimer); if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    clearInterval(profileTimer); clearInterval(lapsedTimer); if (cloudTimer) clearInterval(cloudTimer); if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     const drained = Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
     await Promise.race([drained, new Promise<void>((resolve) => setTimeout(resolve, DRAIN_MS).unref())]);
     servers.forEach((server) => server.closeAllConnections());
@@ -141,4 +174,30 @@ export async function runServer(): Promise<void> {
   process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
 }
 
-export async function runningPid(): Promise<number | null> { try { const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number }; if (!value.pid) return null; process.kill(value.pid, 0); return value.pid; } catch { return null; } }
+export async function recordedServerPid(): Promise<number | null> {
+  try {
+    const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number };
+    if (!value.pid) return null;
+    process.kill(value.pid, 0);
+    return value.pid;
+  } catch { return null; }
+}
+
+export async function probeServer(config: TeamAIConfig, expectedPid?: number, timeoutMs = 1_000): Promise<boolean> {
+  try {
+    const port = config.proxy.controlPort ?? config.proxy.claudePort + 100;
+    const response = await fetch(`http://${config.proxy.host}:${port}/health`, {
+      headers: { authorization: `Bearer ${config.proxy.clientToken}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return false;
+    const value = await response.json() as { status?: unknown; pid?: unknown };
+    return value.status === 'ok' && Number.isInteger(value.pid) && (expectedPid === undefined || value.pid === expectedPid);
+  } catch { return false; }
+}
+
+export async function runningPid(): Promise<number | null> {
+  const pid = await recordedServerPid();
+  if (!pid) return null;
+  try { return await probeServer(await loadConfig(), pid) ? pid : null; } catch { return null; }
+}
