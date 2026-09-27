@@ -104,3 +104,44 @@ test('supervisor sends one SIGTERM so a draining server can finish its final sav
     for (const pid of seen) { try { process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
   }
 });
+
+test('supervisor takes over a healthy unsupervised server instead of fighting it for the port', { timeout: 15_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'teamai-supervisor-takeover-')); const log = join(home, 'pids.log'); const script = join(home, 'fake-server.mjs');
+  const config = defaultConfig(); config.proxy.controlPort = await freePort();
+  await writeFile(join(home, 'config.json'), JSON.stringify(config));
+  await writeFile(script, `
+    import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+    import { createServer } from 'node:http';
+    const config = JSON.parse(readFileSync(process.env.TEAMAI_HOME + '/config.json', 'utf8'));
+    appendFileSync(process.env.TEAMAI_TEST_PID_LOG, String(process.pid) + '\\n');
+    const server = createServer((req, res) => {
+      if (req.headers.authorization !== 'Bearer ' + config.proxy.clientToken) { res.writeHead(401).end(); return; }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'ok', pid: process.pid }));
+    });
+    server.listen(config.proxy.controlPort, config.proxy.host, () => writeFileSync(process.env.TEAMAI_HOME + '/server.json', JSON.stringify({ pid: process.pid })));
+    const stop = () => server.close(() => process.exit(0));
+    process.once('SIGTERM', stop); process.once('SIGINT', stop);
+  `);
+  const names = ['TEAMAI_HOME', 'TEAMAI_TEST_PID_LOG', 'TEAMAI_SUPERVISOR_INTERVAL_MS', 'TEAMAI_SUPERVISOR_STARTUP_GRACE_MS'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, { TEAMAI_HOME: home, TEAMAI_TEST_PID_LOG: log, TEAMAI_SUPERVISOR_INTERVAL_MS: '50', TEAMAI_SUPERVISOR_STARTUP_GRACE_MS: '10000' });
+  // A launcher-started server, running before the supervisor.
+  const { spawn } = await import('node:child_process');
+  const orphan = spawn(process.execPath, [script], { stdio: 'ignore', env: process.env });
+  const controller = new AbortController(); let seen: number[] = [];
+  try {
+    seen = await pids(log, 1);
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) { try { if (JSON.parse(await readFile(join(home, 'server.json'), 'utf8')).pid === orphan.pid) break; } catch { /* not yet */ } await new Promise((r) => setTimeout(r, 25)); }
+    const supervising = runSupervisor(script, { signal: controller.signal });
+    seen = await pids(log, 2);
+    assert.equal(seen[0], orphan.pid);
+    assert.notEqual(seen[1], orphan.pid);
+    assert.ok(orphan.exitCode !== null || orphan.signalCode !== null || await new Promise((r) => orphan.once('exit', () => r(true))), 'the unsupervised server was stopped');
+    controller.abort(); await supervising;
+  } finally {
+    controller.abort();
+    for (const name of names) { const value = previous[name]; if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    for (const pid of [...seen, orphan.pid]) { try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+  }
+});

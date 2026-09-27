@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readFile, rm } from 'node:fs/promises';
 import { atomicWrite, loadConfig, paths } from './storage.js';
-import { probeServer } from './runtime.js';
+import { probeServer, recordedServerPid } from './runtime.js';
 
 const numberFromEnv = (name: string, fallback: number): number => {
   const parsed = Number(process.env[name]);
@@ -46,6 +46,27 @@ async function terminate(child: ChildProcess, graceMs: number): Promise<void> {
   if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await closed(child); }
 }
 
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+// A server started earlier by a launcher holds the ports, so a supervised child
+// would die on EADDRINUSE over and over while the unsupervised one could hang
+// unnoticed. Take it over: ask it to stop (it drains and saves its tokens), wait,
+// and refuse to start if it will not go.
+export async function takeOverServer(graceMs: number): Promise<number | null> {
+  const pid = await recordedServerPid();
+  if (!pid || pid === process.pid || !alive(pid)) return null;
+  // Signal only a process that proves it is this relay (authenticated health
+  // naming the same pid); a recycled pid belongs to someone else.
+  let ours = false;
+  try { ours = await probeServer(await loadConfig(), pid); } catch { ours = false; }
+  if (!ours) return null;
+  try { process.kill(pid, 'SIGTERM'); } catch { return null; }
+  const deadline = Date.now() + graceMs;
+  while (alive(pid) && Date.now() < deadline) await wait(100);
+  if (alive(pid)) throw new Error(`An unsupervised TeamAI server (pid ${pid}) did not stop within ${Math.round(graceMs / 1000)} s; stop it and start the supervisor again`);
+  return pid;
+}
+
 export async function recordedSupervisorPid(): Promise<number | null> {
   try {
     const value = JSON.parse(await readFile(paths().supervisor, 'utf8')) as { pid?: number };
@@ -74,6 +95,10 @@ export async function runSupervisor(cliPath: string, options: { signal?: AbortSi
   const existing = await recordedSupervisorPid();
   if (existing && existing !== process.pid) throw new Error(`TeamAI supervisor already running (pid ${existing})`);
   await atomicWrite(paths().supervisor, { pid: process.pid, startedAt: new Date().toISOString() });
+  try {
+    const taken = await takeOverServer(stopGraceMs);
+    if (taken) console.error(`[TeamAI] supervisor took over from unsupervised server pid=${taken}`);
+  } catch (error) { await removeOwnRecord(); throw error; }
   let stopping = options.signal?.aborted ?? false; let child: ChildProcess | null = null; let backoffMs = initialBackoffMs;
   const stop = (): void => { stopping = true; if (child) signalTerm(child); };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
