@@ -105,9 +105,12 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       // Exhausting this request's candidates does not mean exhausting quota.
       // Only retry explicit pre-stream transient HTTP failures; never replay a
       // successful/partially streamed response. Keep retries in the relay.
+      // Once an attempt may have delivered the request (maybeDelivered), no
+      // failure of any kind earns a retry: a 503 from the next account used to
+      // re-arm the rounds and re-send what the first account may have run.
       if (lastFailure) {
         const delay = Math.max(1000 * 2 ** retryRounds, nextRetryAt - Date.now()) + Math.floor(Math.random() * 200);
-        if (lastFailure.transient && transientAccounts.size && retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
+        if (lastFailure.transient && transientAccounts.size && !maybeDelivered && retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
           retryRounds++; retryWaitMs += delay;
           onChange(`${pool.provider.label} transient retry ${retryRounds}/2 after ${delay}ms`);
           await waitForRetry(delay, res);
