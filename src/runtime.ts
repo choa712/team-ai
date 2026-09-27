@@ -7,7 +7,7 @@ import { createServer } from 'node:http';
 import { providers } from './providers.js';
 import { CloudClient, CloudCoordinator, loadCloudLink } from './cloud-sync.js';
 import { syncFromCloud } from './cloud-fleet.js';
-import { defaultConfig, loadConfig, loadCredentials, loadState, paths, saveCredentials, saveState } from './storage.js';
+import { appendLog, defaultConfig, loadConfig, loadCredentials, loadState, paths, saveCredentials, saveState } from './storage.js';
 import type { OAuthCredential, PersistedState, ProviderId, TeamAIConfig } from './types.js';
 
 // How long a stopping server waits for in-flight responses before cutting them.
@@ -32,11 +32,16 @@ export async function runServer(): Promise<void> {
   const pools = (['claude', 'codex'] as const).map((id) => new AccountPool(providers[id], config.accounts, credentials, state, config.switchThreshold, config.maxConcurrentPerAccount, config.fableReserveThreshold ?? 0.8));
   if (pools.every((p) => p.accounts.length === 0)) throw new Error('No accounts configured');
   let saveTimer: NodeJS.Timeout | null = null; let saving = Promise.resolve(); const events = [...(state.events || [])].slice(-200);
+  // Every event lands in the dashboard ring (200 entries) and in the activity
+  // log on disk (events.log, rotated), which is the one that outlives a busy
+  // afternoon: the ring was four minutes deep when a blip had to be traced.
+  const pendingLog: string[] = [];
+  const record = (message: string): void => { events.push({ at: Date.now(), message }); if (events.length > 200) events.splice(0, events.length - 200); pendingLog.push(`${new Date().toISOString()} ${message}`); };
   // Every save first adopts any credential the TUI wrote since (a re-login),
   // then writes memory back — so a fresh token is picked up within a save
   // interval instead of being overwritten by the stale one it replaced.
-  const persistNow = async (): Promise<void> => { const updated = await loadCredentials(); const adopted = pools.reduce((n, p) => n + p.adoptCredentials(updated), 0); if (adopted) events.push({ at: Date.now(), message: `Adopted ${adopted} re-logged credential(s)` }); const next: PersistedState = { version: 1, accounts: {}, events }; pools.forEach((p) => p.exportState(next)); for (const p of pools) for (const a of p.accounts) updated[a.credentialId] = a.credential; await Promise.all([saveState(next), saveCredentials(updated)]); };
-  const persist = (event?: string): void => { if (event) { events.push({ at: Date.now(), message: event }); if (events.length > 200) events.splice(0, events.length - 200); } if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; saving = saving.then(persistNow, persistNow); }, 25); };
+  const persistNow = async (): Promise<void> => { const updated = await loadCredentials(); const adopted = pools.reduce((n, p) => n + p.adoptCredentials(updated), 0); if (adopted) record(`Adopted ${adopted} re-logged credential(s)`); const next: PersistedState = { version: 1, accounts: {}, events }; pools.forEach((p) => p.exportState(next)); for (const p of pools) for (const a of p.accounts) updated[a.credentialId] = a.credential; const lines = pendingLog.splice(0); await Promise.all([saveState(next), saveCredentials(updated), appendLog(paths().events, lines).catch((error: Error) => console.log(`[TeamAI] activity log unwritable: ${error.message}`))]); };
+  const persist = (event?: string): void => { if (event) record(event); if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; saving = saving.then(persistNow, persistNow); }, 25); };
   // Shared accounts: when a cloud key is linked, Claude refreshes go through the
   // coordinator so a token rotated here is published and one rotated elsewhere
   // is adopted instead of being rotated again (see cloud-sync.ts).

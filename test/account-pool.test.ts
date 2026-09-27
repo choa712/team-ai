@@ -443,3 +443,22 @@ test('an explicit priority orders accounts within a reservation tier, not across
   assert.equal(pool.acquire('s1', new Set(), false)?.id, 'spare', 'non-Fable turn skips the reserving #1 account');
   assert.equal(pool.acquire('s2', new Set(), true)?.id, 'reserved', 'Fable turn still honours priority');
 });
+
+test('a shortfall made of network benches is reported as unreachable, with the earliest bench end as the retry', () => {
+  const pool = new AccountPool(provider, [account('a'), account('b')], { 'codex:a': credential('a'), 'codex:b': credential('b') }, state);
+  const a = pool.accounts[0]!; const b = pool.accounts[1]!;
+  pool.cooldown(a, 2_000, 'network'); pool.cooldown(b, 4_000, 'network');
+  const shortfall = pool.explainShortfall(new Set(), false);
+  assert.equal(shortfall.reason, 'upstream_unreachable');
+  assert.ok(shortfall.retryAfterMs !== null && shortfall.retryAfterMs > 1_500 && shortfall.retryAfterMs <= 2_000, `retry is the earliest bench end: ${shortfall.retryAfterMs}`);
+  assert.match(shortfall.message, /^No Codex account is reachable right now \(2 accounts: 2 paused after a connection failure\)\. Retry in 2s\.$/);
+  // A quota cooldown next to a network bench is still a budget answer for that
+  // account, but the benched one comes back in seconds — so the request waits.
+  pool.cooldown(b, 60_000, 'quota');
+  const mixed = pool.explainShortfall(new Set(), false);
+  assert.equal(mixed.reason, 'upstream_unreachable');
+  assert.match(mixed.message, /2 accounts: 1 paused after a connection failure, 1 cooling down after an upstream rejection/);
+  // With no network bench left the answer is quota, as before.
+  pool.cooldown(a, 60_000, 'quota');
+  assert.equal(pool.explainShortfall(new Set(), false).reason, 'quota_exhausted');
+});

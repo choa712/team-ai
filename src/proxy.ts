@@ -54,6 +54,24 @@ export function createProxy(pool: AccountPool, clientToken: string, onChange: (e
   });
 }
 
+// How long an account is benched after a connection attempt to upstream
+// failed. Short on purpose: a route or DNS blip clears in moments, and the
+// bench only has to keep the next few requests from tripping on it.
+const NETWORK_COOLDOWN_MS = 2_000;
+
+// fetch reports every connection failure as "fetch failed" and keeps the cause
+// (ECONNREFUSED, ENOTFOUND, ECONNRESET) one level down. Surface it: a relay
+// that only says "fetch failed" cannot be told apart from an upstream outage
+// after the fact — two 2026-09-27 blips had to be reconstructed from client logs.
+export function describeFetchError(error: unknown): string {
+  const top = error instanceof Error ? error.message : String(error);
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  if (!cause) return top;
+  const code = (cause as { code?: unknown }).code;
+  const detail = cause instanceof AggregateError && cause.errors.length ? cause.errors.map((e) => e instanceof Error ? e.message : String(e)).join('; ') : cause instanceof Error ? cause.message : String(cause);
+  return `${top}: ${typeof code === 'string' && !detail.includes(code) ? `${code} ${detail}`.trim() : detail}`;
+}
+
 async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer, path: string, pool: AccountPool, session: string, onChange: (event?: string) => void): Promise<void> {
   const excluded = new Set<string>(); let authRetried = false;
   // Decided once from the request body: the retry loop must not re-read a body
@@ -90,6 +108,22 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       // (and whose, and until when) — and leave a trace in the activity log:
       // this 429 never reached upstream, so nothing else records it.
       const shortfall = pool.explainShortfall(excluded, wantsFable);
+      if (shortfall.reason === 'upstream_unreachable') {
+        // Every candidate is benched after a connection failure and is back
+        // within seconds. Wait for it here: a client with no retries of its own
+        // (Codex under the relay) would otherwise take the refusal as final.
+        // A bench too long to wait out is a 503 — nothing about budget is known.
+        const delay = (shortfall.retryAfterMs ?? 0) + 50 + Math.floor(Math.random() * 200);
+        if (retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
+          retryRounds++; retryWaitMs += delay;
+          onChange(`${pool.provider.label} ${req.method} ${path} → upstream unreachable; waiting ${delay}ms (${retryRounds}/2)`);
+          await waitForRetry(delay, res);
+          if (res.destroyed) return;
+          continue;
+        }
+        onChange(`${pool.provider.label} ${req.method} ${path} → 503 ${shortfall.reason}, retry in ${Math.ceil((shortfall.retryAfterMs ?? 1_000) / 1000)}s`);
+        return json(res, 503, { error: shortfall.message }, { 'x-teamai-503-reason': shortfall.reason, 'retry-after': String(Math.min(900, Math.ceil((shortfall.retryAfterMs ?? 1_000) / 1000))) });
+      }
       onChange(`${pool.provider.label} ${req.method} ${path} → 429 ${shortfall.reason}${wantsFable ? ' (fable)' : ''}${shortfall.retryAfterMs ? `, next reset ${AccountPool.formatDuration(shortfall.retryAfterMs)}` : ''}`);
       const headers: Record<string, string> = { 'x-teamai-429-reason': shortfall.reason };
       // Claude Code honours retry-after; cap it so a days-away weekly reset
@@ -116,9 +150,19 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
         response = await fetch(`${pool.provider.upstreamBase}${path}`, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method || '') ? undefined : new Uint8Array(sendBody), signal: headerGuard.signal });
       } finally { clearTimeout(headerTimer); }
     } catch (error) {
-      lastFailure = { response: new Response(null, { status: 502 }), body: JSON.stringify({ error: 'Upstream connection failed' }), transient: false };
-      pool.release(account); pool.cooldown(account, 2_000, 'network'); excluded.add(account.id); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover`);
-      if (excluded.size >= pool.accounts.length) throw error;
+      // A connection that never reached upstream is transient in the same
+      // sense as a 5xx: it says nothing about the account's budget. It used to
+      // end the request the moment every account had failed once (502 "fetch
+      // failed", cause lost), and the client's own retry 200ms later met every
+      // account still benched — answered as a quota 429, which Codex
+      // (request_max_retries=0) took as final. Now the failure is kept as the
+      // request's transient record so the retry rounds above run, timed to the
+      // bench so the first round is not spent on accounts still benched.
+      const detail = describeFetchError(error);
+      lastFailure = { response: new Response(null, { status: 502, headers: { 'content-type': 'application/json' } }), body: JSON.stringify({ error: `Upstream connection failed: ${detail}` }), transient: true };
+      pool.release(account); pool.cooldown(account, NETWORK_COOLDOWN_MS, 'network'); excluded.add(account.id); transientAccounts.add(account.id);
+      nextRetryAt = Math.max(nextRetryAt, Date.now() + NETWORK_COOLDOWN_MS + 50);
+      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail})`);
       continue;
     }
     pool.updateQuota(account, response.headers);

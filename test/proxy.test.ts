@@ -359,3 +359,88 @@ test('an error body that is cut mid-read still releases the account slot', async
     assert.equal(pool.inFlightProxied, 0);
   } finally { proxy.closeAllConnections(); upstream.closeAllConnections(); await Promise.all([new Promise<void>((r) => proxy.close(() => r())), new Promise<void>((r) => upstream.close(() => r()))]); }
 });
+
+// Reserve a port nothing listens on: bind, read it, close. A request there
+// fails with ECONNREFUSED at once — the shape of a route or DNS blip at the
+// relay, where every account's connection attempt dies within milliseconds.
+async function freePort(): Promise<number> {
+  const probe = createServer(); await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+  const address = probe.address(); assert(address && typeof address !== 'string');
+  await new Promise<void>((r) => probe.close(() => r()));
+  return address.port;
+}
+const codexStub = (port: number): Provider => ({
+  id: 'codex', label: 'Codex', upstreamBase: `http://127.0.0.1:${port}`,
+  normalizePath: () => '/codex/responses', rewriteBody: (b) => b, readQuota: () => null, refresh: async (c) => c,
+  buildHeaders: (incoming, account) => { const h = new Headers(incoming); h.set('authorization', `Bearer ${account.credential.accessToken}`); return h; },
+  classifyFailure: () => ({ kind: 'fatal', retryAfterMs: 0 }),
+});
+const codexAccount = (id: string, priority: number): StoredAccount => ({ id, provider: 'codex', label: id, enabled: true, priority, credentialId: id, createdAt: '' });
+const codexCredential = (id: string): OAuthCredential => ({ accessToken: `s-${id}`, refreshToken: null, expiresAt: null, accountId: id });
+const relayCall = (port: number) => fetch(`http://127.0.0.1:${port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
+
+test('a connection failure is retried inside the relay, and a request that arrives during the pause waits instead of hearing the quota is spent', async () => {
+  // 2026-09-27: a network blip made every account's fetch fail within 8ms.
+  // The relay answered 502 "fetch failed", Codex retried 219ms later while
+  // the accounts were still benched, and heard 429 quota_exhausted — which
+  // Codex (request_max_retries=0) took as final. The accounts had 70%+ budget.
+  const port = await freePort();
+  const pool = new AccountPool(codexStub(port), [codexAccount('a', 1), codexAccount('b', 2)], { a: codexCredential('a'), b: codexCredential('b') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  const upstream = createServer(async (req, res) => { req.resume(); await new Promise<void>((r) => req.once('end', r)); res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); });
+  try {
+    const first = relayCall(pa.port);
+    await new Promise((r) => setTimeout(r, 300));
+    // Both accounts are benched for a moment after the failure: this request
+    // finds none free and must wait for the bench to clear, not be refused.
+    const second = relayCall(pa.port);
+    await new Promise((r) => setTimeout(r, 300));
+    await new Promise<void>((r) => upstream.listen(port, '127.0.0.1', r));
+    const [one, two] = await Promise.all([first, second]);
+    assert.equal(one.status, 200, `served once the upstream is back: ${events.join(' | ')}`); await one.text();
+    assert.equal(two.status, 200, `the request that arrived during the pause is served too: ${events.join(' | ')}`); await two.text();
+    assert.ok(events.some((e) => /→ a network error; failover \(.*ECONNREFUSED/.test(e)), `the failure cause is on record: ${events.join(' | ')}`);
+    assert.ok(events.some((e) => /transient retry 1\/2/.test(e)), `the relay retried on its own: ${events.join(' | ')}`);
+    assert.ok(events.some((e) => /upstream unreachable; waiting/.test(e)), `the second request waited out the bench: ${events.join(' | ')}`);
+    assert.ok(!events.some((e) => /429/.test(e)), `nothing was answered with a 429: ${events.join(' | ')}`);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('an upstream that stays unreachable is answered with 502 and the connection error, never with a quota 429', async () => {
+  const port = await freePort();
+  const pool = new AccountPool(codexStub(port), [codexAccount('a', 1)], { a: codexCredential('a') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  try {
+    const started = Date.now();
+    const res = await relayCall(pa.port);
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-teamai-429-reason'), null);
+    const body = JSON.parse(await res.text()) as { error: string };
+    assert.match(body.error, /^Upstream connection failed: .*ECONNREFUSED/);
+    assert.ok(Date.now() - started >= 4_000, 'two retry rounds were spent before giving up');
+    assert.ok(events.some((e) => /502 upstream failure preserved/.test(e)), `the answer is on record: ${events.join(' | ')}`);
+    assert.equal(events.filter((e) => /network error; failover/.test(e)).length, 3, `one attempt plus one per retry round: ${events.join(' | ')}`);
+  } finally { proxy.close(); }
+});
+
+test('a bench too long to wait out is answered with 503 and a retry-after, not a quota 429', async () => {
+  const pool = new AccountPool(codexStub(1), [codexAccount('a', 1), codexAccount('b', 2)], { a: codexCredential('a'), b: codexCredential('b') }, { version: 1, accounts: {} });
+  for (const account of pool.accounts) pool.cooldown(account, 15_000, 'network');
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  try {
+    const res = await relayCall(pa.port);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('x-teamai-503-reason'), 'upstream_unreachable');
+    assert.equal(res.headers.get('x-teamai-429-reason'), null);
+    assert.equal(res.headers.get('retry-after'), '15');
+    const body = JSON.parse(await res.text()) as { error: string };
+    assert.match(body.error, /^No Codex account is reachable right now \(2 accounts: 2 paused after a connection failure\)\. Retry in 15s\.$/);
+    assert.ok(events.some((e) => /→ 503 upstream_unreachable/.test(e)), `the activity log records the 503: ${events.join(' | ')}`);
+  } finally { proxy.close(); }
+});

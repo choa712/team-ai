@@ -146,9 +146,12 @@ export interface Provider {
 
 // Why the pool could not hand out an account, shaped for the 429 the client
 // is about to receive. retryAfterMs is the earliest known roll-over, or null
-// when nothing on record will free up on its own.
+// when nothing on record will free up on its own. 'upstream_unreachable' is
+// not a budget answer at all: every candidate is benched after a connection
+// failure and is back within seconds, so the relay waits for it and, when it
+// cannot wait, answers 503 rather than a quota 429.
 export interface Shortfall {
-  reason: 'concurrency_saturated' | 'quota_exhausted';
+  reason: 'concurrency_saturated' | 'quota_exhausted' | 'upstream_unreachable';
   message: string;
   retryAfterMs: number | null;
 }
