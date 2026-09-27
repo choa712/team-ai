@@ -348,9 +348,12 @@ export class AccountPool {
     if (!force && account.credential.expiresAt && account.credential.expiresAt > Date.now() + 5 * 60_000) return;
     const existing = this.refreshes.get(account.id);
     if (existing) return existing;
+    // A sync or re-login can replace the credential while this runs; that newer
+    // one stays, rather than being overwritten by a result for the old one.
+    const started = account.credential;
     const rotate = (credential: OAuthCredential): Promise<OAuthCredential> => this.provider.refresh(credential);
-    const work = this.refreshVia ? this.refreshVia(account, rotate) : rotate(account.credential);
-    const promise = work.then((next) => { account.credential = next; account.error = null; }).finally(() => this.refreshes.delete(account.id));
+    const work = this.refreshVia ? this.refreshVia(account, rotate) : rotate(started);
+    const promise = work.then((next) => { if (account.credential === started) { account.credential = next; account.error = null; } }).finally(() => this.refreshes.delete(account.id));
     this.refreshes.set(account.id, promise);
     return promise;
   }
@@ -374,6 +377,7 @@ export class AccountPool {
         && (a.error !== null || a.credential.expiresAt === null || a.credential.expiresAt < now + 5 * 60_000));
       let healed = 0; let failed = 0;
       for (const account of due) {
+        const started = account.credential;
         // Force when the account errored or its expiry is unknown: refresh()'s
         // own gate skips a token that still looks valid, but an errored account
         // needs the attempt to heal and a null expiry never trips the gate at
@@ -385,7 +389,7 @@ export class AccountPool {
         // token cannot be renewed cannot serve, so it is benched here until a
         // later sweep — or a re-login adopted by adoptCredentials — heals it.
         try { await this.refresh(account, account.error !== null || account.credential.expiresAt === null); healed++; }
-        catch (error) { failed++; account.error = `token refresh failed: ${(error as Error).message}`; }
+        catch (error) { failed++; if (account.credential === started) account.error = `token refresh failed: ${(error as Error).message}`; }
       }
       return { healed, failed };
     } finally {

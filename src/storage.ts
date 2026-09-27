@@ -40,17 +40,18 @@ export async function saveCredentials(value: Record<string, OAuthCredential>): P
 export async function loadState(): Promise<PersistedState> { return readJson(paths().state, { version: 1, accounts: {}, events: [] }); }
 export async function saveState(value: PersistedState): Promise<void> { await atomicWrite(paths().state, value); }
 
-// 'keep-newer' is for copies (import, cloud pull); 'replace' is for a login the
-// user just completed, which must win even over a revoked token with a later expiry.
-export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' = 'keep-newer'): Promise<StoredAccount[]> {
+// 'replace' is for a login the user just completed, which wins over anything,
+// even a revoked token with a later expiry. 'keep-newer' is for copies
+// (import): they never replace a logged-in credential and otherwise the later
+// expiry wins. 'add-only' (cloud pull) never touches a credential already held.
+export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' | 'add-only' = 'keep-newer'): Promise<StoredAccount[]> {
   const config = await loadConfig();
   const credentials = await loadCredentials();
   const accounts = values.map(({ label, credential: given }) => {
     const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId);
     const credentialId = existing?.credentialId || `${provider}:${given.accountId}`;
     const current = credentials[credentialId];
-    // A copy keeps the login stamp of what it replaces; see OAuthCredential.loggedInAt.
-    const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : current?.loggedInAt !== undefined && given.loggedInAt === undefined ? { ...given, loggedInAt: current.loggedInAt } : given;
+    const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;
     const account: StoredAccount = existing || { id: credential.accountId, provider, label, enabled: true, priority: null, credentialId, createdAt: new Date().toISOString() };
     account.label = label || account.label;
     if (!existing) config.accounts.push(account);
@@ -58,7 +59,9 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     // (a stale export, a lagging cloud). Writing it back would replace a live
     // refresh token with a spent one, so the later expiry wins; a copy with no
     // known expiry is taken as given, as before.
-    if (policy === 'replace' || !current || current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt) credentials[credentialId] = credential;
+    const copyLosesToLogin = policy !== 'replace' && (current?.loggedInAt ?? 0) > (credential.loggedInAt ?? 0);
+    const write = policy === 'replace' || !current || (policy === 'keep-newer' && !copyLosesToLogin && (current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt));
+    if (write) credentials[credentialId] = credential;
     return account;
   });
   await saveCredentials(credentials);
