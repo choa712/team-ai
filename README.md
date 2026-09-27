@@ -10,6 +10,17 @@ TeamAI is a local multi-account relay for **Claude Code** and the official **Cod
 
 > TeamAI is an independent open-source project. It is not affiliated with Anthropic, OpenAI, or the unrelated service at teamai.com.
 
+## This fork (choa712/team-ai)
+
+This is a fork of [soulduse/team-ai](https://github.com/soulduse/team-ai). It tracks upstream and adds the changes below; sync with `git fetch upstream` (the `upstream` remote points at soulduse/team-ai). Everything not listed here, including the account pool and proxy robustness, is upstream.
+
+- **Codex App binding.** `teamai codex-app bind|unbind|status` writes a managed `[model_providers.teamai]` block into `~/.codex/config.toml`, so the Codex CLI and app route through the relay. `unbind` restores the previous provider from saved state.
+- **Import from codex-multi-auth.** `teamai import codex` also reads the codex-multi-auth config shape (an `accounts` array with per-account `workspaces` and `currentWorkspaceIndex`), so existing codex-multi-auth accounts migrate without a fresh login.
+- **launchd supervisor.** `teamai supervise` starts the server and restarts it on health failure, backed by a `/health` endpoint and a control-port `probeServer`. It keeps the relay running independently of any terminal.
+- **Health-aware status and stop.** `status` and `stop` separate a recorded pid from a health-probed one and report the supervisor, so a dead-but-recorded server reads as `unhealthy` rather than `running`.
+- **Launcher rename `tac` to `taic`.** The relayed Claude launcher is `taic`, which avoids clashing with the coreutils `tac`.
+- **Dependency pin.** `js-yaml` is pinned through `overrides`.
+
 ## Requirements
 
 - Node.js 20+
