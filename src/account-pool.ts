@@ -600,12 +600,16 @@ export class AccountPool {
       const fresh = latest[account.credentialId];
       if (!fresh || fresh.expiresAt === null || fresh.accessToken === account.credential.accessToken) continue;
       // Only two things replace what this server holds: a login (a later
-      // loggedInAt), and anything different for an account that is failing.
+      // loggedInAt), and a newer credential for an account that is failing.
       // A later expiry alone is not enough: disk can hold a chain this server
       // already replaced (a token recovered from the cloud expires whenever the
       // other machine minted it), and adopting it would bring a dead chain back.
+      // A failing account still takes only something newer: an older disk copy
+      // is a chain it already rotated past, and restoring it would lose the pair
+      // it holds now (a transient 503 after a successful rotation, for example).
       const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
-      if (!relogin && account.error === null) continue;
+      const newerForFailing = account.error !== null && (account.credential.expiresAt === null || fresh.expiresAt > account.credential.expiresAt);
+      if (!relogin && !newerForFailing) continue;
       account.credential = fresh; account.error = null; adopted++;
     }
     return adopted;

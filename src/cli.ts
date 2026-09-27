@@ -148,6 +148,13 @@ async function codexApp(action = 'status'): Promise<void> {
 // nothing is listening, the client starts one itself.
 async function ensureServer(): Promise<void> {
   if (await runningPid()) return;
+  // Under a supervisor the server is its to start: one launched here would win
+  // the port during the supervisor's backoff and leave its own child failing on
+  // EADDRINUSE, unsupervised. Wait for the supervised server instead.
+  if (await recordedSupervisorPid()) {
+    for (let i = 0; i < 300; i++) { if (await runningPid()) return; await new Promise((r) => setTimeout(r, 100)); }
+    throw new Error('The TeamAI supervisor did not bring the server up within 30 s; check its log or run "teamai status"');
+  }
   // Capture the child's output instead of discarding it: when startup fails,
   // its stderr is the only thing that says why (a port already taken, a bad
   // credential file), and "did not start" on its own sends the user hunting.

@@ -156,7 +156,8 @@ test('an errored account adopts a re-login even when its dead token expires late
   const pool = poolOf({ acc: cred('dead', 'r-dead', NOW + 8 * HOUR) });
   assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + 9 * HOUR) }), 0, 'a healthy account ignores an unstamped copy, even a later one');
   pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (400)';
-  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('fresh', 'r-fresh', NOW + HOUR) }), 1);
+  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('copy', 'r-copy', NOW + HOUR) }), 0, 'an unstamped older copy is not a re-login');
+  assert.equal(pool.adoptCredentials({ 'claude:acc': { ...cred('fresh', 'r-fresh', NOW + HOUR), loggedInAt: 3 } }), 1);
   assert.equal(pool.accounts[0]!.error, null);
 });
 
@@ -211,4 +212,11 @@ test('periodic sync replaces only chains that were refused, and a recovery survi
   // The dead chain on disk expires later than the recovered one; the next save must not bring it back.
   assert.equal(pool.adoptCredentials({ 'claude:refused': cred('r1', 'rr1', later + HOUR, 'refused') }), 0);
   assert.equal(pool.accounts[0]!.credential.refreshToken, 'rr2');
+});
+
+test('a failing account never restores an older chain from disk', () => {
+  const pool = poolOf({ acc: cred('a2', 'r2', NOW + 8 * HOUR) });
+  pool.accounts[0]!.error = 'token refresh failed: OAuth refresh failed (503)';
+  assert.equal(pool.adoptCredentials({ 'claude:acc': cred('a1', 'r1', NOW) }), 0);
+  assert.equal(pool.accounts[0]!.credential.refreshToken, 'r2');
 });
