@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { decodeJwt } from './auth.js';
 import type { OAuthCredential, PersistedState, ProviderId, StoredAccount, TeamAIConfig } from './types.js';
 
 export function dataDir(): string {
@@ -60,11 +61,24 @@ export async function saveState(value: PersistedState): Promise<void> { await at
 // even a revoked token with a later expiry. 'keep-newer' is for copies
 // (import): they never replace a logged-in credential and otherwise the later
 // expiry wins. 'add-only' (cloud pull) never touches a credential already held.
+// A Codex token names its account in the chatgpt_account_id claim. The id an
+// entry is stored under need not be that: a codex-multi-auth import keys the
+// account by its workspace id, `teamai login codex` by the claim. Matching on
+// the stored id alone turned a re-login of an imported account into a second
+// entry beside the dead one, so a Codex credential also matches by its claim.
+function codexAccountOf(credential: OAuthCredential | undefined): string | null {
+  const auth = credential ? decodeJwt(credential.accessToken)['https://api.openai.com/auth'] : null;
+  const id = auth && typeof auth === 'object' ? (auth as Record<string, unknown>).chatgpt_account_id : null;
+  return typeof id === 'string' ? id : null;
+}
+
 export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' | 'add-only' = 'keep-newer'): Promise<StoredAccount[]> {
   const config = await loadConfig();
   const credentials = await loadCredentials();
   const accounts = values.map(({ label, credential: given }) => {
-    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId);
+    const claimed = provider === 'codex' ? codexAccountOf(given) : null;
+    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId)
+      || (claimed ? config.accounts.find((a) => a.provider === provider && codexAccountOf(credentials[a.credentialId]) === claimed) : undefined);
     const credentialId = existing?.credentialId || `${provider}:${given.accountId}`;
     const current = credentials[credentialId];
     const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;

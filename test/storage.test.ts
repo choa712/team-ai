@@ -20,6 +20,29 @@ test('stores credentials separately with restrictive permissions and deduplicate
   delete process.env.TEAMAI_HOME;
 });
 
+// A Codex account imported from codex-multi-auth is keyed by its workspace id,
+// while `teamai login codex` keys the same account by the token's
+// chatgpt_account_id. Both tokens carry that claim, so it is what names the account.
+test('a Codex login for an account imported under another id refreshes that account instead of adding a second one', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-identity-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?codex-identity=${Date.now()}`);
+  const jwt = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  const tokenFor = (account: string, n: number): string => jwt({ n, 'https://api.openai.com/auth': { chatgpt_account_id: account } });
+  await storage.upsertAccounts('codex', [{ label: 'one@example.com', credential: { accessToken: tokenFor('acct-one', 1), refreshToken: 'spent', expiresAt: 100, accountId: 'org-imported' } }]);
+
+  const account = await storage.upsertAccount('codex', 'one@example.com', { accessToken: tokenFor('acct-one', 2), refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
+  await storage.upsertAccount('codex', 'other@example.com', { accessToken: tokenFor('acct-other', 1), refreshToken: 'other', expiresAt: 300, accountId: 'acct-other' });
+
+  const config = await storage.loadConfig();
+  assert.deepEqual(config.accounts.map((a: { label: string }) => a.label), ['one@example.com', 'other@example.com']);
+  assert.equal(account.credentialId, 'codex:org-imported');
+  const credentials = await storage.loadCredentials();
+  assert.equal(credentials['codex:org-imported'].refreshToken, 'fresh');
+  assert.equal(credentials['codex:org-imported'].accountId, 'acct-one');
+  assert.equal(typeof credentials['codex:org-imported'].loggedInAt, 'number');
+  delete process.env.TEAMAI_HOME;
+});
+
 test('the activity log appends, and rotates once a write would carry it past its cap', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamai-log-'));
   const storage = await import(`../src/storage.js?log=${Date.now()}`);

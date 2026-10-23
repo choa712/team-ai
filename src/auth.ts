@@ -8,7 +8,7 @@ import { mkdtemp } from 'node:fs/promises';
 import type { OAuthCredential, ProviderId } from './types.js';
 
 function expand(path: string): string { return path.startsWith('~/') ? join(homedir(), path.slice(2)) : resolve(path); }
-function decodeJwt(token: string): Record<string, unknown> { try { const part = token.split('.')[1]; return part ? JSON.parse(Buffer.from(part, 'base64url').toString()) as Record<string, unknown> : {}; } catch { return {}; } }
+export function decodeJwt(token: string): Record<string, unknown> { try { const part = token.split('.')[1]; return part ? JSON.parse(Buffer.from(part, 'base64url').toString()) as Record<string, unknown> : {}; } catch { return {}; } }
 function stringAt(value: unknown, key: string): string | null { return value && typeof value === 'object' && typeof (value as Record<string, unknown>)[key] === 'string' ? (value as Record<string, string>)[key]! : null; }
 
 export async function importAuth(provider: ProviderId, from?: string): Promise<Array<{ label: string; credential: OAuthCredential }>> {
