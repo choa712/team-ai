@@ -61,11 +61,14 @@ export async function saveState(value: PersistedState): Promise<void> { await at
 // even a revoked token with a later expiry. 'keep-newer' is for copies
 // (import): they never replace a logged-in credential and otherwise the later
 // expiry wins. 'add-only' (cloud pull) never touches a credential already held.
-// A Codex token names its account in the chatgpt_account_id claim. The id an
-// entry is stored under need not be that: a codex-multi-auth import keys the
-// account by its workspace id, `teamai login codex` by the claim. Matching on
-// the stored id alone turned a re-login of an imported account into a second
-// entry beside the dead one, so a Codex credential also matches by its claim.
+// A Codex login keys its account by the token's chatgpt_account_id claim, while
+// a codex-multi-auth import keys it by a workspace id, which for a personal
+// account is an org id (org-…). Matching on the stored id alone turned a
+// re-login of such an import into a second entry beside the dead one. So a
+// login also renews the one entry whose stored token carries the same claim,
+// unless that entry's id is itself a ChatGPT account id: then it names a
+// workspace exactly, and sharing a token does not make it the same one.
+const CHATGPT_ACCOUNT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function codexAccountOf(credential: OAuthCredential | undefined): string | null {
   const auth = credential ? decodeJwt(credential.accessToken)['https://api.openai.com/auth'] : null;
   const id = auth && typeof auth === 'object' ? (auth as Record<string, unknown>).chatgpt_account_id : null;
@@ -76,9 +79,9 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
   const config = await loadConfig();
   const credentials = await loadCredentials();
   const accounts = values.map(({ label, credential: given }) => {
-    const claimed = provider === 'codex' ? codexAccountOf(given) : null;
-    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId)
-      || (claimed ? config.accounts.find((a) => a.provider === provider && codexAccountOf(credentials[a.credentialId]) === claimed) : undefined);
+    const claimed = provider === 'codex' && policy === 'replace' ? codexAccountOf(given) : null;
+    const byClaim = claimed ? config.accounts.filter((a) => a.provider === provider && !CHATGPT_ACCOUNT_ID.test(a.id) && codexAccountOf(credentials[a.credentialId]) === claimed) : [];
+    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId) || (byClaim.length === 1 ? byClaim[0] : undefined);
     const credentialId = existing?.credentialId || `${provider}:${given.accountId}`;
     const current = credentials[credentialId];
     const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;

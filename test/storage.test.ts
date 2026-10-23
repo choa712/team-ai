@@ -43,6 +43,53 @@ test('a Codex login for an account imported under another id refreshes that acco
   delete process.env.TEAMAI_HOME;
 });
 
+test('workspaces that share one Codex token stay separate entries, on import and on login', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-workspaces-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?codex-workspaces=${Date.now()}`);
+  const shared = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } })).toString('base64url')}.s`;
+  const team = '0b0b0b0b-0000-4000-8000-000000000001';
+  await storage.upsertAccounts('codex', [
+    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r1', expiresAt: 100, accountId: 'org-personal' } },
+    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r2', expiresAt: 100, accountId: team } },
+  ]);
+  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-personal', team]);
+
+  // The team entry names its workspace, so the login renews the personal one only.
+  await storage.upsertAccount('codex', 'one@example.com', { accessToken: shared, refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
+  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-personal', team]);
+  const credentials = await storage.loadCredentials();
+  assert.equal(credentials['codex:org-personal'].refreshToken, 'fresh');
+  assert.equal(credentials[`codex:${team}`].refreshToken, 'r2');
+  delete process.env.TEAMAI_HOME;
+});
+
+test('a Codex login adds an entry when more than one imported entry carries its claim', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-ambiguous-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?codex-ambiguous=${Date.now()}`);
+  const shared = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } })).toString('base64url')}.s`;
+  await storage.upsertAccounts('codex', [
+    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r1', expiresAt: 100, accountId: 'org-first' } },
+    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r2', expiresAt: 100, accountId: 'org-second' } },
+  ]);
+  await storage.upsertAccount('codex', 'one@example.com', { accessToken: shared, refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
+  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-first', 'org-second', 'acct-one']);
+  const credentials = await storage.loadCredentials();
+  assert.deepEqual([credentials['codex:org-first'].refreshToken, credentials['codex:org-second'].refreshToken], ['r1', 'r2']);
+  delete process.env.TEAMAI_HOME;
+});
+
+test('a Codex login never renews an entry stored under a different ChatGPT workspace id', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-team-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?codex-team=${Date.now()}`);
+  const shared = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } })).toString('base64url')}.s`;
+  const team = '0b0b0b0b-0000-4000-8000-000000000001';
+  await storage.upsertAccounts('codex', [{ label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'team', expiresAt: 100, accountId: team } }]);
+  await storage.upsertAccount('codex', 'one@example.com', { accessToken: shared, refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
+  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), [team, 'acct-one']);
+  assert.equal((await storage.loadCredentials())[`codex:${team}`].refreshToken, 'team');
+  delete process.env.TEAMAI_HOME;
+});
+
 test('the activity log appends, and rotates once a write would carry it past its cap', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamai-log-'));
   const storage = await import(`../src/storage.js?log=${Date.now()}`);
