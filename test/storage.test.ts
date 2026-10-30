@@ -90,6 +90,23 @@ test('a Codex login never renews an entry stored under a different ChatGPT works
   delete process.env.TEAMAI_HOME;
 });
 
+// A Codex login reads the claim of every stored Codex token. A token whose
+// payload decodes to JSON null used to throw there, so one bad imported entry
+// broke every later `teamai login codex` until it was removed by hand.
+test('a stored Codex token whose payload is not an object does not break a later login', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-null-claim-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?codex-null-claim=${Date.now()}`);
+  const jwt = (claims: unknown): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  await storage.upsertAccounts('codex', [
+    { label: 'null-payload', credential: { accessToken: jwt(null), refreshToken: 'r0', expiresAt: 1, accountId: 'org-null' } },
+    { label: 'array-payload', credential: { accessToken: jwt([1]), refreshToken: 'r1', expiresAt: 1, accountId: 'org-array' } },
+  ]);
+  const login = { accessToken: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } }), refreshToken: 'r2', expiresAt: 2, accountId: 'acct-one' };
+  await storage.upsertAccount('codex', 'one', login);
+  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-null', 'org-array', 'acct-one']);
+  delete process.env.TEAMAI_HOME;
+});
+
 // `teamai import` wrote a later token for an account the running server held
 // without a login stamp. The server refused it as "not a login", and its next
 // save wrote the held token back over it, so the import was undone and the
