@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { decodeJwt } from './auth.js';
 import type { OAuthCredential, PersistedState, ProviderId, StoredAccount, TeamAIConfig } from './types.js';
 
 export function dataDir(): string {
@@ -60,11 +61,27 @@ export async function saveState(value: PersistedState): Promise<void> { await at
 // even a revoked token with a later expiry. 'keep-newer' is for copies
 // (import): they never replace a logged-in credential and otherwise the later
 // expiry wins. 'add-only' (cloud pull) never touches a credential already held.
+// A Codex login keys its account by the token's chatgpt_account_id claim, while
+// a codex-multi-auth import keys it by a workspace id, which for a personal
+// account is an org id (org-…). Matching on the stored id alone turned a
+// re-login of such an import into a second entry beside the dead one. So a
+// login also renews the one entry whose stored token carries the same claim,
+// unless that entry's id is itself a ChatGPT account id: then it names a
+// workspace exactly, and sharing a token does not make it the same one.
+const CHATGPT_ACCOUNT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function codexAccountOf(credential: OAuthCredential | undefined): string | null {
+  const auth = credential ? decodeJwt(credential.accessToken)['https://api.openai.com/auth'] : null;
+  const id = auth && typeof auth === 'object' ? (auth as Record<string, unknown>).chatgpt_account_id : null;
+  return typeof id === 'string' ? id : null;
+}
+
 export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' | 'add-only' = 'keep-newer'): Promise<StoredAccount[]> {
   const config = await loadConfig();
   const credentials = await loadCredentials();
   const accounts = values.map(({ label, credential: given }) => {
-    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId);
+    const claimed = provider === 'codex' && policy === 'replace' ? codexAccountOf(given) : null;
+    const byClaim = claimed ? config.accounts.filter((a) => a.provider === provider && !CHATGPT_ACCOUNT_ID.test(a.id) && codexAccountOf(credentials[a.credentialId]) === claimed) : [];
+    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId) || (byClaim.length === 1 ? byClaim[0] : undefined);
     const credentialId = existing?.credentialId || `${provider}:${given.accountId}`;
     const current = credentials[credentialId];
     const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;
@@ -77,7 +94,14 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     // known expiry is taken as given, as before.
     const copyLosesToLogin = policy !== 'replace' && (current?.loggedInAt ?? 0) > (credential.loggedInAt ?? 0);
     const write = policy === 'replace' || !current || (policy === 'keep-newer' && !copyLosesToLogin && (current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt));
-    if (write) credentials[credentialId] = credential;
+    // An import that replaces the pair held for an existing account is the user
+    // handing a token over. Stamp it, or a running server (which adopts only
+    // what it can tell is newer) writes its own copy back over it on the next
+    // save. The stamp is not a login stamp: a later import may still replace it.
+    // Re-importing the pair already held changes nothing, so it keeps the stamps it has.
+    const samePair = current !== undefined && current.accessToken === credential.accessToken && current.refreshToken === credential.refreshToken;
+    const handedOver = policy === 'keep-newer' && current !== undefined && !samePair;
+    if (write && !(policy === 'keep-newer' && samePair)) credentials[credentialId] = handedOver ? { ...credential, importedAt: Date.now() } : credential;
     return account;
   });
   await saveCredentials(credentials);

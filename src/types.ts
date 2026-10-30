@@ -19,6 +19,10 @@ export interface OAuthCredential {
   // just minted, which replaces any copy regardless of expiry (a revoked token
   // can carry the later expiry). Rotations keep the value they started from.
   loggedInAt?: number;
+  // Set by an explicit import that replaced the pair held for an account. A
+  // later value tells a running server to take the import, unless a later
+  // login says otherwise. Rotations keep the value they started from.
+  importedAt?: number;
 }
 
 export interface TeamAIConfig {

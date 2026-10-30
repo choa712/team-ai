@@ -3,10 +3,11 @@ import { CloudClient, refusedRefresh, type CloudAccount, type CloudCoordinator, 
 import { loadConfig, loadCredentials, upsertAccounts } from './storage.js';
 import type { OAuthCredential } from './types.js';
 
-// The login stamp stays with the account: dropping it would make the older
-// logged-in copy on disk look like a newer login and bring it back.
+// The login and import stamps stay with the account: dropping one would make
+// the older stamped copy on disk look newer and bring it back.
 const toCredential = (remote: CloudAccount, base?: OAuthCredential): OAuthCredential => ({
   ...(base?.loggedInAt !== undefined ? { loggedInAt: base.loggedInAt } : {}),
+  ...(base?.importedAt !== undefined ? { importedAt: base.importedAt } : {}),
   accessToken: remote.accessToken ?? base?.accessToken ?? '',
   refreshToken: remote.refreshToken ?? base?.refreshToken ?? null,
   expiresAt: remote.expiresAt || base?.expiresAt || null,
