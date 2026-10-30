@@ -611,9 +611,10 @@ export class AccountPool {
     let adopted = 0;
     for (const account of this.accounts) {
       const fresh = latest[account.credentialId];
-      if (!fresh || fresh.expiresAt === null || fresh.accessToken === account.credential.accessToken) continue;
-      // Only two things replace what this server holds: a login (a later
-      // loggedInAt), and a newer credential for an account that is failing.
+      if (!fresh || fresh.expiresAt === null || (fresh.accessToken === account.credential.accessToken && fresh.refreshToken === account.credential.refreshToken)) continue;
+      // Only three things replace what this server holds: a login (a later
+      // loggedInAt), an import the user handed over (a later importedAt, never
+      // over a later login), and a newer credential for an account that is failing.
       // A later expiry alone is not enough: disk can hold a chain this server
       // already replaced (a token recovered from the cloud expires whenever the
       // other machine minted it), and adopting it would bring a dead chain back.
@@ -623,8 +624,9 @@ export class AccountPool {
       // An earlier login is never newer, whatever its expiry.
       const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
       const sameOrLaterLogin = (fresh.loggedInAt ?? 0) >= (account.credential.loggedInAt ?? 0);
+      const handedOver = sameOrLaterLogin && (fresh.importedAt ?? 0) > (account.credential.importedAt ?? 0);
       const newerForFailing = account.error !== null && sameOrLaterLogin && (account.credential.expiresAt === null || fresh.expiresAt > account.credential.expiresAt);
-      if (!relogin && !newerForFailing) continue;
+      if (!relogin && !handedOver && !newerForFailing) continue;
       account.credential = fresh; account.error = null; adopted++;
     }
     return adopted;

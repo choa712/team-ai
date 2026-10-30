@@ -94,12 +94,14 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     // known expiry is taken as given, as before.
     const copyLosesToLogin = policy !== 'replace' && (current?.loggedInAt ?? 0) > (credential.loggedInAt ?? 0);
     const write = policy === 'replace' || !current || (policy === 'keep-newer' && !copyLosesToLogin && (current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt));
-    // An import that replaces the token held for an existing account is the
-    // user handing a token over, like a login. Stamp it as one: a running
-    // server adopts only a later login, and would otherwise write its own copy
-    // back over the import on its next save.
-    const handedOver = policy === 'keep-newer' && current !== undefined && current.accessToken !== credential.accessToken;
-    if (write) credentials[credentialId] = handedOver ? { ...credential, loggedInAt: Date.now() } : credential;
+    // An import that replaces the pair held for an existing account is the user
+    // handing a token over. Stamp it, or a running server (which adopts only
+    // what it can tell is newer) writes its own copy back over it on the next
+    // save. The stamp is not a login stamp: a later import may still replace it.
+    // Re-importing the pair already held changes nothing, so it keeps the stamps it has.
+    const samePair = current !== undefined && current.accessToken === credential.accessToken && current.refreshToken === credential.refreshToken;
+    const handedOver = policy === 'keep-newer' && current !== undefined && !samePair;
+    if (write && !(policy === 'keep-newer' && samePair)) credentials[credentialId] = handedOver ? { ...credential, importedAt: Date.now() } : credential;
     return account;
   });
   await saveCredentials(credentials);

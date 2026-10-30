@@ -119,6 +119,21 @@ test('an explicit import that replaces a held token is adopted by a running serv
   // An older copy still loses to what is held.
   await storage.upsertAccounts('claude', [{ label: 'a', credential: { ...held, accessToken: 'older', expiresAt: held.expiresAt - 1 } }]);
   assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'imported');
+  // A second import, here a new refresh chain behind the same access token, is a hand-over too.
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  const rechained = { ...imported, refreshToken: 'rechained-refresh', expiresAt: imported.expiresAt + 1 };
+  await storage.upsertAccounts('claude', [{ label: 'a', credential: rechained }]);
+  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 1, 'the server takes the new refresh chain');
+  assert.equal(pool.accounts[0]?.credential.refreshToken, 'rechained-refresh');
+
+  // A login outranks every import: a later import neither lands on disk nor reaches the server.
+  await storage.upsertAccount('claude', 'a', { ...held, accessToken: 'logged-in', expiresAt: held.expiresAt + 1 });
+  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 1);
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await storage.upsertAccounts('claude', [{ label: 'a', credential: { ...held, accessToken: 'after-login', expiresAt: held.expiresAt + 7_200_000 } }]);
+  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'logged-in');
+  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 0);
+  assert.equal(pool.accounts[0]?.credential.accessToken, 'logged-in');
   delete process.env.TEAMAI_HOME;
 });
 

@@ -15,11 +15,14 @@ export interface OAuthCredential {
   refreshToken: string | null;
   expiresAt: number | null;
   accountId: string;
-  // Set by an explicit login, and by an explicit import that replaces the token
-  // held for an account. A later value marks a credential the user just handed
-  // over, which replaces any copy regardless of expiry (a revoked token can
-  // carry the later expiry). Rotations keep the value they started from.
+  // Set only by an explicit login. A later value marks a credential the user
+  // just minted, which replaces any copy regardless of expiry (a revoked token
+  // can carry the later expiry). Rotations keep the value they started from.
   loggedInAt?: number;
+  // Set by an explicit import that replaced the pair held for an account. A
+  // later value tells a running server to take the import, unless a later
+  // login says otherwise. Rotations keep the value they started from.
+  importedAt?: number;
 }
 
 export interface TeamAIConfig {
