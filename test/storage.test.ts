@@ -90,6 +90,38 @@ test('a Codex login never renews an entry stored under a different ChatGPT works
   delete process.env.TEAMAI_HOME;
 });
 
+// `teamai import` wrote a later token for an account the running server held
+// without a login stamp. The server refused it as "not a login", and its next
+// save wrote the held token back over it, so the import was undone and the
+// account stayed on a chain that might already be spent (2026-10-30 review).
+test('an explicit import that replaces a held token is adopted by a running server', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-import-adopt-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?import-adopt=${Date.now()}`);
+  const { AccountPool } = await import('../src/account-pool.js');
+  const provider = {
+    id: 'claude', label: 'Claude', upstreamBase: 'https://example.test', normalizePath: (p: string) => p,
+    buildHeaders: (h: Headers) => h, rewriteBody: (b: Buffer) => b, readQuota: () => null,
+    classifyFailure: () => ({ kind: 'fatal', retryAfterMs: 0 }), refresh: async (c: unknown) => c,
+  };
+  const held = { accessToken: 'held', refreshToken: 'held-refresh', expiresAt: Date.now() + 60_000, accountId: 'a' };
+  await storage.upsertAccounts('claude', [{ label: 'a', credential: held }]);
+  const pool = new AccountPool(provider as never, (await storage.loadConfig()).accounts, await storage.loadCredentials(), { version: 1, accounts: {} });
+
+  const imported = { ...held, accessToken: 'imported', refreshToken: 'imported-refresh', expiresAt: held.expiresAt + 3_600_000 };
+  await storage.upsertAccounts('claude', [{ label: 'a', credential: imported }]);
+  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 1, 'the server takes the imported token');
+  assert.equal(pool.accounts[0]?.credential.accessToken, 'imported');
+
+  // Importing the token already held is not a hand-over: nothing is rewritten or re-stamped.
+  const stamped = (await storage.loadCredentials())['claude:a'];
+  await storage.upsertAccounts('claude', [{ label: 'a', credential: imported }]);
+  assert.deepEqual((await storage.loadCredentials())['claude:a'], stamped);
+  // An older copy still loses to what is held.
+  await storage.upsertAccounts('claude', [{ label: 'a', credential: { ...held, accessToken: 'older', expiresAt: held.expiresAt - 1 } }]);
+  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'imported');
+  delete process.env.TEAMAI_HOME;
+});
+
 test('the activity log appends, and rotates once a write would carry it past its cap', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamai-log-'));
   const storage = await import(`../src/storage.js?log=${Date.now()}`);

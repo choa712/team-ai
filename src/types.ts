@@ -15,9 +15,10 @@ export interface OAuthCredential {
   refreshToken: string | null;
   expiresAt: number | null;
   accountId: string;
-  // Set only by an explicit login. A later value marks a credential the user
-  // just minted, which replaces any copy regardless of expiry (a revoked token
-  // can carry the later expiry). Rotations keep the value they started from.
+  // Set by an explicit login, and by an explicit import that replaces the token
+  // held for an account. A later value marks a credential the user just handed
+  // over, which replaces any copy regardless of expiry (a revoked token can
+  // carry the later expiry). Rotations keep the value they started from.
   loggedInAt?: number;
 }
 

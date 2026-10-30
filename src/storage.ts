@@ -94,7 +94,12 @@ export async function upsertAccounts(provider: ProviderId, values: Array<{ label
     // known expiry is taken as given, as before.
     const copyLosesToLogin = policy !== 'replace' && (current?.loggedInAt ?? 0) > (credential.loggedInAt ?? 0);
     const write = policy === 'replace' || !current || (policy === 'keep-newer' && !copyLosesToLogin && (current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt));
-    if (write) credentials[credentialId] = credential;
+    // An import that replaces the token held for an existing account is the
+    // user handing a token over, like a login. Stamp it as one: a running
+    // server adopts only a later login, and would otherwise write its own copy
+    // back over the import on its next save.
+    const handedOver = policy === 'keep-newer' && current !== undefined && current.accessToken !== credential.accessToken;
+    if (write) credentials[credentialId] = handedOver ? { ...credential, loggedInAt: Date.now() } : credential;
     return account;
   });
   await saveCredentials(credentials);
