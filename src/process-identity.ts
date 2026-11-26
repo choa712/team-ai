@@ -57,13 +57,20 @@ export function startedBy(pid: number, recordedAt: unknown): boolean | null {
 // A lock left behind: its holder exited, or its pid now belongs to a process
 // that started after the lock was taken. One that does not parse is being
 // written, unless it has stayed that way for 5 s (a holder that died mid-write).
-async function lockAbandoned(path: string, raw: string): Promise<boolean> {
+// Whether the pid was reused is asked once per lock file (reused): reading a
+// start time spawns ps, or PowerShell on Windows, which takes a second or more
+// and blocks this process, so asking it on every poll stalled waiters and the
+// holder they shared a process with. This process's own pid is never reused.
+async function lockAbandoned(path: string, raw: string, reused: Map<string, boolean>): Promise<boolean> {
   let value: { pid?: unknown; at?: unknown };
   try { value = JSON.parse(raw) as typeof value; } catch {
     try { return Date.now() - (await stat(path)).mtimeMs > 5_000; } catch { return false; }
   }
   if (!Number.isInteger(value.pid) || !processAlive(value.pid as number)) return true;
-  return startedBy(value.pid as number, value.at) === false;
+  if (value.pid === process.pid) return false;
+  let known = reused.get(raw);
+  if (known === undefined) { known = startedBy(value.pid as number, value.at) === false; reused.set(raw, known); }
+  return known;
 }
 
 const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -90,12 +97,12 @@ async function generations(dir: string): Promise<number[]> {
   return names.filter((name) => /^[0-9]+$/.test(name)).map(Number).sort((a, b) => a - b);
 }
 
-async function generationFree(dir: string, n: number): Promise<boolean | 'gone'> {
+async function generationFree(dir: string, n: number, reused: Map<string, boolean>): Promise<boolean | 'gone'> {
   const file = join(dir, String(n));
   if (await stat(`${file}.released`).then(() => true, () => false)) return true;
   const raw = await readFile(file, 'utf8').catch(() => null);
   if (raw === null) return 'gone';
-  return lockAbandoned(file, raw);
+  return lockAbandoned(file, raw, reused);
 }
 
 export async function withFileLock<T>(lockPath: string, fn: () => Promise<T>, waitMs = 15_000): Promise<T> {
@@ -103,11 +110,11 @@ export async function withFileLock<T>(lockPath: string, fn: () => Promise<T>, wa
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const body = JSON.stringify({ pid: process.pid, at: new Date().toISOString(), nonce: randomBytes(8).toString('hex') });
   const deadline = Date.now() + waitMs;
-  let mine = 0;
+  let mine = 0; const reused = new Map<string, boolean>();
   for (;;) {
     const top = (await generations(dir)).at(-1) ?? 0;
     if (top > 0) {
-      const free = await generationFree(dir, top);
+      const free = await generationFree(dir, top, reused);
       if (free === 'gone') continue; // cleared by a holder between the listing and the read
       if (!free) {
         if (Date.now() > deadline) throw new Error(`${lockPath} is held by another TeamAI process; try again in a moment`);
