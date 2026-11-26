@@ -11,7 +11,9 @@ import { claudeProvider } from './providers.js';
 import type { OAuthCredential, ProviderId } from './types.js';
 
 function expand(path: string): string { return path.startsWith('~/') ? join(homedir(), path.slice(2)) : resolve(path); }
-function decodeJwt(token: string): Record<string, unknown> { try { const part = token.split('.')[1]; return part ? JSON.parse(Buffer.from(part, 'base64url').toString()) as Record<string, unknown> : {}; } catch { return {}; } }
+// A payload that parses to anything but an object (null, an array, a number)
+// carries no claims; returning it would make every claim lookup throw.
+export function decodeJwt(token: string): Record<string, unknown> { try { const part = token.split('.')[1]; const claims: unknown = part ? JSON.parse(Buffer.from(part, 'base64url').toString()) : null; return claims && typeof claims === 'object' && !Array.isArray(claims) ? claims as Record<string, unknown> : {}; } catch { return {}; } }
 function stringAt(value: unknown, key: string): string | null { return value && typeof value === 'object' && typeof (value as Record<string, unknown>)[key] === 'string' ? (value as Record<string, string>)[key]! : null; }
 
 export async function importAuth(provider: ProviderId, from?: string): Promise<Array<{ label: string; credential: OAuthCredential }>> {
@@ -38,6 +40,26 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
     if (typeof data.accessToken !== 'string') throw new Error('Claude accessToken is missing');
     const profile = await claudeProfile(data.accessToken);
     return [{ label: profile.label, credential: { accessToken: data.accessToken, refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null, expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null, accountId: profile.id, ...(profile.organizationId ? { organizationId: profile.organizationId } : {}) } }];
+  }
+  if (Array.isArray(raw.accounts)) {
+    const accounts = raw.accounts.flatMap((entry) => {
+      const data = entry as Record<string, unknown>;
+      if (typeof data.accessToken !== 'string') return [];
+      const workspaces = Array.isArray(data.workspaces) ? data.workspaces : [];
+      const selectedIndex = typeof data.currentWorkspaceIndex === 'number' ? data.currentWorkspaceIndex : 0;
+      const selected = workspaces[selectedIndex] as Record<string, unknown> | undefined;
+      const accountId = typeof selected?.id === 'string' ? selected.id : typeof data.accountId === 'string' ? data.accountId : null;
+      if (!accountId) return [];
+      const label = typeof data.email === 'string' ? data.email : typeof data.accountLabel === 'string' ? data.accountLabel : accountId;
+      return [{ label, credential: {
+        accessToken: data.accessToken,
+        refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null,
+        expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null,
+        accountId,
+      } }];
+    });
+    if (!accounts.length) throw new Error('No OAuth accounts found in codex-multi-auth config');
+    return [...new Map(accounts.map((account) => [account.credential.accountId, account])).values()];
   }
   const tokens = (raw.tokens || raw) as Record<string, unknown>;
   if (typeof tokens.access_token !== 'string') throw new Error('Codex access_token is missing');

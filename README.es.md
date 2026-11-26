@@ -26,7 +26,7 @@ cd team-ai
 ```
 
 `install.sh` instala las dependencias, compila, enlaza los comandos
-`teamai`/`tai`/`tac`/`tax` y ofrece agregar el bloque de shell. Es idempotente:
+`teamai`/`tai`/`taic`/`tax` y ofrece agregar el bloque de shell. Es idempotente:
 vuelve a ejecutarlo para actualizar. Usa `--no-shell` para omitir el bloque de
 shell, o `--dry-run` para ver qué haría sin aplicar cambios.
 
@@ -39,7 +39,7 @@ npm link
 ```
 
 En Windows, `install.sh` necesita un shell bash, así que usa los pasos manuales de arriba.
-`npm link` crea los comandos `teamai`/`tai`/`tac`/`tax` para `cmd.exe` y
+`npm link` crea los comandos `teamai`/`tai`/`taic`/`tax` para `cmd.exe` y
 PowerShell, y los lanzadores ejecutan los `claude.cmd`/`codex.cmd` instalados con
 npm escapando cada argumento para `cmd.exe`. Las secciones de configuración del
 shell y de elemento de inicio de sesión son para macOS y Linux.
@@ -60,18 +60,18 @@ tai
 Para iniciar una sesión directa con un proveedor, usa los lanzadores dedicados. Inician el relé de TeamAI automáticamente cuando hace falta y pasan todos los argumentos finales al cliente oficial:
 
 ```bash
-tac                   # Claude Code a través del grupo de cuentas de TeamAI
-tac --resume          # equivale a: teamai claude --resume
+taic                  # Claude Code a través del grupo de cuentas de TeamAI
+taic --resume         # equivale a: teamai claude --resume
 tax                   # Codex a través del grupo de cuentas de TeamAI
 tax resume            # equivale a: teamai codex resume
 tag                   # Grok CLI a través del grupo de cuentas de TeamAI
-teamai claude         # forma larga de tac
+teamai claude         # forma larga de taic
 teamai codex          # forma larga de tax
 teamai grok           # forma larga de tag
 teamai session        # elige [1] Claude, [2] Codex o [3] Grok de forma interactiva
 ```
 
-Los nombres evitan deliberadamente reemplazar una función de shell `tc` existente de TeamClaude. `tc` puede seguir apuntando a TeamClaude mientras `tac` y `tax` apuntan a TeamAI.
+Los nombres evitan deliberadamente reemplazar una función de shell `tc` existente de TeamClaude y la utilidad de texto estándar `tac`. `tc` puede seguir apuntando a TeamClaude mientras `taic` y `tax` apuntan a TeamAI.
 
 ## Configuración del shell
 
@@ -285,7 +285,7 @@ El mismo informe se sirve en el puerto de control, ligado a `127.0.0.1` y proteg
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:3556/usage?redact=partial"
 ```
 
-`3556` es el valor por defecto de `proxy.controlPort`; si lo cambiaste, usa el tuyo (`jq .proxy.controlPort ~/.config/teamai/config.json`). Dentro de una sesión iniciada con `tac`, `$ANTHROPIC_AUTH_TOKEN` ya contiene ese token. En cualquier otro sitio, `teamai usage --json` es más sencillo: lee el token de tu configuración por sí mismo.
+`3556` es el valor por defecto de `proxy.controlPort`; si lo cambiaste, usa el tuyo (`jq .proxy.controlPort ~/.config/teamai/config.json`). Dentro de una sesión iniciada con `taic`, `$ANTHROPIC_AUTH_TOKEN` ya contiene ese token. En cualquier otro sitio, `teamai usage --json` es más sencillo: lee el token de tu configuración por sí mismo.
 
 ### Formas de usarlo
 
@@ -376,7 +376,7 @@ npm run lint
 
 Consulta [NOTICE](NOTICE) para lo relativo a obra derivada y [SECURITY.md](SECURITY.md) para el modelo de seguridad local.
 
-> Translation update pending: see the canonical English README for nested Codex relay configuration inheritance.
+> Translation update pending: see the canonical English README for codex-multi-auth import, Codex App binding, health supervision, and nested Codex relay configuration inheritance.
 
 <!-- transient-recovery-2026-09-22 -->
 Los errores transitorios conservan el estado HTTP, el cuerpo y Retry-After originales. Tras cambiar de cuenta, el relay permite hasta dos rondas de reintento, con un máximo de 10 segundos de espera por ronda y 20 en total. Las esperas mayores se devuelven al cliente; los streams exitosos no se repiten. Los reintentos HTTP de Codex siguen desactivados para evitar duplicarlos. Reinicia el relay después de compilar para aplicar los cambios.

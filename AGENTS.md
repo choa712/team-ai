@@ -64,6 +64,8 @@ exists (recent Claude Code versions use the macOS Keychain instead):
 ```bash
 teamai import claude --from ~/.config/teamclaude.json
 teamai import codex
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json --dry-run
+
 teamai import grok     # shares ~/.grok's refresh token; prefer login for a pooled account
 ```
 
@@ -79,7 +81,9 @@ teamai start                              # start relay + open dashboard (needs 
 teamai stop
 teamai restart
 teamai server                             # run relay in the foreground (for a supervisor)
+teamai supervise                          # run relay with authenticated health recovery
 teamai tui                                # dashboard only (needs a TTY)
+teamai codex-app bind|unbind|status       # manage Codex App routing
 teamai enable  <claude|codex> <account>
 teamai disable <claude|codex> <account>
 teamai priority <claude|codex> <account> <rank|auto>
@@ -111,7 +115,7 @@ usage from other sessions and scripts".
 
 ### Launching sessions
 
-`tac` / `tax` / `teamai claude` / `teamai codex` spawn the official client with
+`taic` / `tax` / `teamai claude` / `teamai codex` spawn the official client with
 stdio inherited — they are interactive sessions for the user, not something to
 run and parse. Start the relay with `teamai server` and let the user drive the
 client.
@@ -151,6 +155,8 @@ before speculating; a port conflict is the common cause.
 | `src/font.ts` | Generated 9×18 bitmap glyphs; regenerate with `scripts/gen-font.py` (needs Pillow, build-time only) |
 | `src/storage.ts` | Config/state persistence, paths |
 | `src/auth.ts` | Login and credential import |
+| `src/codex-app.ts` | Reversible Codex App config binding |
+| `src/supervisor.ts` | Health-based relay process supervision |
 | `test/` | `node --test` suites |
 
 ## Before you commit

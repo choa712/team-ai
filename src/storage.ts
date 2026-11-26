@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { claudeOrganization, codexUserId } from './auth.js';
 import type { OAuthCredential, PersistedState, ProviderId, StoredAccount, TeamAIConfig } from './types.js';
 
@@ -10,7 +10,15 @@ const DEFAULT_GROK_PORT = 3458;
 export function dataDir(): string {
   return process.env.TEAMAI_HOME || join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'teamai');
 }
-export const paths = () => ({ config: join(dataDir(), 'config.json'), credentials: join(dataDir(), 'credentials.json'), state: join(dataDir(), 'state.json'), server: join(dataDir(), 'server.json') });
+export const paths = () => ({
+  config: join(dataDir(), 'config.json'),
+  credentials: join(dataDir(), 'credentials.json'),
+  state: join(dataDir(), 'state.json'),
+  server: join(dataDir(), 'server.json'),
+  supervisor: join(dataDir(), 'supervisor.json'),
+  codexAppBinding: join(dataDir(), 'codex-app-binding.json'),
+  events: join(dataDir(), 'events.log'),
+});
 
 export function defaultConfig(): TeamAIConfig {
   return { version: 1, proxy: { host: '127.0.0.1', claudePort: 3456, codexPort: 3457, grokPort: DEFAULT_GROK_PORT, controlPort: 3556, clientToken: `tai-${randomBytes(24).toString('base64url')}` }, switchThreshold: 0.98, warmupIntervalMs: 5 * 60_000, maxConcurrentPerAccount: 16, fableReserveThreshold: 0.8, accounts: [] };
@@ -32,7 +40,7 @@ async function readJson<T>(path: string, fallback: T): Promise<T> {
 let tempSeq = 0;
 // commit, when given, is asked right before the rename and can veto it; the
 // temp file is removed and false returned.
-async function atomicWrite(path: string, value: unknown, commit?: () => Promise<boolean>): Promise<boolean> {
+export async function atomicWrite(path: string, value: unknown, commit?: () => Promise<boolean>): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.${++tempSeq}.tmp`;
   try {
@@ -41,6 +49,32 @@ async function atomicWrite(path: string, value: unknown, commit?: () => Promise<
     await rename(temp, path);
     return true;
   } finally { await rm(temp, { force: true }); }
+}
+
+// Text files that are not JSON (the Codex config.toml): same temp-and-rename.
+export async function atomicWriteText(path: string, contents: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temp = `${path}.${process.pid}.${++tempSeq}.tmp`;
+  try {
+    await writeFile(temp, contents, { mode: 0o600 });
+    await rename(temp, path);
+  } finally { await rm(temp, { force: true }); }
+}
+
+
+// The activity log: one line per relay event, appended as it happens. The ring
+// in state.json keeps 200 events, which under a busy fleet is four minutes —
+// both 2026-09-27 blips had scrolled out of it before anyone looked. Rotated
+// once a write would carry the file past maxBytes; one previous file is kept
+// as `.1`, so the log is bounded at twice the cap.
+export async function appendLog(path: string, lines: string[], maxBytes = 8 * 1024 * 1024): Promise<void> {
+  if (!lines.length) return;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const chunk = `${lines.join('\n')}\n`;
+  let size = 0;
+  try { size = (await stat(path)).size; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  if (size > 0 && size + Buffer.byteLength(chunk) > maxBytes) await rename(path, `${path}.1`);
+  await appendFile(path, chunk, { mode: 0o600 });
 }
 
 export async function loadConfig(): Promise<TeamAIConfig> { return readJson(paths().config, defaultConfig()); }

@@ -6,7 +6,7 @@
   "bin": {
     "teamai": "dist/src/cli.js",
     "tai": "dist/src/cli.js",
-    "tac": "dist/src/cli.js",
+    "taic": "dist/src/cli.js",
     "tax": "dist/src/cli.js",
     "tag": "dist/src/cli.js"
   },
@@ -31,5 +31,8 @@
   },
   "dependencies": {
     "smol-toml": "^1.8.0"
+  },
+  "overrides": {
+    "js-yaml": "^4.3.2"
   }
 }

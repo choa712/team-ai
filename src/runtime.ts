@@ -5,7 +5,7 @@ import { AccountPool } from './account-pool.js';
 import { createProxy, secureEqual } from './proxy.js';
 import { createServer } from 'node:http';
 import { providers } from './providers.js';
-import { defaultConfig, loadConfig, loadCredentials, loadState, paths, providerPort, readCredentialsText, saveCredentialsIfUnchanged, saveState } from './storage.js';
+import { appendLog, defaultConfig, loadConfig, loadCredentials, loadState, paths, providerPort, readCredentialsText, saveCredentialsIfUnchanged, saveState } from './storage.js';
 import { PROVIDER_IDS, type OAuthCredential, type PersistedState, type ProviderId, type RefreshSweep, type TeamAIConfig } from './types.js';
 import { buildUsageReport, requestUrl, serveUsage } from './usage.js';
 
@@ -35,6 +35,8 @@ function bounded(work: Promise<unknown>, ms: number): Promise<void> {
   });
 }
 
+export function listenersHealthy(servers: Array<Pick<Server, 'listening'>>): boolean { return servers.length > 1 && servers.every((server) => server.listening); }
+
 // Ports this provider should still answer on besides the configured one:
 // whatever the user listed in proxy.legacyPorts, plus the built-in default,
 // which is the port every session started before the config was edited was
@@ -61,13 +63,18 @@ export async function runServer(): Promise<void> {
   // written and the save runs again, adopting the new token first. A save that
   // outlived its timeout is also superseded by any later one (the generation),
   // so it can land neither file with what memory held minutes ago.
+  // Every event also lands in the activity log on disk (events.log, rotated),
+  // which outlives a busy afternoon: the 200-entry ring was four minutes deep
+  // when a blip had to be traced.
+  const pendingLog: string[] = [];
   let saveGeneration = 0;
   const persistNow = async (): Promise<boolean> => {
     const generation = ++saveGeneration; const current = (): boolean => generation === saveGeneration;
     const snapshot = await readCredentialsText(); const updated = (snapshot ? JSON.parse(snapshot) : {}) as Record<string, OAuthCredential>;
     const adopted = pools.reduce((n, p) => n + p.adoptCredentials(updated), 0); if (adopted) record(`Adopted ${adopted} re-logged credential(s)`, true);
     const next: PersistedState = { version: 1, accounts: {}, events, notices }; pools.forEach((p) => p.exportState(next)); for (const p of pools) for (const a of p.accounts) updated[a.credentialId] = a.credential;
-    const [, written] = await Promise.all([saveState(next, async () => current()), saveCredentialsIfUnchanged(updated, snapshot, current)]);
+    const lines = pendingLog.splice(0);
+    const [, written] = await Promise.all([saveState(next, async () => current()), saveCredentialsIfUnchanged(updated, snapshot, current), appendLog(paths().events, lines).catch((error: Error) => console.log(`[TeamAI] activity log unwritable: ${error.message}`))]);
     if (!written && current()) persist('Credentials changed on disk during a save; saving again', true);
     return written;
   };
@@ -76,6 +83,7 @@ export async function runServer(): Promise<void> {
   const record = (message: string, notice: boolean): void => {
     const entry = { at: Date.now(), message };
     events.push(entry); if (events.length > 200) events.splice(0, events.length - 200);
+    pendingLog.push(`${new Date(entry.at).toISOString()} ${message}`);
     if (notice) { notices.push(entry); if (notices.length > NOTICE_LIMIT) notices.splice(0, notices.length - NOTICE_LIMIT); }
   };
   const persist = (event?: string, notice = false): void => { if (event) record(event, notice); if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; saving = saving.then(() => bounded(persistNow(), SAVE_TIMEOUT_MS)); }, 25); };
@@ -194,6 +202,12 @@ export async function runServer(): Promise<void> {
   const control = createServer(async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
     if (!secureEqual(token, config.proxy.clientToken)) { res.writeHead(401).end('{}'); return; }
+    if (req.url === '/health') {
+      const healthy = listenersHealthy(servers);
+      res.writeHead(healthy ? 200 : 503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: healthy ? 'ok' : 'degraded', pid: process.pid }));
+      return;
+    }
     // Read-only usage report for other sessions and scripts. Answered before
     // the /probe branch: it must not sync the fleet or spend a probe.
     const url = requestUrl(req);
@@ -262,4 +276,30 @@ export async function releaseServerFile(serverPath: string, pid = process.pid): 
   try { const value = JSON.parse(await readFile(serverPath, 'utf8')) as { pid?: number }; if (value.pid !== pid) return; } catch { return; }
   await rm(serverPath, { force: true });
 }
-export async function runningPid(): Promise<number | null> { try { const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number }; if (!value.pid) return null; process.kill(value.pid, 0); return value.pid; } catch { return null; } }
+export async function recordedServerPid(): Promise<number | null> {
+  try {
+    const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number };
+    if (!value.pid) return null;
+    process.kill(value.pid, 0);
+    return value.pid;
+  } catch { return null; }
+}
+
+export async function probeServer(config: TeamAIConfig, expectedPid?: number, timeoutMs = 1_000): Promise<boolean> {
+  try {
+    const port = config.proxy.controlPort ?? config.proxy.claudePort + 100;
+    const response = await fetch(`http://${config.proxy.host}:${port}/health`, {
+      headers: { authorization: `Bearer ${config.proxy.clientToken}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return false;
+    const value = await response.json() as { status?: unknown; pid?: unknown };
+    return value.status === 'ok' && Number.isInteger(value.pid) && (expectedPid === undefined || value.pid === expectedPid);
+  } catch { return false; }
+}
+
+export async function runningPid(): Promise<number | null> {
+  const pid = await recordedServerPid();
+  if (!pid) return null;
+  try { return await probeServer(await loadConfig(), pid) ? pid : null; } catch { return null; }
+}

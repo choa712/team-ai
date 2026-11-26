@@ -206,23 +206,36 @@ export class AccountPool {
     const now = Date.now();
     const live = this.accounts.filter((a) => a.enabled && !a.error && !excluded.has(a.id));
     const resets: Array<{ at: number; label: string }> = [];
-    let fableSpent = 0; let overLimit = 0; let coolingDown = 0; let keptForFable = 0;
+    let fableSpent = 0; let overLimit = 0; let coolingDown = 0; let benched = 0; let keptForFable = 0;
+    const benches: number[] = [];
     for (const account of live) {
       const fable = AccountPool.fableWindow(account);
       if (wantsFable && AccountPool.fableSpent(account, 1)) { fableSpent++; if (fable?.resetsAt) resets.push({ at: fable.resetsAt, label: `${account.label} Fable weekly` }); continue; }
       if (account.usage !== null && account.usage >= 1) { overLimit++; if (account.resetsAt) resets.push({ at: account.resetsAt, label: `${account.label} usage limit` }); continue; }
-      if (account.cooldownUntil && account.cooldownUntil > now) { coolingDown++; resets.push({ at: account.cooldownUntil, label: `${account.label} cooldown` }); continue; }
+      if (account.cooldownUntil && account.cooldownUntil > now) {
+        // A network bench is not a rejection: one connection attempt failed
+        // and the account is back in seconds. Counted apart, so the client is
+        // told to wait rather than that its budget is gone — that wording sent
+        // Codex (which does not retry a 429 under the relay) home for nothing.
+        if (account.cooldownReason === 'network') { benched++; benches.push(account.cooldownUntil); continue; }
+        coolingDown++; resets.push({ at: account.cooldownUntil, label: `${account.label} cooldown` }); continue;
+      }
       // its Fable reset frees nothing for this request, so it is not offered as a reset time
       if (this.keptForFable(account, wantsFable)) keptForFable++;
     }
-    const next = resets.filter((r) => r.at > now).sort((a, b) => a.at - b.at)[0];
     const parts: string[] = [];
+    if (benched) parts.push(`${benched} paused after a connection failure`);
     if (fableSpent) parts.push(`${fableSpent} spent the Fable weekly budget`);
     if (overLimit) parts.push(`${overLimit} used up the usage limit`);
     if (coolingDown) parts.push(`${coolingDown} cooling down after an upstream rejection`);
     if (keptForFable) parts.push(`${keptForFable} kept for Fable only`);
-    const what = wantsFable ? `No ${label} account can serve Fable right now` : `No ${label} account has budget left`;
     const detail = parts.length ? ` (${live.length} accounts: ${parts.join(', ')})` : ` (${live.length} accounts)`;
+    if (benched) {
+      const retryAfterMs = Math.max(1, Math.min(...benches) - now);
+      return { reason: 'upstream_unreachable', retryAfterMs, message: `No ${label} account is reachable right now${detail}. Retry in ${Math.ceil(retryAfterMs / 1000)}s.` };
+    }
+    const next = resets.filter((r) => r.at > now).sort((a, b) => a.at - b.at)[0];
+    const what = wantsFable ? `No ${label} account can serve Fable right now` : `No ${label} account has budget left`;
     const when = next ? ` Earliest reset in ${AccountPool.formatDuration(next.at - now)}: ${next.label}.` : '';
     const hint = wantsFable && fableSpent ? ' Other models are still served: switch model or wait.' : '';
     return { reason: 'quota_exhausted', retryAfterMs: next ? next.at - now : null, message: `${what}${detail}.${when}${hint}` };
@@ -419,7 +432,10 @@ export class AccountPool {
     const existing = this.refreshes.get(account.id);
     if (existing) return existing;
     // A new token does not lift an organization's OAuth block: only an answer does.
-    const promise = this.provider.refresh(account.credential).then((next) => { account.credential = next; if (account.errorKind !== 'blocked') AccountPool.clearError(account); }).finally(() => this.refreshes.delete(account.id));
+    // A re-login can replace the credential while this runs; that newer one
+    // stays, rather than being overwritten by a result for the old one.
+    const started = account.credential;
+    const promise = this.provider.refresh(started).then((next) => { if (account.credential === started) { account.credential = next; if (account.errorKind !== 'blocked') AccountPool.clearError(account); } }).finally(() => this.refreshes.delete(account.id));
     this.refreshes.set(account.id, promise);
     return promise;
   }
@@ -448,6 +464,7 @@ export class AccountPool {
         : (a.error !== null && a.errorKind !== 'blocked') || a.credential.expiresAt === null || a.credential.expiresAt < now + 5 * 60_000));
       const sweep: RefreshSweep = { healed: 0, failed: 0, unreachable: 0, outcomes: [] };
       for (const account of due) {
+        const started = account.credential;
         // Force when the account errored or its expiry is unknown: refresh()'s
         // own gate skips a token that still looks valid, but an errored account
         // needs the attempt to heal and a null expiry never trips the gate at
@@ -472,8 +489,9 @@ export class AccountPool {
         catch (error) {
           // A blocked account keeps its block: recording the token failure over
           // it would let the next successful refresh clear the error and route
-          // the account straight back into the organization's 403.
-          if (account.errorKind === 'blocked') continue;
+          // the account straight back into the organization's 403. A re-login
+          // adopted while this ran replaced the credential that failed.
+          if (account.errorKind === 'blocked' || account.credential !== started) continue;
           const kind = this.recordRefreshFailure(account, error);
           if (kind === 'unreachable') sweep.unreachable++; else sweep.failed++;
           sweep.outcomes.push({ label: account.label, kind, message: account.error! });

@@ -9,34 +9,39 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { importAuth, login } from './auth.js';
 import { captureDashboard } from './capture.js';
+import { bindCodexApp, codexAppStatus, unbindCodexApp } from './codex-app.js';
 import { refreshErrorKind, resetTicketsNote } from './frame.js';
 import { relayedCodexConfig } from './codex-config.js';
 import { launchCommand } from './launch.js';
 import { isRedactLevel } from './redact.js';
 import { buildUsageReport, formatUsageTable, type UsageReport } from './usage.js';
-import { releaseServerFile, runServer, runningPid } from './runtime.js';
+import { recordedServerPid, releaseServerFile, runServer, runningPid } from './runtime.js';
 import { dataDir, loadConfig, loadState, paths, providerPort, saveConfig, upsertAccount } from './storage.js';
+import { recordedSupervisorPid, runSupervisor } from './supervisor.js';
 import { runTui } from './tui.js';
 import { PROVIDER_IDS, type ProviderId, type TeamAIConfig } from './types.js';
 
 const invokedAs = basename(process.argv[1] || 'teamai');
 const inputArgs = process.argv.slice(2);
-const invocation = invokedAs === 'tai' ? ['start', ...inputArgs] : invokedAs === 'tac' ? ['run', 'claude', ...inputArgs] : invokedAs === 'tax' ? ['run', 'codex', ...inputArgs] : invokedAs === 'tag' ? ['run', 'grok', ...inputArgs] : inputArgs;
+const invocation = invokedAs === 'tai' ? ['start', ...inputArgs] : invokedAs === 'taic' ? ['run', 'claude', ...inputArgs] : invokedAs === 'tax' ? ['run', 'codex', ...inputArgs] : invokedAs === 'tag' ? ['run', 'grok', ...inputArgs] : inputArgs;
 const [command = 'help', ...args] = invocation;
 
 function provider(value?: string): ProviderId { const id = PROVIDER_IDS.find((x) => x === value); if (!id) throw new Error(`Provider must be ${PROVIDER_IDS.join(', ')}`); return id; }
 function flag(name: string): string | undefined { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; }
+function hasFlag(name: string): boolean { return args.includes(name); }
 
 async function main(): Promise<void> {
   switch (command) {
     case 'login': { const id = args[0] ? provider(args[0]) : await selectProvider('Login provider'); const result = await login(id); const account = await upsertAccount(id, result.label, result.credential); console.log(`Added ${id} account: ${account.label}`); break; }
-    case 'import': { const id = provider(args[0]); const results = await importAuth(id, flag('--from')); for (const result of results) { const account = await upsertAccount(id, result.label, result.credential); console.log(`Imported ${id} account: ${account.label}`); } break; }
+    case 'import': { const id = provider(args[0]); const results = await importAuth(id, flag('--from')); if (hasFlag('--dry-run')) { console.log(`Would import ${results.length} ${id} account(s); source and TeamAI state unchanged`); break; } for (const result of results) { const account = await upsertAccount(id, result.label, result.credential); console.log(`Imported ${id} account: ${account.label}`); } break; }
     case 'accounts': await accounts(args[0] ? provider(args[0]) : undefined); break;
     case 'enable': await toggle(true); break;
     case 'disable': await toggle(false); break;
     case 'priority': await priority(); break;
     case 'fable-only': await fableOnly(); break;
     case 'server': await runServer(); break;
+    case 'supervise': await runSupervisor(fileURLToPath(import.meta.url)); break;
+    case 'codex-app': await codexApp(args[0]); break;
     case 'start': await ensureServer(); await runTui(); break;
     case 'status': await status(); break;
     case 'usage': await usage(); break;
@@ -72,7 +77,8 @@ async function selectProvider(promptLabel: string): Promise<ProviderId> {
 
 async function accounts(filter?: ProviderId): Promise<void> {
   const config = await loadConfig(); const state = await loadState();
-  for (const a of config.accounts.filter((x) => !filter || x.provider === filter)) { const s = state.accounts[a.credentialId]; const usage = s?.usage == null ? 'unknown' : `${Math.round(s.usage * 100)}%`; console.log(`${a.provider.padEnd(7)} ${a.enabled ? 'on ' : 'off'} ${usage.padStart(7)} ${a.priority === null ? 'auto' : `#${a.priority}`} ${a.label}${a.fableOnly ? ' (fable only)' : ''}${resetTicketsNote(s?.resetCredits)}${errorNote(s)}`); }
+  const list = config.accounts.filter((x) => !filter || x.provider === filter);
+  list.forEach((a, i) => { const s = state.accounts[a.credentialId]; const usage = s?.usage == null ? 'unknown' : `${Math.round(s.usage * 100)}%`; console.log(`${String(i + 1).padStart(2)}. ${a.provider.padEnd(7)} ${a.enabled ? 'on ' : 'off'} ${usage.padStart(7)} ${a.priority === null ? 'auto' : `#${a.priority}`} ${a.label}${a.fableOnly ? ' (fable only)' : ''}${resetTicketsNote(s?.resetCredits)}${errorNote(s)}`); });
 }
 function errorNote(saved: Parameters<typeof refreshErrorKind>[0]): string { const kind = refreshErrorKind(saved); return kind === 'unreachable' ? '  [retrying: token server unreachable]' : kind ? '  [error: re-login needed]' : ''; }
 async function toggle(enabled: boolean): Promise<void> { const id = provider(args[0]); const name = args.slice(1).join(' '); const config = await loadConfig(); const account = config.accounts.find((a) => a.provider === id && (a.id === name || a.label === name)); if (!account) throw new Error('Account not found'); account.enabled = enabled; await saveConfig(config); console.log(`${enabled ? 'Enabled' : 'Disabled'} ${account.label}`); }
@@ -96,7 +102,10 @@ async function usage(): Promise<void> {
 }
 
 async function status(): Promise<void> {
-  const pid = await runningPid(); console.log(pid ? `TeamAI server running (pid ${pid})` : 'TeamAI server is stopped'); await accounts();
+  const recorded = await recordedServerPid(); const healthy = recorded ? await runningPid() : null; const supervisor = await recordedSupervisorPid();
+  const managed = supervisor ? `, supervisor pid ${supervisor}` : '';
+  console.log(healthy ? `TeamAI server running (pid ${healthy}${managed})` : recorded ? `TeamAI server unhealthy (pid ${recorded}${managed})` : `TeamAI server is stopped${managed}`);
+  await accounts();
   // Token failures and recoveries, kept apart from request lines so they are still here hours later.
   const notices = (await loadState()).notices ?? [];
   if (notices.length) { console.log('\nRecent notices:'); for (const n of notices.slice(-10)) console.log(`  ${new Date(n.at).toLocaleString('en-GB')}  ${n.message}`); }
@@ -108,20 +117,31 @@ async function status(): Promise<void> {
 // drop a save, never tear a file.
 const STOP_WAIT_MS = 20_000;
 async function stop(quiet = false): Promise<void> {
-  const pid = await runningPid(); if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; }
+  const pid = await recordedServerPid(); if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; }
   // Wait on this pid, not on whatever server.json names: a supervisor may have
   // started a replacement meanwhile, and that one is not ours to kill.
   const alive = (): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
   process.kill(pid, 'SIGTERM');
   for (let waited = 0; waited < STOP_WAIT_MS && alive(); waited += 100) await new Promise((r) => setTimeout(r, 100));
-  if (alive() && await runningPid() === pid) {
+  if (alive() && await recordedServerPid() === pid) {
     try { process.kill(pid, 'SIGKILL'); } catch { /* exited on its own just now */ }
     for (let waited = 0; waited < 2_000 && alive(); waited += 50) await new Promise((r) => setTimeout(r, 50));
     // A killed server leaves its server.json; clear it so ensureServer starts a new one.
     await releaseServerFile(paths().server, pid);
     console.log(`TeamAI server ${pid} did not stop within ${STOP_WAIT_MS / 1000}s; killed`); return;
   }
-  if (!quiet) console.log(`Stopped TeamAI server ${pid}`);
+  if (!quiet) console.log(await recordedSupervisorPid() ? `Stopped TeamAI server ${pid}; the active supervisor will replace it` : `Stopped TeamAI server ${pid}`);
+}
+
+async function codexApp(action = 'status'): Promise<void> {
+  if (action === 'bind') { console.log(`Bound Codex App to TeamAI in ${await bindCodexApp()}`); return; }
+  if (action === 'unbind') { console.log(`Restored Codex App routing in ${await unbindCodexApp()}`); return; }
+  if (action === 'status') {
+    const result = await codexAppStatus();
+    console.log(`Codex App routing: ${result.bound ? 'TeamAI' : 'not bound'} (${result.configPath})`);
+    return;
+  }
+  throw new Error('codex-app action must be bind, unbind or status');
 }
 
 // Start the relay on demand. This is what makes the launchers work whether or
@@ -129,6 +149,13 @@ async function stop(quiet = false): Promise<void> {
 // nothing is listening, the client starts one itself.
 async function ensureServer(): Promise<void> {
   if (await runningPid()) return;
+  // Under a supervisor the server is its to start: one launched here would win
+  // the port during the supervisor's backoff and leave its own child failing on
+  // EADDRINUSE, unsupervised. Wait for the supervised server instead.
+  if (await recordedSupervisorPid()) {
+    for (let i = 0; i < 300; i++) { if (await runningPid()) return; await new Promise((r) => setTimeout(r, 100)); }
+    throw new Error('The TeamAI supervisor did not bring the server up within 30 s; check its log or run "teamai status"');
+  }
   // Capture the child's output instead of discarding it: when startup fails,
   // its stderr is the only thing that says why (a port already taken, a bad
   // credential file), and "did not start" on its own sends the user hunting.
@@ -214,7 +241,7 @@ function help(): void { console.log(`TeamAI — multi-account relay for Claude C
 
 Usage:
   tai                                  Open the TeamAI dashboard
-  tac [CLAUDE_ARGS...]                 Start a relayed Claude Code session
+  taic [CLAUDE_ARGS...]                Start a relayed Claude Code session
   tax [CODEX_ARGS...]                  Start a relayed Codex session
   tag [GROK_ARGS...]                   Start a relayed Grok session
   teamai claude [CLAUDE_ARGS...]       Start a relayed Claude Code session
@@ -222,9 +249,10 @@ Usage:
   teamai grok [GROK_ARGS...]           Start a relayed Grok session
   teamai session [CLIENT_ARGS...]      Choose Claude, Codex or Grok
   teamai login [claude|codex|grok]
-  teamai import <claude|codex|grok> [--from PATH]
+  teamai import <claude|codex|grok> [--from PATH] [--dry-run]
   teamai accounts [claude|codex|grok]
-  teamai start|restart|status|stop
+  teamai start|restart|status|stop|supervise
+  teamai codex-app bind|unbind|status
   teamai usage [--json] [--redact partial|full|none]
                                        Quota per account and window, live from
                                        the server (or state.json if it is down)

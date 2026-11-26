@@ -10,6 +10,20 @@ TeamAI is a local multi-account relay for **Claude Code**, the official **Codex 
 
 > TeamAI is an independent open-source project. It is not affiliated with Anthropic, OpenAI, xAI, or the unrelated service at teamai.com.
 
+## This fork (choa712/team-ai)
+
+This is a fork of [soulduse/team-ai](https://github.com/soulduse/team-ai). It tracks upstream and adds the changes below; sync with `git fetch upstream` (the `upstream` remote points at soulduse/team-ai). Everything not listed here, including the account pool and proxy robustness, is upstream.
+
+- **Codex App binding.** `teamai codex-app bind|unbind|status` writes a managed `[model_providers.teamai]` block into `~/.codex/config.toml`, so the Codex CLI and app route through the relay. `unbind` restores the previous provider from saved state.
+- **Import from codex-multi-auth.** `teamai import codex` also reads the codex-multi-auth config shape (an `accounts` array with per-account `workspaces` and `currentWorkspaceIndex`), so existing codex-multi-auth accounts migrate without a fresh login.
+- **launchd supervisor.** `teamai supervise` starts the server and restarts it on health failure, backed by a `/health` endpoint and a control-port `probeServer`. It keeps the relay running independently of any terminal.
+- **Health-aware status and stop.** `status` and `stop` separate a recorded pid from a health-probed one and report the supervisor, so a dead-but-recorded server reads as `unhealthy` rather than `running`.
+- **Launcher rename `tac` to `taic`.** The relayed Claude launcher is `taic`, which avoids clashing with the coreutils `tac`.
+- **Dependency pin.** `js-yaml` is pinned through `overrides`.
+- **A request that may have run upstream is never re-sent.** A connection that dropped after the body went out (`ECONNRESET`, a closed socket, a header timeout) is failed over to the next account but never retried, since upstream may already have run it. Upstream re-sends such a request; this fork does not.
+- **A connection failure is retried, not reported as spent quota.** When the relay itself cannot reach upstream (`fetch failed`: a route or DNS blip), the failure is treated as transient when the connection was never made (`ECONNREFUSED`, `ENOTFOUND`, a connect timeout): the relay retries after the two-second bench, a request that arrives while every account is benched waits for the bench instead of hearing `429 quota_exhausted`, and a bench too long to wait out is answered `503` with a `Retry-After`. The cause (`ECONNREFUSED`, `ENOTFOUND`, ...) is written to the activity log.
+- **Activity log on disk.** Every relay event is appended to `~/.config/teamai/events.log` (rotated at 8 MB, one previous file kept as `.1`), in addition to the 200-entry ring the dashboard shows — which is only minutes deep under a busy fleet.
+
 ## Requirements
 
 - Node.js 20+
@@ -25,7 +39,7 @@ cd team-ai
 ./scripts/install.sh
 ```
 
-`install.sh` installs dependencies, builds, links the `teamai`/`tai`/`tac`/`tax`
+`install.sh` installs dependencies, builds, links the `teamai`/`tai`/`taic`/`tax`
 commands, and offers to add the shell block. It is idempotent — re-run it to
 upgrade. Pass `--no-shell` to skip the shell block, or `--dry-run` to see what it
 would do.
@@ -39,7 +53,7 @@ npm link
 ```
 
 On Windows, `install.sh` needs a bash shell, so use these manual steps instead.
-`npm link` creates `teamai`/`tai`/`tac`/`tax` commands for `cmd.exe` and
+`npm link` creates `teamai`/`tai`/`taic`/`tax` commands for `cmd.exe` and
 PowerShell, and the launchers start an npm-installed `claude.cmd`/`codex.cmd`
 with every argument escaped for `cmd.exe`. The shell setup and login-item
 sections below are for macOS and Linux.
@@ -59,18 +73,18 @@ tai
 For a direct provider session, use the dedicated launchers. They automatically start the TeamAI relay when necessary and pass every trailing argument to the official client:
 
 ```bash
-tac                   # Claude Code through the TeamAI account pool
-tac --resume          # same as: teamai claude --resume
+taic                  # Claude Code through the TeamAI account pool
+taic --resume         # same as: teamai claude --resume
 tax                   # Codex through the TeamAI account pool
 tax resume            # same as: teamai codex resume
 tag                   # Grok CLI through the TeamAI account pool
-teamai claude         # long form of tac
+teamai claude         # long form of taic
 teamai codex          # long form of tax
 teamai grok           # long form of tag
 teamai session        # choose [1] Claude, [2] Codex or [3] Grok interactively
 ```
 
-The names intentionally avoid replacing an existing TeamClaude `tc` shell function. `tc` can continue to target TeamClaude while `tac` and `tax` target TeamAI.
+The names intentionally avoid replacing an existing TeamClaude `tc` shell function and the standard `tac` text utility. `tc` can continue to target TeamClaude while `taic` and `tax` target TeamAI.
 
 ## Shell setup
 
@@ -89,11 +103,13 @@ re-running it upgrades rather than appends; every write leaves a timestamped
 backup, and install/uninstall cycles restore the file byte for byte.
 
 A supervisor is optional: `cl`, `co`, `tai` and `teamai run` all start the relay
-themselves when nothing is listening, so they keep working if the LaunchAgent is
-unloaded, fails, or was never installed. A stale `server.json` left by a killed
-process is ignored and replaced. When startup does fail, the reason from the
-server (a port already in use, an unreadable credential file) is reported
-instead of a bare "did not start", and the full output is kept at
+themselves when the authenticated control health check is not answering, so
+they keep working if the LaunchAgent is unloaded, fails, or was never installed.
+`teamai supervise` also watches that health endpoint and replaces a server after
+three consecutive failures, covering the case where a PID survives but its
+listeners do not. When startup does fail, the reason from the server (a port
+already in use, an unreadable credential file) is reported instead of a bare
+"did not start", and the full output is kept at
 `~/.config/teamai/server-start.log`.
 
 ### Running the relay as a login item
@@ -112,7 +128,7 @@ drive a LaunchAgent labeled `com.teamai.proxy`, so use exactly that label:
   <array>
     <string>/usr/local/bin/node</string>
     <string>/ABSOLUTE/PATH/TO/team-ai/dist/src/cli.js</string>
-    <string>server</string>
+    <string>supervise</string>
   </array>
   <key>RunAtLoad</key>      <true/>
   <key>KeepAlive</key>      <true/>
@@ -126,7 +142,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teamai.proxy.plist
 ```
 
 Use `command -v node` for the real Node path; a LaunchAgent does not inherit
-your shell's PATH.
+your shell's PATH. Use `launchctl` to stop a supervised login item; stopping
+only the child relay causes the supervisor to replace it.
 
 ## Accounts
 
@@ -142,6 +159,10 @@ teamai import claude --from ~/.config/teamclaude.json
 
 # Import Codex CLI's current file-based login, when present.
 teamai import codex
+
+# Import every account from codex-multi-auth, preserving each selected workspace.
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json --dry-run
+teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json
 ```
 
 Recent Claude Code versions may store credentials in the macOS Keychain rather than `~/.claude/.credentials.json`; use `teamai login` in that case. `import` never modifies the original TeamClaude, Claude Code, or Codex files. TeamAI uses a persistent isolated Codex home for relayed sessions, so the user's original `~/.codex` remains untouched.
@@ -157,7 +178,11 @@ teamai start                                   # start relay, open dashboard
 teamai stop                                    # stop the relay
 teamai restart                                 # stop, start, open dashboard
 teamai server                                  # run the relay in the foreground
+teamai supervise                               # run and health-supervise the relay
 teamai tui                                     # dashboard only, no auto-start
+teamai codex-app bind                          # route Codex App through TeamAI
+teamai codex-app status
+teamai codex-app unbind                        # restore the previous provider
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # or: auto
@@ -165,6 +190,13 @@ teamai fable-only claude user@example.com on  # or: off
 teamai capture [--redact partial|full|none] [--out DIR]   # dashboard → .txt + .png, no TTY needed
 teamai usage [--json] [--redact partial|full|none]       # quota per account and window, as a table or JSON
 ```
+
+`codex-app bind` changes only the top-level `model_provider` and appends a
+marked `model_providers.teamai` block to the active Codex config. The prior
+provider is recorded under `~/.config/teamai` and restored by `unbind`; unrelated
+TOML text is left byte-for-byte intact. The managed block contains the local
+relay bearer token, so the Codex config remains mode `0600`. Restart Codex App
+after binding or unbinding. Keep the supervisor running while the app is bound.
 
 Accounts are ordered by how much quota they have left, least-spent first, in
 both the dashboard and the pool's own selection — so the top row is the account
@@ -290,7 +322,7 @@ the relay's client token like everything else there:
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:3556/usage?redact=partial"
 ```
 
-`3556` is the default `proxy.controlPort`; if you changed it, use your value (`jq .proxy.controlPort ~/.config/teamai/config.json`). Inside a session started with `tac`, `$ANTHROPIC_AUTH_TOKEN` already holds that
+`3556` is the default `proxy.controlPort`; if you changed it, use your value (`jq .proxy.controlPort ~/.config/teamai/config.json`). Inside a session started with `taic`, `$ANTHROPIC_AUTH_TOKEN` already holds that
 token. Elsewhere, `teamai usage --json` is simpler: it reads the token from your
 config itself.
 
@@ -380,7 +412,7 @@ rather than allowed to take the relay down.
 
 ## Scope and compliance
 
-Version 0.1 targets subscription OAuth accounts and wrapper-launched CLI sessions. It does not expose a public OpenAI-compatible API, convert Claude requests to Codex requests, support Codex Desktop, or pool credentials between different people. You are responsible for complying with provider terms and policies. Production/commercial API workloads should use the providers' official API billing mechanisms.
+Version 0.1 targets subscription OAuth accounts, wrapper-launched CLI sessions, and an explicitly bound Codex App. It does not expose a public OpenAI-compatible API, convert Claude requests to Codex requests, launch or install Codex App itself, or pool credentials between different people. You are responsible for complying with provider terms and policies. Production/commercial API workloads should use the providers' official API billing mechanisms.
 
 **Gemini / Antigravity is not supported, on purpose.** Every provider's terms treat rotating several subscription accounts to get around usage limits as outside ordinary use, but Google is the one that enforces it: its Antigravity FAQ names "automating account rotation" as unsupported on consumer plans, its terms make reaching Antigravity through third-party software grounds for suspension, and open-source tools that pool Antigravity or Gemini CLI logins have reported accounts disabled in waves through 2026, with a repeat violation meaning a permanent ban. The Antigravity CLI also has no documented endpoint override and keeps its consumer sign-in in the OS keychain, so it could only be pooled by TeamAI holding Google tokens itself. Google's advice for third-party tools is an AI Studio or Vertex API key, which is pay-as-you-go rather than a subscription pool, so it is outside what TeamAI does.
 
@@ -398,3 +430,5 @@ TeamAI persists relay routing in the isolated `codex-home/config.toml` and passe
 
 <!-- transient-recovery-2026-09-22 -->
 Transient upstream errors retain their original HTTP status, body and Retry-After. After account failover, the relay allows up to two retry rounds (at most 10 seconds of backoff per round and 20 seconds total); longer waits are returned to the client. Successful streams are never replayed. Codex HTTP retries remain disabled to avoid multiplying relay retries. Restart the relay after rebuilding to activate changes.
+
+A connection that never reaches upstream (`fetch failed` with `ECONNREFUSED`, `ENOTFOUND`, a connect timeout) is transient in the same sense. The account is benched for two seconds and the request fails over; once every account has failed, the same retry rounds run, timed so the first round starts after the bench. A connection that was made and died later (a reset, no response headers within 300 s) is failed over to the next account as before but never retried by the relay, because the request may have reached upstream and a retry could run it twice; once every account has been tried the 502 is final and the client decides. A request that arrives while every account is benched waits for the bench (`upstream unreachable; waiting` in the activity log) rather than being told the quota is spent, and when the bench is longer than the relay will wait the client hears `503` with `x-teamai-503-reason: upstream_unreachable` and a `Retry-After`. If the upstream stays unreachable the answer is `502 Upstream connection failed: <cause>`. This replaced a 2026-09-27 failure where every account's fetch died within milliseconds, the relay answered `502 fetch failed`, and the client's own retry 200 ms later met the benched accounts as `429 quota_exhausted` — final for Codex, which does not retry under the relay.

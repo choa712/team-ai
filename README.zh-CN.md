@@ -25,7 +25,7 @@ cd team-ai
 ./scripts/install.sh
 ```
 
-`install.sh` 会安装依赖、执行构建、链接 `teamai`/`tai`/`tac`/`tax` 命令，并询问是否添加 shell 配置块。该脚本是幂等的——升级时重新执行即可。加 `--no-shell` 可跳过 shell 配置块，加 `--dry-run` 则只显示将要执行的操作。
+`install.sh` 会安装依赖、执行构建、链接 `teamai`/`tai`/`taic`/`tax` 命令，并询问是否添加 shell 配置块。该脚本是幂等的——升级时重新执行即可。加 `--no-shell` 可跳过 shell 配置块，加 `--dry-run` 则只显示将要执行的操作。
 
 如果想手动完成同样的步骤：
 
@@ -35,7 +35,7 @@ npm run build          # 必需：dist/ 未提交到仓库
 npm link
 ```
 
-在 Windows 上，`install.sh` 需要 bash shell，请改用上面的手动步骤。`npm link` 会为 `cmd.exe` 和 PowerShell 创建 `teamai`/`tai`/`tac`/`tax` 命令，启动器会把每个参数按 `cmd.exe` 规则转义后运行 npm 安装的 `claude.cmd`/`codex.cmd`。下文的 Shell 配置和登录项章节仅适用于 macOS 与 Linux。
+在 Windows 上，`install.sh` 需要 bash shell，请改用上面的手动步骤。`npm link` 会为 `cmd.exe` 和 PowerShell 创建 `teamai`/`tai`/`taic`/`tax` 命令，启动器会把每个参数按 `cmd.exe` 规则转义后运行 npm 安装的 `claude.cmd`/`codex.cmd`。下文的 Shell 配置和登录项章节仅适用于 macOS 与 Linux。
 
 打算用 AI 智能体来自动化安装？请参阅 [AGENTS.md](AGENTS.md)，其中把相同的步骤写成了带校验环节与失败分支的确定性命令。
 
@@ -51,18 +51,18 @@ tai
 若想直接开启某个服务商的会话，请使用专用启动命令。它们会在必要时自动拉起 TeamAI 中继，并把后面跟的所有参数原样传给官方客户端：
 
 ```bash
-tac                   # 经由 TeamAI 账号池的 Claude Code
-tac --resume          # 等同于：teamai claude --resume
+taic                  # 经由 TeamAI 账号池的 Claude Code
+taic --resume         # 等同于：teamai claude --resume
 tax                   # 经由 TeamAI 账号池的 Codex
 tax resume            # 等同于：teamai codex resume
 tag                   # 经由 TeamAI 账号池的 Grok CLI
-teamai claude         # tac 的完整写法
+teamai claude         # taic 的完整写法
 teamai codex          # tax 的完整写法
 teamai grok           # tag 的完整写法
 teamai session        # 交互式选择 [1] Claude、[2] Codex 或 [3] Grok
 ```
 
-这些名称是有意取的，以免覆盖已有的 TeamClaude `tc` shell 函数。`tc` 可以继续指向 TeamClaude，而 `tac` 和 `tax` 指向 TeamAI。
+这些名称是有意取的，以免覆盖已有的 TeamClaude `tc` shell 函数和标准 `tac` 文本工具。`tc` 可以继续指向 TeamClaude，而 `taic` 和 `tax` 指向 TeamAI。
 
 ## Shell 配置
 
@@ -233,7 +233,7 @@ JSON（节选）：
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:3556/usage?redact=partial"
 ```
 
-`3556` 是 `proxy.controlPort` 的默认值；如果改过，请用你设置的值（`jq .proxy.controlPort ~/.config/teamai/config.json`）。在用 `tac` 启动的会话中，`$ANTHROPIC_AUTH_TOKEN` 就是这个令牌。其他地方用 `teamai usage --json` 更简单，它会自己从配置读取令牌。
+`3556` 是 `proxy.controlPort` 的默认值；如果改过，请用你设置的值（`jq .proxy.controlPort ~/.config/teamai/config.json`）。在用 `taic` 启动的会话中，`$ANTHROPIC_AUTH_TOKEN` 就是这个令牌。其他地方用 `teamai usage --json` 更简单，它会自己从配置读取令牌。
 
 ### 可以这样用
 
@@ -314,7 +314,7 @@ npm run lint
 
 衍生作品相关说明见 [NOTICE](NOTICE)，本地安全模型见 [SECURITY.md](SECURITY.md)。
 
-> Translation update pending: see the canonical English README for nested Codex relay configuration inheritance.
+> Translation update pending: see the canonical English README for codex-multi-auth import, Codex App binding, health supervision, and nested Codex relay configuration inheritance.
 
 <!-- transient-recovery-2026-09-22 -->
 临时上游错误保留原始 HTTP 状态、正文和 Retry-After。切换账号后最多重试两轮，每轮等待不超过 10 秒，总等待不超过 20 秒。更长的等待交给客户端，成功的流不会重放。Codex HTTP 重试保持关闭，避免重复重试。构建后需重启中继才能生效。
