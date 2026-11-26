@@ -380,3 +380,5 @@ Consulta [NOTICE](NOTICE) para lo relativo a obra derivada y [SECURITY.md](SECUR
 
 <!-- transient-recovery-2026-09-22 -->
 Los errores transitorios conservan el estado HTTP, el cuerpo y Retry-After originales. Tras cambiar de cuenta, el relay permite hasta dos rondas de reintento, con un máximo de 10 segundos de espera por ronda y 20 en total. Las esperas mayores se devuelven al cliente; los streams exitosos no se repiten. Los reintentos HTTP de Codex siguen desactivados para evitar duplicarlos. Reinicia el relay después de compilar para aplicar los cambios.
+
+> Translation update pending: see the canonical English README for the Windows installer (`scripts\install.cmd`), the `taic`/`tax` launcher fix on Windows, and the clone URL of this fork.

@@ -13,12 +13,21 @@ retrying on another account when one is out of quota. It is not an API gateway a
 
 ## Install
 
-Run from the repository root. The script is idempotent — safe to re-run.
+Run from the repository root. The scripts are idempotent — safe to re-run.
 
 ```bash
 ./scripts/install.sh --with-shell     # non-interactive; adds cl/co/tai to ~/.zshrc
 ./scripts/install.sh --no-shell       # leaves the user's rc file untouched
 ./scripts/install.sh --dry-run        # prints the plan, changes nothing
+```
+
+On Windows (works under any PowerShell execution policy):
+
+```powershell
+scripts\install.cmd                   # build, npm link, verify in a new session
+scripts\install.cmd -UserBin          # link into %LOCALAPPDATA%\TeamAI\bin instead
+scripts\install.cmd -DryRun
+scripts\install.cmd -Uninstall
 ```
 
 `--with-shell` writes to `~/.zshrc`. It backs the file up first and rewrites a
@@ -45,7 +54,9 @@ command -v teamai && teamai help >/dev/null && echo INSTALL_OK
 | Symptom | Cause | Action |
 | --- | --- | --- |
 | `Node 20+ required` | Node too old | Install Node 20+. Do not patch `engines`. |
-| `npm link` fails with `EACCES` | Global prefix not user-owned | `npm config set prefix ~/.npm-global`, add `~/.npm-global/bin` to PATH, retry. Do not use `sudo` unless the user approves it. |
+| `npm link` fails with `EACCES` | Global prefix not user-owned | The installers fall back on their own (`~/.local/bin`, `%LOCALAPPDATA%\TeamAI\bin`). After `--no-shell`, tell the user to add `~/.local/bin` to PATH. Do not use `sudo` unless the user approves it. |
+| PowerShell: `tax` cannot be loaded, running scripts is disabled | npm's `.ps1` shim under the Restricted policy | Re-run `scripts\install.cmd` (it removes the TeamAI `.ps1` shims when the policy blocks them), or `scripts\install.cmd -Ps1Shims remove`. Do not change the execution policy for the user. |
+| `warning: port 3456 is already used` | Another relay (often TeamClaude) holds the Claude port | Ask the user to stop it (`teamclaude stop`), or change `proxy.claudePort`. |
 | `teamai: command not found` after linking | npm bin dir not on PATH | Print `npm bin -g`, tell the user to add it to PATH. |
 | Build fails | Toolchain mismatch | Run `npm run typecheck` and report the output. Do not edit `tsconfig.json` to force it through. |
 

@@ -318,3 +318,5 @@ npm run lint
 
 <!-- transient-recovery-2026-09-22 -->
 临时上游错误保留原始 HTTP 状态、正文和 Retry-After。切换账号后最多重试两轮，每轮等待不超过 10 秒，总等待不超过 20 秒。更长的等待交给客户端，成功的流不会重放。Codex HTTP 重试保持关闭，避免重复重试。构建后需重启中继才能生效。
+
+> Translation update pending: see the canonical English README for the Windows installer (`scripts\install.cmd`), the `taic`/`tax` launcher fix on Windows, and the clone URL of this fork.

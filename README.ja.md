@@ -318,3 +318,5 @@ npm run lint
 
 <!-- transient-recovery-2026-09-22 -->
 一時的な上流エラーのHTTPステータス・本文・Retry-Afterを保持します。アカウント切替後の再試行は最大2ラウンド、待機は各10秒・合計20秒以内です。長い待機はクライアントへ返し、成功したストリームは再実行しません。二重再試行を避けるためCodexのHTTP再試行は無効のままです。ビルド後にリレーを再起動すると適用されます。
+
+> Translation update pending: see the canonical English README for the Windows installer (`scripts\install.cmd`), the `taic`/`tax` launcher fix on Windows, and the clone URL of this fork.

@@ -22,6 +22,9 @@ This is a fork of [soulduse/team-ai](https://github.com/soulduse/team-ai). It tr
 - **Dependency pin.** `js-yaml` is pinned through `overrides`.
 - **A request that may have run upstream is never re-sent.** A connection that dropped after the body went out (`ECONNRESET`, a closed socket, a header timeout) is failed over to the next account but never retried, since upstream may already have run it. Upstream re-sends such a request; this fork does not.
 - **A connection failure is retried, not reported as spent quota.** When the relay itself cannot reach upstream (`fetch failed`: a route or DNS blip), the failure is treated as transient when the connection was never made (`ECONNREFUSED`, `ENOTFOUND`, a connect timeout): the relay retries after the two-second bench, a request that arrives while every account is benched waits for the bench instead of hearing `429 quota_exhausted`, and a bench too long to wait out is answered `503` with a `Retry-After`. The cause (`ECONNREFUSED`, `ENOTFOUND`, ...) is written to the activity log.
+- **Launchers work on Windows.** npm's Windows shims start every command as `node <file>`, so with all launchers pointing at `cli.js`, `tax`, `taic`, `tai` and `tag` ran as plain `teamai`. Each launcher now has an entry file of its own (`src/bin/`). Upstream has the same defect for `tac`.
+- **One-command install on Windows and a safer one on macOS.** `scripts\install.cmd` (see Install), a user bin fallback when `npm link` is refused, a `~/.zshrc` created when a new Mac has none, and a warning when the relay port is already taken.
+- **No TeamClaude Cloud.** The fork used to share Claude accounts through TeamClaude Cloud; that service has ended and the feature is gone. Accounts are logged in on each machine.
 - **Activity log on disk.** Every relay event is appended to `~/.config/teamai/events.log` (rotated at 8 MB, one previous file kept as `.1`), in addition to the 200-entry ring the dashboard shows — which is only minutes deep under a busy fleet.
 
 ## Requirements
@@ -33,16 +36,33 @@ This is a fork of [soulduse/team-ai](https://github.com/soulduse/team-ai). It tr
 
 ## Install
 
+macOS and Linux:
+
 ```bash
-git clone https://github.com/soulduse/team-ai.git
+git clone https://github.com/choa712/team-ai.git
 cd team-ai
-./scripts/install.sh
+./scripts/install.sh --with-shell
 ```
 
-`install.sh` installs dependencies, builds, links the `teamai`/`tai`/`taic`/`tax`
-commands, and offers to add the shell block. It is idempotent — re-run it to
-upgrade. Pass `--no-shell` to skip the shell block, or `--dry-run` to see what it
-would do.
+Windows (`cmd.exe` or PowerShell, under any execution policy):
+
+```powershell
+git clone https://github.com/choa712/team-ai.git
+cd team-ai
+scripts\install.cmd
+```
+
+Both install dependencies, build, link the `teamai`/`tai`/`taic`/`tax`/`tag`
+commands and check that they resolve. They are idempotent: `git pull` and
+re-run to upgrade. `install.sh` adds the shell block with `--with-shell`, skips
+it with `--no-shell` and asks otherwise; `--dry-run` shows the plan. When npm
+cannot link into its global prefix, the commands go to `~/.local/bin` (macOS,
+Linux) or `%LOCALAPPDATA%\TeamAI\bin` (Windows) and that directory is put on
+PATH. On Windows the installer also removes the TeamAI `.ps1` shims when the
+execution policy would refuse them, so PowerShell runs the `.cmd` instead, and
+`scripts\install.cmd -Uninstall` removes the commands again. Both warn when the
+Claude or Codex port is held by another program, such as a TeamClaude relay
+still running.
 
 To do the same by hand:
 
@@ -52,11 +72,10 @@ npm run build          # required: dist/ is not committed
 npm link
 ```
 
-On Windows, `install.sh` needs a bash shell, so use these manual steps instead.
-`npm link` creates `teamai`/`tai`/`taic`/`tax` commands for `cmd.exe` and
-PowerShell, and the launchers start an npm-installed `claude.cmd`/`codex.cmd`
-with every argument escaped for `cmd.exe`. The shell setup and login-item
-sections below are for macOS and Linux.
+On Windows `npm link` creates `teamai`/`tai`/`taic`/`tax`/`tag` commands for
+`cmd.exe` and PowerShell, and the launchers start an npm-installed
+`claude.cmd`/`codex.cmd` with every argument escaped for `cmd.exe`. The shell
+setup and login-item sections below are for macOS and Linux.
 
 Automating this from an AI agent? See [AGENTS.md](AGENTS.md), which states the
 same steps as deterministic commands with verification and failure branches.

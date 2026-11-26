@@ -19,13 +19,23 @@ TeamAI는 **Claude Code**, 공식 **Codex CLI**, 공식 **Grok CLI**를 위한 �
 
 ## 설치
 
+macOS·Linux:
+
 ```bash
-git clone https://github.com/soulduse/team-ai.git
+git clone https://github.com/choa712/team-ai.git
 cd team-ai
-./scripts/install.sh
+./scripts/install.sh --with-shell
 ```
 
-`install.sh`는 의존성 설치, 빌드, `teamai`/`tai`/`taic`/`tax` 명령 링크를 수행하고 셸 블록 추가 여부를 묻습니다. 멱등적이므로 업그레이드할 때 다시 실행하면 됩니다. 셸 블록을 건너뛰려면 `--no-shell`, 실제 변경 없이 계획만 보려면 `--dry-run`을 씁니다.
+Windows(`cmd.exe`나 PowerShell, 실행 정책과 무관):
+
+```powershell
+git clone https://github.com/choa712/team-ai.git
+cd team-ai
+scripts\install.cmd
+```
+
+두 스크립트 모두 의존성 설치, 빌드, `teamai`/`tai`/`taic`/`tax`/`tag` 명령 연결을 하고 명령이 실제로 잡히는지 확인합니다. 여러 번 실행해도 되므로 업그레이드는 `git pull` 뒤 다시 실행하면 됩니다. `install.sh`는 `--with-shell`이면 셸 블록을 넣고, `--no-shell`이면 건너뛰고, 둘 다 없으면 묻습니다. `--dry-run`은 계획만 보여 줍니다. npm 전역 폴더에 연결할 권한이 없으면 명령을 `~/.local/bin`(macOS·Linux)이나 `%LOCALAPPDATA%\TeamAI\bin`(Windows)에 두고 그 폴더를 PATH에 넣습니다. Windows에서는 실행 정책이 막는 경우 TeamAI의 `.ps1` 실행 파일을 지워 PowerShell이 `.cmd`를 쓰게 하고, `scripts\install.cmd -Uninstall`로 명령을 다시 지울 수 있습니다. Claude나 Codex 포트를 다른 프로그램(아직 켜져 있는 TeamClaude 등)이 쓰고 있으면 두 스크립트 모두 경고합니다.
 
 수동으로 하려면:
 
@@ -35,7 +45,7 @@ npm run build          # 필수: dist/는 저장소에 포함되지 않습니다
 npm link
 ```
 
-Windows에서는 `install.sh`에 bash 셸이 필요하므로 위 수동 절차를 쓰세요. `npm link`가 `cmd.exe`·PowerShell용 `teamai`/`tai`/`taic`/`tax` 명령을 만들고, 실행기는 npm으로 설치된 `claude.cmd`/`codex.cmd`를 모든 인자를 `cmd.exe`용으로 escape해 실행합니다. 아래 셸 설정과 로그인 항목 절은 macOS·Linux용입니다.
+Windows에서는 `npm link`가 `cmd.exe`·PowerShell용 `teamai`/`tai`/`taic`/`tax`/`tag` 명령을 만들고, 실행기는 npm으로 설치된 `claude.cmd`/`codex.cmd`를 모든 인자를 `cmd.exe`용으로 escape해 실행합니다. 아래 셸 설정과 로그인 항목 절은 macOS·Linux용입니다.
 
 AI 에이전트로 설치를 자동화하시나요? [AGENTS.md](AGENTS.md)에 같은 절차가 검증 단계와 실패 분기를 갖춘 결정적 명령으로 정리돼 있습니다.
 

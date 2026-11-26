@@ -154,6 +154,7 @@ if ($DryRun) { Note 'would check that every command resolves and that tax and ta
   $probeHome = Join-Path ([IO.Path]::GetTempPath()) ("teamai-install-check-" + [Guid]::NewGuid().ToString('N'))
   $check = @'
 $ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
 $failed = 0
 foreach ($name in 'teamai', 'tai', 'taic', 'tax', 'tag') {
   $cmd = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -174,7 +175,7 @@ exit $failed
     $env:Path = Get-FreshPath; $env:TEAMAI_HOME = $probeHome
     Remove-Item Env:PSExecutionPolicyPreference -ErrorAction SilentlyContinue
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($check))
-    & powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded | ForEach-Object { Note $_ }
+    & powershell.exe -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand $encoded | ForEach-Object { Note $_ }
     $verifyCode = $LASTEXITCODE
   } finally {
     $env:Path = $savedPath; $env:TEAMAI_HOME = $savedHome
