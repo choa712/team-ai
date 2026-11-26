@@ -208,10 +208,11 @@ if (!procs) {
   say('Not changed: the running processes could not be listed, so a running TeamClaude cannot be ruled out.');
   process.exit(DRY ? 0 : 3);
 }
-// Codex sessions depend on the server too while TeamClaude routes Codex.
+// Codex sessions count too, whatever config.toml says now: a session keeps the
+// address it started with, and it may have started from another CODEX_HOME.
 const dependents = serverRunning ? [
   procs.claudes.length && `Claude Code pid ${pids(procs.claudes)}`,
-  codexRouted() && procs.codexes.length && `Codex pid ${pids(procs.codexes)}`,
+  procs.codexes.length && `Codex pid ${pids(procs.codexes)}`,
 ].filter(Boolean) : [];
 if (dependents.length && !FORCE) {
   say('');

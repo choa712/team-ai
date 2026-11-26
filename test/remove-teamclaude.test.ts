@@ -183,11 +183,9 @@ test('keeps a skill folder whose files were edited or backed up', { skip }, (t) 
   }
 });
 
-test('does not stop the server while Codex sessions run and TeamClaude routes Codex', { skip }, async (t) => {
+test('does not stop the server while Codex sessions run, even when Codex routing was already switched off', { skip }, async (t) => {
+  // No TeamClaude block in config.toml: a running session keeps the address it started with.
   const box = sandbox(t, { route: null });
-  const codexConfig = join(box.env.HOME!, '.codex', 'config.toml');
-  mkdirSync(dirname(codexConfig));
-  writeFileSync(codexConfig, '# >>> teamclaude: route Codex through the TeamClaude proxy (teamclaude codex on|off) >>>\nmodel_provider = "teamclaude"\n# <<< teamclaude <<<\n');
   const server = idle(t, box, join(box.pkg, 'src', 'index.js'), ['server']);
   writeFileSync(box.env.STUB_PID!, String(server.pid));
   const codex = join(box.root, 'codex');
