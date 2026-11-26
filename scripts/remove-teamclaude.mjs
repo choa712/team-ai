@@ -71,8 +71,9 @@ const token = (tail) => `(?:"[^"]*${tail}"|(?:[^"\\s]*[\\\\/])?${tail})`;
 const NODE = token('node(?:\\.exe)?');
 const TEAMCLAUDE_SCRIPT = token('(?:teamclaude-cloud[\\\\/]src[\\\\/]index\\.js|@karpeleslab[\\\\/]teamclaude[\\\\/]src[\\\\/]index\\.js|teamclaude)');
 // The teamclaude program itself, as a server or as a `teamclaude run` session.
-// Node options may sit between node and the script (node --enable-source-maps …).
-const NODE_OPTIONS = '(?:\\s+-[^\\s"]*)*';
+// Node options, with or without values, may sit between node and the script
+// (node --require x.cjs …). The status probe below backs this match up.
+const NODE_OPTIONS = '(?:\\s+(?:"[^"]*"|[^\\s"]+))*?';
 const TEAMCLAUDE = new RegExp(`^${NODE}${NODE_OPTIONS}\\s+${TEAMCLAUDE_SCRIPT}(?=\\s|$)`, 'i');
 const RUN = new RegExp(`^${NODE}${NODE_OPTIONS}\\s+${TEAMCLAUDE_SCRIPT}\\s+run(?:\\s|$)`, 'i');
 // Claude Code and Codex sessions: their word anywhere. Matching too much only makes
@@ -151,10 +152,24 @@ function teamclaudeSkillFiles() {
   } catch { return null; }
 }
 
+// TeamClaude's own liveness test (its src/index.js): the status page answers with
+// an accounts list and a switch threshold. It does not depend on how the process
+// was started, so it catches a server the command-line match misses.
+async function serverAnswers() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
+  } catch { return false; }
+}
+
 const procs = teamclaudeProcesses();
+const answering = await serverAnswers();
+const serverRunning = Boolean(procs?.servers.length) || answering;
 const strayCommand = installed.length ? null : teamclaudeOnPath();
 // The account file does not count: this script keeps it on purpose.
-traces = Boolean(installed.length || strayCommand || skillPresent() || procs?.servers.length || procs?.runs.length);
+traces = Boolean(installed.length || strayCommand || skillPresent() || serverRunning || procs?.runs.length);
 // Inside Claude Code (CLAUDECODE=1) the variable comes from settings.json, which
 // is already covered above, not from the user's shell.
 const shellRouted = sameUrl(process.env.ANTHROPIC_BASE_URL) && !process.env.CLAUDECODE;
@@ -164,6 +179,7 @@ if (!procs) found.push('the running processes could not be listed, so a running 
 for (const p of installed) found.push(`${p.name} ${p.json.version} is installed in ${p.dir}`);
 if (strayCommand) found.push(`a teamclaude command is at ${strayCommand}, outside this npm's global folder`);
 if (procs?.servers.length) found.push(`TeamClaude is running (pid ${pids(procs.servers)})`);
+else if (answering) found.push(`TeamClaude is running (it answers on port ${port})`);
 if (procs?.runs.length) found.push(`${procs.runs.length} 'teamclaude run' session(s) are open (pid ${pids(procs.runs)})`);
 if (claudeRouted()) found.push(`${settingsPath} sends Claude Code to ${teamclaudeUrl}`);
 if (codexRouted()) found.push(`${codexPath} sends Codex to TeamClaude`);
@@ -189,7 +205,7 @@ if (!procs) {
   process.exit(DRY ? 0 : 3);
 }
 // Codex sessions depend on the server too while TeamClaude routes Codex.
-const dependents = procs.servers.length ? [
+const dependents = serverRunning ? [
   procs.claudes.length && `Claude Code pid ${pids(procs.claudes)}`,
   codexRouted() && procs.codexes.length && `Codex pid ${pids(procs.codexes)}`,
 ].filter(Boolean) : [];
@@ -208,18 +224,20 @@ const teamclaude = (...args) => {
   spawnSync(process.execPath, [entry, ...args], { stdio: 'inherit', timeout: 60000 });
 };
 
-if (procs.servers.length) {
+const where = (list) => (list?.length ? `pid ${pids(list)}` : `port ${port}`);
+if (serverRunning) {
   if (entry) {
     teamclaude('stop');
-    // A stopping server can take a moment to finish in-flight requests.
+    // A stopping server can take a moment to finish in-flight requests. It is gone
+    // only when neither its process nor its status page is left.
     for (let i = 0; i < 20 && !DRY; i++) {
       const left = teamclaudeProcesses();
-      if (left && !left.servers.length) break;
-      if (i === 19) unfinished.push(`TeamClaude is still running (pid ${pids(left?.servers || procs.servers)}): stop it, then run this again`);
+      if (left && !left.servers.length && !(await serverAnswers())) break;
+      if (i === 19) unfinished.push(`TeamClaude is still running (${where(left?.servers)}): stop it, then run this again`);
       await sleep(500);
     }
   } else {
-    unfinished.push(`TeamClaude is running (pid ${pids(procs.servers)}) but its package is not in this npm: stop it, then run this again`);
+    unfinished.push(`TeamClaude is running (${where(procs.servers)}) but its package is not in this npm: stop it, then run this again`);
   }
 }
 
