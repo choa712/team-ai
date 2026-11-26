@@ -14,6 +14,10 @@ execution policy is. Idempotent: re-run it to upgrade.
                    TeamAI .ps1 files only when the policy would block them, so
                    PowerShell falls back to the .cmd.
   -Uninstall       remove the commands, the fallback directory and its PATH entry
+  -RemoveTeamClaude
+                   also stop and uninstall TeamClaude and clear the address it
+                   left in ~/.claude/settings.json (scripts\remove-teamclaude.mjs;
+                   will not stop a running TeamClaude while sessions using it run)
 
 This file is ASCII on purpose: Windows PowerShell 5.1 reads a script without a
 byte order mark in the system code page.
@@ -23,7 +27,8 @@ param(
   [switch]$DryRun,
   [switch]$UserBin,
   [ValidateSet('auto', 'keep', 'remove')][string]$Ps1Shims = 'auto',
-  [switch]$Uninstall
+  [switch]$Uninstall,
+  [switch]$RemoveTeamClaude
 )
 $ErrorActionPreference = 'Stop'
 
@@ -194,6 +199,27 @@ exit $failed
   Note "commands resolve under the $policy policy"
 }
 
+# TeamClaude writes its address into ~/.claude/settings.json, and that file
+# wins over the address taic passes: TeamAI sessions then reach TeamClaude, or a
+# dead port once it stops. Remove it on request, otherwise only report it.
+$teamclaudeStatus = 0
+$removeScript = Join-Path $PSScriptRoot 'remove-teamclaude.mjs'
+if ($RemoveTeamClaude) {
+  Step 'Removing TeamClaude'
+  $removeArgs = @($removeScript)
+  if ($DryRun) { $removeArgs += '--dry-run' }
+  & node @removeArgs | Out-Host
+  $teamclaudeStatus = $LASTEXITCODE
+} else {
+  Step 'Checking for TeamClaude'
+  & node $removeScript --check | Out-Host
+  switch ($LASTEXITCODE) {
+    0 { Note 'not found' }
+    10 { Note 'Remove it, from a terminal with no Claude Code session: scripts\install.cmd -RemoveTeamClaude' }
+    default { Note "could not check (exit $LASTEXITCODE)" }
+  }
+}
+
 # TeamClaude listened on the same Claude port (3456). A relay still running
 # there makes every TeamAI start fail with "port in use", so say so now.
 if (-not $DryRun) {
@@ -210,7 +236,7 @@ if (-not $DryRun) {
     $who = if ($proc) { "$($proc.Name) (pid $($proc.ProcessId))" } else { "pid $($listen.OwningProcess)" }
     Write-Host ''
     Write-Host "   warning: port $port is already used by $who."
-    Write-Host '   TeamAI cannot start while it is. If it is TeamClaude, stop it from another terminal: teamclaude stop'
+    Write-Host '   TeamAI cannot start while it is. If it is TeamClaude, close Claude Code and run: scripts\install.cmd -RemoveTeamClaude'
   }
 }
 
@@ -222,3 +248,7 @@ Write-Host '  taic             Claude Code through the account pool'
 Write-Host '  tax              Codex through the account pool'
 Write-Host '  tai              open the dashboard'
 Write-Host ''
+if ($teamclaudeStatus -ne 0) {
+  Write-Host 'TeamClaude was not fully removed: see the lines above, then run scripts\install.cmd -RemoveTeamClaude again.'
+  exit $teamclaudeStatus
+}

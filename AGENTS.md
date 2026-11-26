@@ -19,6 +19,7 @@ Run from the repository root. The scripts are idempotent — safe to re-run.
 ./scripts/install.sh --with-shell     # non-interactive; adds cl/co/tai to ~/.zshrc
 ./scripts/install.sh --no-shell       # leaves the user's rc file untouched
 ./scripts/install.sh --dry-run        # prints the plan, changes nothing
+./scripts/install.sh --no-shell --remove-teamclaude   # also stop and uninstall TeamClaude
 ```
 
 On Windows (works under any PowerShell execution policy):
@@ -28,6 +29,7 @@ scripts\install.cmd                   # build, npm link, verify in a new session
 scripts\install.cmd -UserBin          # link into %LOCALAPPDATA%\TeamAI\bin instead
 scripts\install.cmd -DryRun
 scripts\install.cmd -Uninstall
+scripts\install.cmd -RemoveTeamClaude
 ```
 
 `--with-shell` writes to `~/.zshrc`. It backs the file up first and rewrites a
@@ -56,7 +58,9 @@ command -v teamai && teamai help >/dev/null && echo INSTALL_OK
 | `Node 20+ required` | Node too old | Install Node 20+. Do not patch `engines`. |
 | `npm link` fails with `EACCES` | Global prefix not user-owned | The installers fall back on their own (`~/.local/bin`, `%LOCALAPPDATA%\TeamAI\bin`). After `--no-shell`, tell the user to add `~/.local/bin` to PATH. Do not use `sudo` unless the user approves it. |
 | PowerShell: `tax` cannot be loaded, running scripts is disabled | npm's `.ps1` shim under the Restricted policy | Re-run `scripts\install.cmd` (it removes the TeamAI `.ps1` shims when the policy blocks them), or `scripts\install.cmd -Ps1Shims remove`. Do not change the execution policy for the user. |
-| `warning: port 3456 is already used` | Another relay (often TeamClaude) holds the Claude port | Ask the user to stop it (`teamclaude stop`), or change `proxy.claudePort`. |
+| `warning: port 3456 is already used` | Another relay (often TeamClaude) holds the Claude port | Ask the user to close Claude Code and run `scripts/install.sh --remove-teamclaude` (Windows: `scripts\install.cmd -RemoveTeamClaude`), or change `proxy.claudePort`. |
+| `Not changed: sessions that may go through TeamClaude are running` | `--remove-teamclaude` will not stop a running TeamClaude while Claude Code or Codex runs; an agent inside Claude Code always hits this | Hand it to the user. Pass `--force` to `scripts/remove-teamclaude.mjs` only when the user confirms no running session goes through TeamClaude. |
+| `Not finished:` after `--remove-teamclaude` (exit 3) | Something it would not touch is left, such as a TeamClaude block in `~/.codex/config.toml` | Show the list to the user. For the Codex block the user runs `teamclaude codex off`; then re-run. Do not edit `~/.codex` yourself. |
 | `teamai: command not found` after linking | npm bin dir not on PATH | Print `npm bin -g`, tell the user to add it to PATH. |
 | Build fails | Toolchain mismatch | Run `npm run typecheck` and report the output. Do not edit `tsconfig.json` to force it through. |
 

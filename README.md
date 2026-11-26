@@ -64,6 +64,17 @@ execution policy would refuse them, so PowerShell runs the `.cmd` instead, and
 Claude or Codex port is held by another program, such as a TeamClaude relay
 still running.
 
+Both also check for TeamClaude. `install.sh --remove-teamclaude`
+(`scripts\install.cmd -RemoveTeamClaude` on Windows) stops it, removes the
+`ANTHROPIC_BASE_URL` it wrote into `~/.claude/settings.json` and its `/teamclaude`
+skill, and uninstalls the `teamclaude-cloud` package. That settings line matters:
+it overrides the address `taic` passes, so TeamAI sessions would otherwise reach
+TeamClaude, or a dead port once it stops. TeamClaude's account file
+(`~/.config/teamclaude.json`) is kept. It does not stop a running TeamClaude while
+any Claude Code or Codex process runs, because that cuts off the sessions that go through it;
+`node scripts/remove-teamclaude.mjs --force` goes ahead when none of them does. A Codex block TeamClaude left in `~/.codex/config.toml` is reported, not
+edited: run `teamclaude codex off`, then the removal again.
+
 To do the same by hand:
 
 ```bash

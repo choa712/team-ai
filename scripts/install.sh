@@ -9,6 +9,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 WITH_SHELL=ask
 DRY_RUN=false
+REMOVE_TEAMCLAUDE=false
 LAUNCHERS="tai taic tax tag"
 # Where commands go when npm cannot link into its global prefix (EACCES on a
 # root-owned /usr/local from the nodejs.org installer, for example).
@@ -16,12 +17,16 @@ USER_BIN="${TEAMAI_BIN_DIR:-$HOME/.local/bin}"
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--no-shell] [--with-shell] [--dry-run]
+Usage: install.sh [--no-shell] [--with-shell] [--remove-teamclaude] [--dry-run]
 
-  (default)      install, build, link, then ask about the shell block
-  --with-shell   install the shell block without asking (for automation)
-  --no-shell     skip the shell block entirely
-  --dry-run      print what would happen, change nothing
+  (default)            install, build, link, then ask about the shell block
+  --with-shell         install the shell block without asking (for automation)
+  --no-shell           skip the shell block entirely
+  --remove-teamclaude  also stop and uninstall TeamClaude and clear the
+                       address it left in ~/.claude/settings.json
+                       (scripts/remove-teamclaude.mjs; will not stop a
+                       running TeamClaude while sessions using it run)
+  --dry-run            print what would happen, change nothing
 
 When npm cannot link into its global prefix, the commands are linked into
 ~/.local/bin instead (override with TEAMAI_BIN_DIR); --with-shell then also
@@ -34,6 +39,7 @@ while [ $# -gt 0 ]; do
     --no-shell)   WITH_SHELL=no ;;
     --with-shell) WITH_SHELL=yes ;;
     --dry-run)    DRY_RUN=true ;;
+    --remove-teamclaude) REMOVE_TEAMCLAUDE=true ;;
     -h|--help)    usage; exit 0 ;;
     *)            echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -118,6 +124,25 @@ else
   echo "   teamai responds; $LAUNCHERS resolve to $(dirname "$(command -v teamai)")"
 fi
 
+# TeamClaude writes its address into ~/.claude/settings.json, and that file
+# wins over the address taic passes: TeamAI sessions then reach TeamClaude, or a
+# dead port once it stops. Remove it on request, otherwise only report it.
+TEAMCLAUDE_STATUS=0
+REMOVE_SCRIPT="$REPO_ROOT/scripts/remove-teamclaude.mjs"
+if [ "$REMOVE_TEAMCLAUDE" = true ]; then
+  step "Removing TeamClaude"
+  if [ "$DRY_RUN" = true ]; then node "$REMOVE_SCRIPT" --dry-run || TEAMCLAUDE_STATUS=$?; else node "$REMOVE_SCRIPT" || TEAMCLAUDE_STATUS=$?; fi
+else
+  step "Checking for TeamClaude"
+  check_status=0
+  node "$REMOVE_SCRIPT" --check || check_status=$?
+  case "$check_status" in
+    0)  echo "   not found" ;;
+    10) echo "   Remove it, from a terminal with no Claude Code session: scripts/install.sh --remove-teamclaude" ;;
+    *)  echo "   could not check (exit $check_status)" ;;
+  esac
+fi
+
 # TeamClaude listened on the same Claude port (3456). A relay still running
 # there makes every TeamAI start fail with "port in use", so say so now.
 if [ "$DRY_RUN" != true ] && command -v lsof >/dev/null; then
@@ -131,7 +156,7 @@ if [ "$DRY_RUN" != true ] && command -v lsof >/dev/null; then
     if ps -o command= -p "$pid" 2>/dev/null | grep -qiE 'teamai|team-ai'; then continue; fi
     echo ""
     echo "   warning: port $port is already used by $owner."
-    echo "   TeamAI cannot start while it is. If it is TeamClaude, stop it from another terminal: teamclaude stop"
+    echo "   TeamAI cannot start while it is. If it is TeamClaude, close Claude Code and run: scripts/install.sh --remove-teamclaude"
   done
 fi
 
@@ -145,3 +170,8 @@ TeamAI is installed. Next:
   tai              open the dashboard
 
 DONE
+
+if [ "$TEAMCLAUDE_STATUS" -ne 0 ]; then
+  echo "TeamClaude was not fully removed: see the lines above, then run scripts/install.sh --remove-teamclaude again." >&2
+  exit "$TEAMCLAUDE_STATUS"
+fi
