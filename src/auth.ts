@@ -2,9 +2,12 @@ import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { readFile, rm } from 'node:fs/promises';
-import { homedir, platform, tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mkdtemp } from 'node:fs/promises';
+import { openInBrowser } from './desktop.js';
+import { launchCommand } from './launch.js';
+import { claudeProvider } from './providers.js';
 import type { OAuthCredential, ProviderId } from './types.js';
 
 function expand(path: string): string { return path.startsWith('~/') ? join(homedir(), path.slice(2)) : resolve(path); }
@@ -14,7 +17,7 @@ export function decodeJwt(token: string): Record<string, unknown> { try { const 
 function stringAt(value: unknown, key: string): string | null { return value && typeof value === 'object' && typeof (value as Record<string, unknown>)[key] === 'string' ? (value as Record<string, string>)[key]! : null; }
 
 export async function importAuth(provider: ProviderId, from?: string): Promise<Array<{ label: string; credential: OAuthCredential }>> {
-  const path = expand(from || (provider === 'claude' ? '~/.claude/.credentials.json' : join(process.env.CODEX_HOME || '~/.codex', 'auth.json')));
+  const path = expand(from || (provider === 'claude' ? '~/.claude/.credentials.json' : provider === 'grok' ? join(process.env.GROK_HOME || '~/.grok', 'auth.json') : join(process.env.CODEX_HOME || '~/.codex', 'auth.json')));
   let contents: string;
   try { contents = await readFile(path, 'utf8'); }
   catch (error) {
@@ -22,6 +25,7 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
     throw error;
   }
   const raw = JSON.parse(contents) as Record<string, unknown>;
+  if (provider === 'grok') return grokAccounts(raw);
   if (provider === 'claude') {
     if (Array.isArray(raw.accounts)) {
       const accounts = raw.accounts.flatMap((entry) => {
@@ -35,7 +39,7 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
     const data = (raw.claudeAiOauth || raw) as Record<string, unknown>;
     if (typeof data.accessToken !== 'string') throw new Error('Claude accessToken is missing');
     const profile = await claudeProfile(data.accessToken);
-    return [{ label: profile.label, credential: { accessToken: data.accessToken, refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null, expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null, accountId: profile.id } }];
+    return [{ label: profile.label, credential: { accessToken: data.accessToken, refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null, expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null, accountId: profile.id, ...(profile.organizationId ? { organizationId: profile.organizationId } : {}) } }];
   }
   if (Array.isArray(raw.accounts)) {
     const accounts = raw.accounts.flatMap((entry) => {
@@ -47,15 +51,19 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
       const accountId = typeof selected?.id === 'string' ? selected.id : typeof data.accountId === 'string' ? data.accountId : null;
       if (!accountId) return [];
       const label = typeof data.email === 'string' ? data.email : typeof data.accountLabel === 'string' ? data.accountLabel : accountId;
+      // Members of one Business/Team workspace share its id; the user in the
+      // token tells them apart, as for every other Codex import (accountKey).
+      const userId = codexUserId(data.accessToken, typeof data.idToken === 'string' ? data.idToken : undefined);
       return [{ label, credential: {
         accessToken: data.accessToken,
         refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null,
         expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null,
         accountId,
+        ...(userId ? { userId } : {}),
       } }];
     });
     if (!accounts.length) throw new Error('No OAuth accounts found in codex-multi-auth config');
-    return [...new Map(accounts.map((account) => [account.credential.accountId, account])).values()];
+    return [...new Map(accounts.map((account) => [`${account.credential.accountId}:${account.credential.userId ?? ''}`, account])).values()];
   }
   const tokens = (raw.tokens || raw) as Record<string, unknown>;
   if (typeof tokens.access_token !== 'string') throw new Error('Codex access_token is missing');
@@ -64,15 +72,67 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
   const accountId = typeof tokens.account_id === 'string' ? tokens.account_id : stringAt(auth, 'chatgpt_account_id') || stringAt(auth, 'account_id');
   if (!accountId) throw new Error('Codex account_id is missing');
   const exp = decodeJwt(tokens.access_token).exp;
-  return [{ label: stringAt(idClaims, 'email') || accountId, credential: { accessToken: tokens.access_token, refreshToken: typeof tokens.refresh_token === 'string' ? tokens.refresh_token : null, expiresAt: typeof exp === 'number' ? exp * 1000 : null, accountId } }];
+  const userId = codexUserId(tokens.access_token, typeof tokens.id_token === 'string' ? tokens.id_token : undefined);
+  return [{ label: stringAt(idClaims, 'email') || accountId, credential: { accessToken: tokens.access_token, refreshToken: typeof tokens.refresh_token === 'string' ? tokens.refresh_token : null, expiresAt: typeof exp === 'number' ? exp * 1000 : null, accountId, ...(userId ? { userId } : {}) } }];
 }
 
-async function claudeProfile(accessToken: string): Promise<{ id: string; label: string }> {
+// Grok's auth.json keys each session as `<issuer>::<client id>`; only xAI's
+// own sign-in (auth.x.ai) is a subscription account the relay can use.
+export function grokAccounts(raw: Record<string, unknown>): Array<{ label: string; credential: OAuthCredential }> {
+  const accounts = Object.entries(raw).flatMap(([key, value]) => {
+    if (!key.startsWith('https://auth.x.ai::') || !value || typeof value !== 'object') return [];
+    const access = stringAt(value, 'key'); const userId = stringAt(value, 'user_id');
+    if (!access || !userId) return [];
+    const expires = Date.parse(stringAt(value, 'expires_at') ?? '');
+    return [{ label: stringAt(value, 'email') || userId, credential: { accessToken: access, refreshToken: stringAt(value, 'refresh_token'), expiresAt: Number.isFinite(expires) ? expires : null, accountId: userId } }];
+  });
+  if (!accounts.length) throw new Error('No Grok sign-in found in auth.json (an API key or SSO login cannot be pooled)');
+  return accounts;
+}
+
+// The ChatGPT user a Codex token belongs to. The access token is read first so
+// a credential stored without its id_token resolves to the same value later.
+export function codexUserId(accessToken: string, idToken?: string): string | null {
+  for (const token of [accessToken, idToken]) {
+    if (!token) continue;
+    const claims = decodeJwt(token); const auth = claims['https://api.openai.com/auth'];
+    const id = stringAt(auth, 'chatgpt_user_id') || stringAt(auth, 'user_id') || stringAt(claims, 'sub');
+    if (id) return id;
+  }
+  return null;
+}
+
+// Labels stay the email for a personal plan; an organization seat gets its kind
+// appended so a personal plan and a Team seat under one email can be told apart.
+const ORG_KINDS: Record<string, string> = { claude_team: 'Team', claude_enterprise: 'Enterprise' };
+
+async function claudeProfile(accessToken: string): Promise<{ id: string; label: string; organizationId: string | null }> {
   const response = await fetch('https://api.anthropic.com/api/oauth/profile', { headers: { authorization: `Bearer ${accessToken}`, 'anthropic-version': '2023-06-01' }, signal: AbortSignal.timeout(15_000) });
-  if (!response.ok) throw new Error(`Claude profile failed (${response.status})`);
-  const value = await response.json() as { account?: { uuid?: string; email?: string } };
+  if (!response.ok) throw Object.assign(new Error(`Claude profile failed (${response.status})`), { status: response.status });
+  const value = await response.json() as { account?: { uuid?: string; email?: string }; organization?: { uuid?: string; organization_type?: string } };
   if (!value.account?.uuid) throw new Error('Claude account UUID is missing');
-  return { id: value.account.uuid, label: value.account.email || value.account.uuid };
+  const kind = ORG_KINDS[value.organization?.organization_type ?? ''];
+  const label = value.account.email || value.account.uuid;
+  return { id: value.account.uuid, label: kind ? `${label} (${kind})` : label, organizationId: value.organization?.uuid ?? null };
+}
+
+// Upstream turned the token down, as opposed to not answering at all.
+const refused = (error: unknown): boolean => [400, 401, 403].includes((error as { status?: number } | null)?.status ?? 0);
+
+// The organization a stored Claude credential belongs to, for records saved
+// before the organization was kept. An idle record's access token has usually
+// lapsed, so a refused token is renewed once and asked again; the renewed
+// credential comes back with the answer, because the refresh token it replaced
+// is spent and the caller must keep the new one. 'lost' when the renewal is
+// refused too: that credential can no longer serve, so nothing is lost by
+// replacing it. 'unknown' when upstream could not be reached to say.
+export type HeldOrganization = { organizationId: string | null; renewed?: OAuthCredential } | 'lost' | 'unknown';
+export async function claudeOrganization(credential: OAuthCredential): Promise<HeldOrganization> {
+  try { return { organizationId: (await claudeProfile(credential.accessToken)).organizationId }; } catch (error) { if (!refused(error)) return 'unknown'; }
+  if (!credential.refreshToken) return 'lost';
+  let renewed: OAuthCredential;
+  try { renewed = await claudeProvider.refresh(credential); } catch (error) { return refused(error) ? 'lost' : 'unknown'; }
+  try { return { organizationId: (await claudeProfile(renewed.accessToken)).organizationId, renewed }; } catch { return { organizationId: null, renewed }; }
 }
 
 export async function loginClaude(): Promise<{ label: string; credential: OAuthCredential }> {
@@ -85,21 +145,35 @@ export async function loginClaude(): Promise<{ label: string; credential: OAuthC
   const redirect = `http://localhost:${address.port}/callback`;
   const url = new URL('https://claude.ai/oauth/authorize');
   for (const [k, v] of Object.entries({ code: 'true', client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e', response_type: 'code', redirect_uri: redirect, scope: 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload', code_challenge: challenge, code_challenge_method: 'S256', state })) url.searchParams.set(k, v);
-  openBrowser(url.toString()); console.error(`Open this URL if the browser did not open:\n${url}`);
+  openInBrowser(url.toString()); console.error(`Open this URL if the browser did not open:\n${url}`);
   let authorizationCode: string; try { authorizationCode = await code; } finally { server.close(); }
   const response = await fetch('https://platform.claude.com/v1/oauth/token', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: authorizationCode, state, grant_type: 'authorization_code', client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e', redirect_uri: redirect, code_verifier: verifier }) });
   if (!response.ok) throw new Error(`Claude token exchange failed (${response.status})`);
   const tokens = await response.json() as Record<string, unknown>; const accessToken = String(tokens.access_token); const profile = await claudeProfile(accessToken);
-  return { label: profile.label, credential: { accessToken, refreshToken: typeof tokens.refresh_token === 'string' ? tokens.refresh_token : null, expiresAt: Date.now() + Number(tokens.expires_in || 3600) * 1000, accountId: profile.id } };
+  return { label: profile.label, credential: { accessToken, refreshToken: typeof tokens.refresh_token === 'string' ? tokens.refresh_token : null, expiresAt: Date.now() + Number(tokens.expires_in || 3600) * 1000, accountId: profile.id, ...(profile.organizationId ? { organizationId: profile.organizationId } : {}) } };
+}
+
+// `grok login` in a throwaway GROK_HOME, so the user's own ~/.grok session is
+// neither replaced nor shared: the account gets a sign-in of its own.
+export async function loginGrok(): Promise<{ label: string; credential: OAuthCredential }> {
+  const home = await mkdtemp(join(tmpdir(), 'teamai-grok-login-'));
+  try {
+    const exit = await new Promise<number>((resolveExit, reject) => { const launch = launchCommand('grok', ['login']); const child = spawn(launch.file, launch.args, { stdio: 'inherit', windowsVerbatimArguments: launch.windowsVerbatimArguments, env: { ...process.env, GROK_HOME: home } }); child.once('error', reject); child.once('exit', (code) => resolveExit(code ?? 1)); });
+    if (exit !== 0) throw new Error(`grok login exited with ${exit}`);
+    return (await importAuth('grok', join(home, 'auth.json')))[0]!;
+  } finally { await rm(home, { recursive: true, force: true }); }
 }
 
 export async function loginCodex(): Promise<{ label: string; credential: OAuthCredential }> {
   const home = await mkdtemp(join(tmpdir(), 'teamai-codex-login-'));
   try {
-    const exit = await new Promise<number>((resolveExit, reject) => { const child = spawn('codex', ['login'], { stdio: 'inherit', env: { ...process.env, CODEX_HOME: home } }); child.once('error', reject); child.once('exit', (code) => resolveExit(code ?? 1)); });
+    const exit = await new Promise<number>((resolveExit, reject) => { const launch = launchCommand('codex', ['login']); const child = spawn(launch.file, launch.args, { stdio: 'inherit', windowsVerbatimArguments: launch.windowsVerbatimArguments, env: { ...process.env, CODEX_HOME: home } }); child.once('error', reject); child.once('exit', (code) => resolveExit(code ?? 1)); });
     if (exit !== 0) throw new Error(`codex login exited with ${exit}`);
     return (await importAuth('codex', join(home, 'auth.json')))[0]!;
   } finally { await rm(home, { recursive: true, force: true }); }
 }
 
-function openBrowser(url: string): void { const command = platform() === 'darwin' ? 'open' : 'xdg-open'; spawn(command, [url], { detached: true, stdio: 'ignore' }).unref(); }
+// Interactive sign-in for any provider; the dashboard and `teamai login` share it.
+export function login(id: ProviderId): Promise<{ label: string; credential: OAuthCredential }> {
+  return id === 'claude' ? loginClaude() : id === 'codex' ? loginCodex() : loginGrok();
+}

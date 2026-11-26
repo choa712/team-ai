@@ -2,30 +2,40 @@
 
 [English](README.md) · **한국어** · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Español](README.es.md)
 
-TeamAI는 **Claude Code**와 공식 **Codex CLI**를 위한 로컬 다중 계정 릴레이입니다. 제공자별로 별도의 계정 풀을 유지하며, 선택된 구독 계정을 쓸 수 없거나 할당량이 소진되면 다른 계정으로 요청을 재시도합니다.
+TeamAI는 **Claude Code**, 공식 **Codex CLI**, 공식 **Grok CLI**를 위한 로컬 다중 계정 릴레이입니다. 제공자별로 별도의 계정 풀을 유지하며, 선택된 구독 계정을 쓸 수 없거나 할당량이 소진되면 다른 계정으로 요청을 재시도합니다.
 
 ![TeamAI 대시보드](docs/dashboard.png)
 
 <sub>위 대시보드는 <code>teamai capture --redact full</code>로 만든 실제 캡처입니다 — 실제 할당량과 활동 로그이며 계정 주소는 없습니다.</sub>
 
-> TeamAI는 독립적인 오픈소스 프로젝트입니다. Anthropic, OpenAI, 그리고 이와 무관한 teamai.com 서비스와 아무런 관련이 없습니다.
+> TeamAI는 독립적인 오픈소스 프로젝트입니다. Anthropic, OpenAI, xAI, 그리고 이와 무관한 teamai.com 서비스와 아무런 관련이 없습니다.
 
 ## 요구 사항
 
 - Node.js 20 이상
-- macOS 또는 Linux
+- macOS, Linux 또는 Windows
 - `claude` 및/또는 `codex` 별도 설치
-- 본인 소유의 Claude Pro/Max 또는 ChatGPT Codex 구독 계정
+- 본인 소유의 Claude Pro/Max/Ultra, ChatGPT Codex 또는 SuperGrok 구독 계정
 
 ## 설치
 
+macOS·Linux:
+
 ```bash
-git clone https://github.com/soulduse/team-ai.git
+git clone https://github.com/choa712/team-ai.git
 cd team-ai
-./scripts/install.sh
+./scripts/install.sh --with-shell
 ```
 
-`install.sh`는 의존성 설치, 빌드, `teamai`/`tai`/`taic`/`tax` 명령 링크를 수행하고 셸 블록 추가 여부를 묻습니다. 멱등적이므로 업그레이드할 때 다시 실행하면 됩니다. 셸 블록을 건너뛰려면 `--no-shell`, 실제 변경 없이 계획만 보려면 `--dry-run`을 씁니다.
+Windows(`cmd.exe`나 PowerShell, 실행 정책과 무관):
+
+```powershell
+git clone https://github.com/choa712/team-ai.git
+cd team-ai
+scripts\install.cmd
+```
+
+두 스크립트 모두 의존성 설치, 빌드, `teamai`/`tai`/`taic`/`tax`/`tag` 명령 연결을 하고 명령이 실제로 잡히는지 확인합니다. 여러 번 실행해도 되므로 업그레이드는 `git pull` 뒤 다시 실행하면 됩니다. `install.sh`는 `--with-shell`이면 셸 블록을 넣고, `--no-shell`이면 건너뛰고, 둘 다 없으면 묻습니다. `--dry-run`은 계획만 보여 줍니다. npm 전역 폴더에 연결할 권한이 없으면 명령을 `~/.local/bin`(macOS·Linux)이나 `%LOCALAPPDATA%\TeamAI\bin`(Windows)에 두고 그 폴더를 PATH에 넣습니다. Windows에서는 실행 정책이 막는 경우 TeamAI의 `.ps1` 실행 파일을 지워 PowerShell이 `.cmd`를 쓰게 하고, `scripts\install.cmd -Uninstall`로 명령을 다시 지울 수 있습니다. Claude나 Codex 포트를 다른 프로그램(아직 켜져 있는 TeamClaude 등)이 쓰고 있으면 두 스크립트 모두 경고합니다.
 
 수동으로 하려면:
 
@@ -34,6 +44,8 @@ npm install
 npm run build          # 필수: dist/는 저장소에 포함되지 않습니다
 npm link
 ```
+
+Windows에서는 `npm link`가 `cmd.exe`·PowerShell용 `teamai`/`tai`/`taic`/`tax`/`tag` 명령을 만들고, 실행기는 npm으로 설치된 `claude.cmd`/`codex.cmd`를 모든 인자를 `cmd.exe`용으로 escape해 실행합니다. 아래 셸 설정과 로그인 항목 절은 macOS·Linux용입니다.
 
 AI 에이전트로 설치를 자동화하시나요? [AGENTS.md](AGENTS.md)에 같은 절차가 검증 단계와 실패 분기를 갖춘 결정적 명령으로 정리돼 있습니다.
 
@@ -44,7 +56,7 @@ teamai login
 tai
 ```
 
-`login`은 `[1] Claude` 또는 `[2] Codex` 중 무엇을 추가할지 묻습니다. 계정을 더 넣으려면 반복 실행하세요. `tai`는 짧은 세션 명령이며 `teamai start`와 동일합니다 — 로컬 릴레이를 띄우고 대시보드를 엽니다. TUI에서 `1`을 누르면 Claude Code가, `2`를 누르면 Codex가 실행됩니다. 클라이언트를 종료하면 대시보드로 돌아옵니다.
+`login`은 `[1] Claude`, `[2] Codex`, `[3] Grok` 중 무엇을 추가할지 묻습니다. 계정을 더 넣으려면 반복 실행하세요. `tai`는 짧은 세션 명령이며 `teamai start`와 동일합니다 — 로컬 릴레이를 띄우고 대시보드를 엽니다. TUI에서 `1`을 누르면 Claude Code가, `2`를 누르면 Codex가, `3`을 누르면 Grok이 실행됩니다. 클라이언트를 종료하면 대시보드로 돌아옵니다.
 
 특정 제공자로 바로 세션을 시작하려면 전용 런처를 씁니다. 필요하면 릴레이를 자동으로 띄우고, 뒤에 붙인 인자를 모두 공식 클라이언트에 그대로 전달합니다.
 
@@ -53,9 +65,11 @@ taic                  # TeamAI 계정 풀을 통한 Claude Code
 taic --resume         # teamai claude --resume 와 동일
 tax                   # TeamAI 계정 풀을 통한 Codex
 tax resume            # teamai codex resume 와 동일
-teamai claude         # tac의 긴 형태
+tag                   # TeamAI 계정 풀을 통한 Grok CLI
+teamai claude         # taic의 긴 형태
 teamai codex          # tax의 긴 형태
-teamai session        # [1] Claude / [2] Codex 대화식 선택
+teamai grok           # tag의 긴 형태
+teamai session        # [1] Claude / [2] Codex / [3] Grok 대화식 선택
 ```
 
 이름은 기존 TeamClaude의 `tc` 셸 함수와 표준 텍스트 도구 `tac`을 덮어쓰지 않도록 의도적으로 피했습니다. `tc`는 계속 TeamClaude를, `taic`과 `tax`는 TeamAI를 가리킵니다.
@@ -106,6 +120,8 @@ Node 경로는 `command -v node`로 확인한 실제 경로를 넣으세요. Lau
 
 Codex는 평소의 브라우저 로그인 절차를 그대로 씁니다. TeamAI는 ChatGPT의 선택적 기기 코드(device-code) 인증 설정을 켜둘 것을 요구하지 않습니다.
 
+Claude 로그인은 기본 브라우저로 인증 페이지를 엽니다(macOS `open`, Linux `xdg-open`, Windows `rundll32`). URL은 항상 함께 출력되므로, 브라우저를 열 수 없는 헤드리스 서버에서도 로그인이 멈추지 않습니다 — 아무 기기에서 그 URL을 열어 마치면 됩니다.
+
 자격증명 가져오기는 선택 사항이며, 내보내기 가능한 자격증명 파일이 있을 때만 동작합니다.
 
 ```bash
@@ -122,10 +138,12 @@ teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json
 
 최근 버전의 Claude Code는 자격증명을 `~/.claude/.credentials.json` 대신 macOS 키체인에 저장할 수 있습니다. 그 경우에는 `teamai login`을 쓰세요. `import`는 원본 TeamClaude·Claude Code·Codex 파일을 절대 수정하지 않습니다. TeamAI는 릴레이 세션용으로 격리된 Codex 홈을 따로 유지하므로 사용자의 원래 `~/.codex`는 그대로 남습니다.
 
+**Grok.** `teamai login grok`은 일회용 `GROK_HOME`에서 `grok login`을 실행하므로, 계정마다 별도의 로그인을 갖게 되고 사용자의 `~/.grok` 세션은 교체되지도 공유되지도 않습니다. 풀에 넣을 수 있는 것은 xAI 자체 로그인(`auth.x.ai`)뿐이며, API 키나 회사 SSO 로그인은 넣을 수 없습니다. `teamai import grok`은 `~/.grok/auth.json`을 수정하지 않고 읽지만, 가져온 계정은 사용자의 `grok`과 리프레시 토큰 하나를 공유하게 됩니다. 먼저 갱신하는 쪽이 다른 쪽을 로그아웃시킬 수 있으므로, 직접도 쓰는 계정은 `login`으로 추가하는 편이 좋습니다. 릴레이 세션(`tag`)은 `$TEAMAI_HOME/grok-home`에서 릴레이의 클라이언트 토큰을 API 키로 삼아 실행됩니다 — `config.toml`은 복사되고 `skills`·`installed-plugins`·`hooks`는 링크되지만 로그인 정보는 넘어가지 않습니다 — 따라서 모든 모델 요청은 릴레이에 도달하고, 릴레이가 풀의 계정으로 전달합니다. Grok의 주간 한도는 `/usage` 화면이 쓰는 것과 같은 엔드포인트에서 읽으며, 할당량을 소모하지 않습니다.
+
 ## 운영
 
 ```bash
-teamai status                                  # 서버 상태 + 계정 표
+teamai status                                  # 서버 상태 + 계정 표 + 최근 알림
 teamai accounts [claude|codex]                 # 계정 표만
 teamai start                                   # 릴레이 기동 후 대시보드
 teamai stop                                    # 릴레이 중지
@@ -139,7 +157,9 @@ teamai codex-app unbind                        # 기존 provider 복원
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # 또는: auto
+teamai fable-only claude user@example.com on  # 또는: off
 teamai capture [--redact partial|full|none] [--out DIR]   # 대시보드를 .txt + .png로 저장 (TTY 불필요)
+teamai usage [--json] [--redact partial|full|none]       # 계정·창별 사용량을 표 또는 JSON으로
 ```
 
 `codex-app bind`는 활성 Codex 설정에서 최상위 `model_provider`만 바꾸고 마커가 붙은 `model_providers.teamai` 블록을 추가합니다. 기존 provider는 `~/.config/teamai` 아래에 기록했다가 `unbind`에서 복원하며, 그 밖의 TOML 텍스트는 그대로 유지합니다. 관리 블록에는 로컬 릴레이 bearer token이 들어가므로 Codex 설정 파일은 `0600`으로 저장됩니다. bind/unbind 뒤에는 Codex App을 재시작하고, 바인딩 중에는 수퍼바이저를 계속 실행해야 합니다.
@@ -148,25 +168,130 @@ teamai capture [--redact partial|full|none] [--out DIR]   # 대시보드를 .txt
 
 **모델 인식 라우팅.** 모델별 주간 창을 소비하는 것은 최상위 모델(Claude의 Fable 등급)뿐이므로, 그것이 필요 없는 요청 — Opus, Sonnet, Haiku — 은 Fable 예산이 아직 남은 계정을 피해 Fable 창을 이미 다 쓴 계정(`fableReserveThreshold` 이상)으로 보내고, 그 그룹 안에서는 전체 주간 창 기준으로 정렬합니다. 이렇게 하면 계정마다 귀한 Fable 예산을 정말 필요한 요청에 남겨 두면서, 그렇지 않으면 놀고 있을 주간 여유분을 활용하게 됩니다. 소진된 계정이 하나도 비어 있지 않으면 실패하는 대신 예약된 계정으로 되돌아갑니다. Fable 요청은 그대로 적게 쓴 순을 따르며, `fableReserveThreshold`를 `1`로 두면 이 분리를 끕니다.
 
-Fable 등급 429(`7d_oi`는 거절됐지만 공유 `5h`/`7d` 창은 아직 허용된 경우)는 계정 전체가 아니라 그 계정의 Fable 창만 벤치합니다 — 최상위 모델만 소비하는 예산 때문에 계정 전체를 최대 일주일 놀리는 대신, 다른 모델은 그 계정에서 계속 처리됩니다. 공유 창을 거절하는 429는 평소대로 계정 전체를 벤치합니다.
+Fable 등급 429(`7d_oi`는 거절됐지만 공유 `7d` 창은 아직 허용된 경우)는 계정 전체가 아니라 그 계정의 Fable 창만 벤치합니다 — 최상위 모델만 소비하는 예산 때문에 계정 전체를 최대 일주일 놀리는 대신, 다른 모델은 그 계정에서 계속 처리됩니다. 공유 창을 거절하는 429는 평소대로 계정 전체를 벤치합니다.
 
-전체 화면 TUI는 Claude와 Codex 계정을 그룹으로 묶고, 사용량이 바뀌어도 현재 선택된 계정을 고정해 둡니다. Claude 행은 `5h session`, `7d overall`, 모델 범위의 `7d Fable` 창을 각각 보여주고, Codex 행은 주/부 창을 해당 계정이 실제로 보고한 기간을 제목으로 달아(`1w limit`) 보여줍니다. 할당량은 공식 클라이언트 응답에서 학습하며 재시작해도 유지됩니다.
+**Fable 전용 계정.** 기본값은 모든 계정에서 꺼져 있습니다. `teamai fable-only claude <계정> on`으로 Claude 계정 하나를 Fable 전용으로 만듭니다. 그 계정의 모델별 주간(Fable) 창에 예산이 남아 있는 동안에는 모든 Fable 요청이 다른 어느 계정보다(고정 우선순위보다도) 먼저 그 계정으로 가고, 다른 모델(Opus, Sonnet, Haiku) 요청은 보내지 않습니다(릴레이 자체의 백그라운드 할당량 측정만 예외). Fable 한도는 주간 한도의 최대 절반이라, 그 창을 다 쓰면 계정의 남은 주간 여유가 놀게 됩니다. 그래서 그때부터는 Fable이 다른 계정으로 넘어가고, Fable 전용 계정은 다른 모델을 일반 계정처럼 처리합니다. 예약 중인 동안 대시보드 상태는 `fable`로 표시됩니다. 실행 중인 릴레이는 대시보드의 `R`이나 `teamai restart`로 변경을 반영합니다.
 
-푸터는 TeamClaude와 동일한 계정 워크플로를 제공합니다 — Claude/Codex 실행, 선택, 전환, 활성/비활성, 순서, 삭제, 추가/로그인, 재측정(`R`), 종료. `switch`는 선택한 계정을 해당 제공자 풀의 맨 앞에 고정합니다. 순서 모드에서는 순위를 지정하거나 계정을 자동 스케줄링으로 되돌릴 수 있습니다. Claude 프로필을 갱신하면 요금제 등급과 `past_due` 같은 비정상 구독 상태가 빨간색으로 표시됩니다.
+**한도 리셋 티켓.** Claude가 계정에 한도 리셋 티켓을 줄 때가 있습니다. `resets` 열과 `teamai accounts`가 계정마다 가진 수를 보여줍니다: `R<n>`은 주간 한도 전체, `F<n>`은 Fable 창만 리셋합니다. 릴레이가 이미 보내는 사용량 요청(`?cedar_ember=1`)에서 읽으며, TeamAI는 표시만 하고 티켓을 쓰지 않습니다 — 사용은 Claude에서 직접 하세요. 이 열은 티켓을 가진 계정이 있고 행이 터미널 폭 안에 들어갈 때만 나타납니다. 하루 넘게 다시 읽지 못한 수는 이미 썼을 수 있어 흐리게 표시합니다(`teamai accounts`에서는 `, stale`). 어떤 계정에서 티켓 요청만 거부되고 일반 요청은 되면, 그 계정은 일반 방식으로 할당량만 읽고 6시간 동안 티켓을 다시 묻지 않습니다.
 
-`p`는 대시보드를 캡처해 저장하고, `teamai capture`는 터미널 없이 스크립트나 에이전트에서 같은 일을 합니다. 캡처는 `~/.config/teamai/captures/`(또는 `--out DIR`) 아래 파일 한 쌍으로 남습니다 — 색상을 그대로 담은 텍스트 프레임과, 내장 비트맵 폰트로 그린 같은 프레임의 PNG. Node 외에 필요한 것이 없습니다. 계정 주소는 프레임을 그리기 전에 마스킹되므로 계정 열·푸터·활동 로그 어디에도 남지 않습니다. 기본은 `de•••••••••w@gm•••.com` 형태의 부분 마스킹이고, `--redact full`은 `account #N`으로 바꾸며, `--redact none`은 혼자 볼 캡처를 위해 주소를 그대로 둡니다. 대시보드에서 `p`를 누르면 저장에 더해 파일 관리자에서 그 PNG를 선택한 채로 열고 이미지를 클립보드에 복사합니다 — macOS는 바로 되고, Linux는 `xdg-open`과 `wl-copy` 또는 `xclip`이 있을 때 됩니다. 어느 것이 실제로 됐는지는 푸터에 표시됩니다. 이 README 상단의 이미지도 그렇게 만든 캡처입니다.
+전체 화면 TUI는 Claude와 Codex 계정을 그룹으로 묶고, 사용량이 바뀌어도 현재 선택된 계정을 고정해 둡니다. Claude 행은 `7d overall`과 모델 범위의 `7d Fable` 창을 각각 보여주고(Claude가 2026년 11월 5시간 세션 한도를 주간 한도로 통합했기 때문에, `5h session` 열은 살아 있는 5시간 창을 보고하는 계정이 있을 때만 나타납니다), Codex 행은 주/부 창을 해당 계정이 실제로 보고한 기간을 제목으로 달아(`1w limit`) 보여주며, Grok 행은 요금제의 주간 한도(`/usage` 화면에 표시되는 수치)를 보여줍니다. 할당량은 공식 클라이언트 응답에서 학습하며 재시작해도 유지됩니다.
 
-`R`은 전체 계정의 할당량을 다시 측정합니다. 할당량은 별도 엔드포인트를 폴링해서 얻는 것이 아니라 업스트림이 돌려주는 rate-limit 헤더에서 학습하므로, 트래픽을 한 번도 처리하지 않은 계정은 무언가 측정하기 전까지 `-`로 표시됩니다. `R`은 이미 수용된 것으로 확인된 요청 형태를 유휴 상태의 모든 계정에 병렬로 재생하고(이미 측정된 계정과 스로틀된 계정도 포함 — 그쪽 429 응답도 신뢰할 수 있는 헤더를 담고 있습니다) `measured/targets` 개수를 정직하게 보고합니다. 그 요청 형태는 프록시를 실제로 통과한 2xx 응답에서만 확정되므로, 요청이 한 번도 성공하지 않았다면 `R`은 페이로드를 추측하는 대신 아직 프로브 템플릿이 없다고 알립니다. 모델 범위 주간(Fable) 창이 없는 계정에는 보충 프로브를 한 번 더 보냅니다 — 그 창은 Fable 등급 요청에 대한 응답에만 나타나기 때문입니다.
+푸터는 TeamClaude와 동일한 계정 워크플로를 제공합니다 — Claude/Codex/Grok 실행, 선택, 전환, 활성/비활성, 순서, 삭제, 추가/로그인, 재측정(`R`), 종료. `switch`는 선택한 계정을 해당 제공자 풀의 맨 앞에 고정합니다. 순서 모드에서는 순위를 지정하거나 계정을 자동 스케줄링으로 되돌릴 수 있습니다. Claude 프로필을 갱신하면 요금제 등급(`Ultra`(구 Max 20x), `Max 5x`, `Pro` — TeamAI가 모르는 등급은 `OAuth`가 아니라 보고된 이름 그대로)과 `past_due` 같은 비정상 구독 상태가 빨간색으로 표시됩니다. 구독이 연체된 계정(`past_due`, `unpaid`)은 가장 나중에 씁니다. 업스트림이 세션 도중 끊을 수 있으므로, 계속 사용은 하되 정상 계정이 요청을 받을 수 없을 때만 씁니다. Grok 토큰은 요금제를 숫자로만 담고 있어 `7`은 `Super`, 그 밖의 값은 `tier N`으로 표시하며, 이 숫자는 토큰 발급 시점에 고정되므로 요금제 변경은 다음 토큰 갱신 후에 반영됩니다.
+
+`v`는 표시 설정 메뉴를 엽니다. 계정 섹션(Claude, Codex, Grok), 게이지(Claude 5h session·7d overall·7d Fable·리셋 티켓, Codex 첫째·둘째 한도, Grok 주간 한도), plan·state·order·갱신일·측정 시각 열, Activity 로그를 Space나 Enter로 끄고 켤 수 있습니다. 선택은 `config.json`의 `display.hidden`에 저장되어 재시작 후와 `teamai capture`에도 유지되며, 화면 표시만 바꾸고 라우팅에는 영향이 없습니다. 숨긴 섹션에는 커서가 가지 않습니다. 푸터에서는 `s`(맨 앞 고정)를 `pin`, `d`를 `del`로 줄여 표시하며, 힌트가 터미널 너비보다 넓으면 덜 필요한 것부터(`↑↓ move`가 먼저) 빼고 종료와 실행 키는 항상 남깁니다.
+
+`p`는 대시보드를 캡처해 저장하고, `teamai capture`는 터미널 없이 스크립트나 에이전트에서 같은 일을 합니다. 캡처는 `~/.config/teamai/captures/`(또는 `--out DIR`) 아래 파일 한 쌍으로 남습니다 — 색상을 그대로 담은 텍스트 프레임과, 내장 비트맵 폰트로 그린 같은 프레임의 PNG. Node 외에 필요한 것이 없습니다. 계정 주소는 프레임을 그리기 전에 마스킹되므로 계정 열·푸터·활동 로그 어디에도 남지 않습니다. 기본은 `de•••••••••w@gm•••.com` 형태의 부분 마스킹이고, `--redact full`은 `account #N`으로 바꾸며, `--redact none`은 혼자 볼 캡처를 위해 주소를 그대로 둡니다. 대시보드에서 `p`는 기본 마스킹으로, `P`(shift)는 `account #N`으로 캡처하며, 둘 다 저장에 더해 파일 관리자에서 그 PNG를 선택한 채로 열고 이미지를 클립보드에 복사합니다 — macOS는 바로 되고, Linux는 `xdg-open`과 `wl-copy` 또는 `xclip`이 있을 때 되며, Windows에서는 파일만 저장되고 두 동작은 하지 않습니다. 어느 것이 실제로 됐는지는 푸터에 표시됩니다. 이 README 상단의 이미지도 그렇게 만든 캡처입니다.
+
+`R`은 전체 계정의 할당량을 다시 측정합니다. 할당량은 별도 엔드포인트를 폴링해서 얻는 것이 아니라 업스트림이 돌려주는 rate-limit 헤더에서 학습하므로, 트래픽을 한 번도 처리하지 않은 계정은 무언가 측정하기 전까지 `-`로 표시됩니다. `R`은 이미 수용된 것으로 확인된 요청 형태를 유휴 상태의 모든 계정에 병렬로 재생하고(이미 측정된 계정과 스로틀된 계정도 포함 — 그쪽 429 응답도 신뢰할 수 있는 헤더를 담고 있습니다) `measured/targets` 개수를 정직하게 보고합니다. 그 요청 형태는 프록시를 실제로 통과한 2xx 응답에서만 확정되므로, 요청이 한 번도 성공하지 않았다면 `R`은 페이로드를 추측하는 대신 아직 프로브 템플릿이 없다고 알립니다. 모델 범위 주간(Fable) 창이 없는 계정에는 보충 프로브를 한 번 더 보냅니다 — 그 창은 Fable 등급 요청에 대한 응답에만 나타나기 때문입니다. `R`은 모든 계정의 구독 상태도 다시 읽으므로, 방금 결제한 계정은 6시간 주기 갱신을 기다리지 않고 `past_due` 표시가 사라집니다. 측정하는 동안 푸터에는 노란 스피너와 함께 읽은 계정 수와 경과 시간이 표시되고, 각 행의 측정 시각 열에는 그 계정을 읽을 때까지 스피너가, 읽고 나면 초록색 `✓ updated`가 표시됩니다. 끝나면 읽지 못한 계정은 몇 초 동안 빨간 `✗`와 이유(`blocked`, `re-login`, `retrying`, 또는 `403` 같은 조회 실패 상태 코드)를 보여 주고, 푸터는 결과를 초록·노랑·빨강으로 요약하며 그런 계정을 최대 세 개까지 이름으로 알려 줍니다.
 
 서버는 5분마다 스스로 워밍업도 합니다(`warmupIntervalMs`, `0`이면 비활성화). 업스트림에서 이미 리셋된 할당량 창을 정리하고 아직 측정되지 않은 계정만 측정하므로, 안정된 상태에서는 틱당 비용이 들지 않고 창이 넘어가면 `R`을 누르지 않아도 다시 채워집니다. 업스트림이 끝내 할당량을 보고하지 않는 계정은 세 번 헛수고한 뒤 제외되며, 해당 창이 리셋되거나 `R`을 누르면 그 예산이 다시 주어집니다.
 
 유휴 계정도 같은 5분 주기로 살아 있게 유지됩니다. 토큰이 만료되어 가거나 마지막 시도가 실패한 계정은 한 번에 하나씩 갱신됩니다. 평소 트래픽은 일부 계정에만 몰리고 워밍업은 일부러 토큰을 갱신하지 않으므로, 이 처리가 없으면 아무도 쓰지 않는 계정의 리프레시 토큰 체인이 만료되어 업스트림에서 무효화될 수 있습니다. 이 스윕은 의도적으로 순차 실행합니다 — 오랜 다운타임 뒤에 전체 계정을 한꺼번에 갱신하면 토큰 엔드포인트가 순간적으로 몰려 rate limit에 걸리기 때문입니다.
 
+갱신 실패는 원인별로 구분되고, 대시보드 `state` 열에 어느 쪽인지 표시됩니다. 토큰 엔드포인트가 응답하지 않았거나(시간 초과, 연결 끊김) 과부하·장애를 알린 경우(429, 5xx)는 노란색 `retrying`으로 표시됩니다. 토큰이 죽은 것이 아니라 계정만 잠시 빠져 있는 상태이며, 릴레이가 30초 뒤부터 최대 4분까지 간격을 두 배씩 늘려 가며 응답할 때까지 다시 시도하므로 재로그인할 필요가 없습니다. 토큰 엔드포인트가 거부한 경우(리프레시 토큰이 폐기·만료됨)만 빨간색 `error`로 표시되며, 이때만 `teamai login`이 필요합니다. 빨간색 `blocked`는 토큰 문제가 아닙니다. Claude가 `403 oauth_not_allowed_for_organization`으로 답한 경우로, Anthropic은 구독이 연체된 동안 이렇게 막습니다. 이 계정은 30분마다 재시도하는 대신 즉시 빠지고, 할당량을 쓰지 않는 사용량 엔드포인트를 워밍업 주기마다 다시 읽어서 응답이 돌아오면(결제가 끝나면) 저절로 복귀합니다. 사용량 조회가 실패하면 측정 시각 열이 빨간색으로 바뀌고 이유를 표시합니다(`3h ago (403)`). 숫자는 마지막으로 알던 값이지만, 지금은 아무것도 갱신하지 못하고 있다는 뜻입니다. 실패와 복구는 계정 라벨과 함께 요청 로그와 분리된 알림 기록에 남고, `teamai status`가 계정 표 아래에 최근 10건을 보여 줍니다.
+
 학습된 할당량(사용량, 창, 리셋 시각, 구독 프로필)은 디스크에 기록되어 다음 기동 시 복원되므로, 대시보드와 정렬은 재측정 없이 재시작을 넘어 유지됩니다. `R`이 재생하는 프로브 형태도 같은 방식으로 유지됩니다. 다만 응답 단위 신호는 유지하지 않습니다 — 쿨다운이나 오류는 재시작 시 의도적으로 버리므로, 오래된 429의 retry-after 때문에 계정이 다시 벤치되는 일이 없습니다. 정말로 소진된 계정이라면 다음 요청이 올바른 상태를 다시 도출합니다.
 
 계정당 동시 처리 한도를 합친 것보다 많은 요청이 한꺼번에 도착하면, 릴레이는 요청 본문을 읽기도 전에 초과분을 `429`(`x-teamai-429-reason: concurrency_saturated`)로 거절합니다 — 무제한으로 본문을 버퍼링하지 않기 위함입니다. "사용 가능한 계정 없음" 429에서도 같은 헤더로 바쁜 상태(`concurrency_saturated`)와 소진된 상태(`quota_exhausted`)를 구분합니다.
 
-`~D-N` 구독 값은 확정된 만료일이 아니라 추정치입니다. Anthropic의 프로필 엔드포인트는 구독 상태와 생성 시각은 주지만 현재 청구 주기의 종료일은 주지 않습니다. 그래서 TeamAI는 다음 월간 청구 기념일을 추정하고 `~`로 표시합니다. 프로필 상태는 서버 기동 시와 이후 6시간마다 갱신됩니다.
+`~D-N` 구독 값은 확정된 만료일이 아니라 추정치입니다. Anthropic의 프로필 엔드포인트는 구독 상태와 생성 시각은 주지만 현재 청구 주기의 종료일은 주지 않습니다. 그래서 TeamAI는 다음 월간 청구 기념일을 추정하고 `~`로 표시합니다. 프로필 상태는 서버 기동 시, 이후 6시간마다, 그리고 `R`을 누를 때 갱신됩니다.
+
+## 다른 세션·스크립트에서 사용량 확인
+
+대시보드는 사람용이고, `teamai usage`는 같은 데이터를 나머지 모두에게 줍니다. 다른 Claude Code·Codex 세션, 셸 스크립트, 상태줄, 긴 작업을 시작할지 판단하는 에이전트가 쓸 수 있습니다.
+
+```bash
+teamai usage                    # 표: 계정별 모든 창과 리셋까지 남은 시간
+teamai usage --json             # 같은 내용을 JSON으로
+teamai usage --json --redact full   # 계정을 "account #N"으로 표시
+```
+
+```text
+TeamAI usage (live from the server, 2026-11-17T02:17:41.007Z)
+
+claude: 3/9 available, next reset 9h43m
+  ○ account #1  7d 98% (2d15h)  7d_oi 100% (2d15h)
+  ● account #5  7d 5% (6d17h)  7d_oi 8% (6d17h)
+  ● account #6  7d 35% (3d11h)  7d_oi 69% (3d11h)  [2 in flight]
+
+codex: 1/1 available, next reset 1d5h
+  ● account #8  primary 37% (1d5h)  secondary 0%
+```
+
+릴레이가 돌고 있으면 서버 메모리에서 실시간으로 답합니다. 진행 중 요청 수와 쿨다운 사유도 함께 나옵니다. 서버가 꺼져 있거나 이 엔드포인트가 없는 예전 버전이면 `state.json`으로 같은 보고서를 만들고, 어느 쪽인지는 `source`에 적힙니다. 답하려고 새로 측정하지 않으므로 할당량을 쓰지 않습니다. 몇 번을 불러도 괜찮습니다.
+
+JSON(일부 생략):
+
+```json
+{
+  "source": "live",
+  "generatedAt": "2026-11-17T02:17:41.007Z",
+  "providers": {
+    "claude": {
+      "summary": { "accounts": 9, "enabled": 9, "available": 3, "nextResetAt": "2026-11-17T12:00:00.475Z" },
+      "accounts": [{
+        "id": "…", "label": "de•••••••••w@gm•••.com", "enabled": true, "priority": null,
+        "plan": "default_claude_max_20x", "usage": 0.05,
+        "windows": { "7d": { "usage": 0.05, "resetsAt": "…", "resetsInMs": 579600000 },
+                     "7d_oi": { "usage": 0.08, "resetsAt": "…", "resetsInMs": 579600000 } },
+        "measuredAt": "…", "resetTickets": null, "cooldownUntil": null, "cooldownReason": null,
+        "error": null, "errorKind": null, "measureError": null, "inflight": 0, "available": true
+      }]
+    },
+    "codex": { "summary": { "…": "…" }, "accounts": [] }
+  }
+}
+```
+
+`usage`는 0~1 사이의 비율입니다. 창 이름은 업스트림이 보고하는 그대로입니다. Claude는 `7d`(전체 주간), `7d_oi`(최상위 모델 주간), 남아 있는 동안의 `5h`이고, Codex는 `primary`·`secondary`, Grok은 `weekly`입니다. `available`은 켜져 있고, 오류가 없고, 쿨다운 중이 아니고, `switchThreshold` 미만이라는 뜻입니다. `state.json`에서 만든 보고서면 `inflight`는 `null`입니다. `resetTickets`는 Codex 계정과 티켓을 한 번도 읽지 못한 Claude 계정에서는 `null`이고, 그 외에는 `{ general, fable, nextExpiry, readAt, stale }`입니다. `stale`은 그 수가 하루 넘게 지난 값이라는 뜻입니다. 계정 주소는 캡처와 같은 방식으로 가려지고(`--redact`), 토큰·자격증명은 보고서에 절대 들어가지 않습니다.
+
+### HTTP 엔드포인트
+
+같은 보고서를 제어 포트에서 줍니다. 이 포트는 `127.0.0.1`에만 열려 있고, 다른 경로와 똑같이 릴레이 클라이언트 토큰이 있어야 합니다.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:3556/usage?redact=partial"
+```
+
+`3556`은 `proxy.controlPort`의 기본값입니다. 바꿨다면 설정한 값을 쓰세요(`jq .proxy.controlPort ~/.config/teamai/config.json`). `taic`로 시작한 세션 안에서는 `$ANTHROPIC_AUTH_TOKEN`이 곧 그 토큰입니다. 그 밖의 곳에서는 토큰을 설정에서 직접 읽는 `teamai usage --json`이 더 간단합니다.
+
+### 이렇게 활용할 수 있습니다
+
+**긴 작업 전에 확인하기.** 에이전트나 스크립트가 할당량을 많이 쓸 작업을 시작하기 전에 남은 여유를 확인합니다.
+
+```bash
+available=$(teamai usage --json | jq '.providers.claude.summary.available')
+[ "$available" -gt 0 ] || { echo "No Claude account free right now"; exit 1; }
+```
+
+**실패하는 대신 리셋까지 기다리기.** 배치 작업이 가장 빠른 창이 넘어갈 때까지 잠시 쉽니다.
+
+```bash
+until [ "$(teamai usage --json | jq '.providers.claude.summary.available')" -gt 0 ]; do
+  sleep 600
+done
+```
+
+**Claude Code 상태줄에 표시하기.** `~/.claude/settings.json`의 `statusLine`이 작은 스크립트를 가리키게 합니다. 엔드포인트를 직접 읽어서 빠릅니다.
+
+```bash
+#!/bin/sh
+# ~/.claude/teamai-statusline.sh
+config="${TEAMAI_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/teamai}/config.json"
+port=$(jq -r '.proxy.controlPort // 3556' "$config")
+curl -s -m 1 -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "http://127.0.0.1:$port/usage" |
+  jq -r '.providers.claude.summary |
+    "TeamAI \(.available)/\(.enabled) free" +
+    (if .nextResetAt then " · reset in \(((.nextResetAt | sub("\\.[0-9]+Z$";"Z") | fromdate) - now) / 3600 | floor)h" else "" end)'
+```
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.claude/teamai-statusline.sh" } }
+```
+
+**에이전트에게 알려 주기.** 프로젝트의 `CLAUDE.md`나 `AGENTS.md`에 "길거나 병렬인 작업 전에 `teamai usage --json`을 실행해 `providers.claude.summary.available`을 확인할 것" 한 줄을 넣으세요. 그 프로젝트의 모든 세션이 대시보드를 열지 않고도 남은 여유를 볼 수 있습니다.
+
+**바닥나면 알림 받기.** cron이나 LaunchAgent가 요약을 주기적으로 읽다가 `available`이 0이 되면 알림을 보내게 할 수 있습니다. `errorKind`가 `refused`인 계정 목록을 뽑으면 다시 `teamai login`이 필요한 계정도 알 수 있습니다(`unreachable`은 릴레이가 알아서 재시도 중이라는 뜻이고, `blocked`는 조직이 OAuth를 거부한다는 뜻이니 그 계정의 결제를 확인하세요). `measureError`는 마지막 사용량 조회가 실패한 이유(`403`, `timeout`)이며, 측정에 성공하면 `null`이 됩니다.
 
 ## 설정
 
@@ -179,12 +304,14 @@ Fable 등급 429(`7d_oi`는 거절됐지만 공유 `5h`/`7d` 창은 아직 허�
 | `proxy.host` | `127.0.0.1` | 바인드 주소. 설계상 루프백 전용. |
 | `proxy.claudePort` | `3456` | Claude 릴레이 포트. |
 | `proxy.codexPort` | `3457` | Codex 릴레이 포트. |
-| `proxy.controlPort` | `3556` | TUI가 통신하는 제어 채널. |
+| `proxy.grokPort` | `3458` | Grok 릴레이 포트. 선택 사항이며, 이 키가 없는 이전 설정은 기본값을 씁니다. |
+| `proxy.controlPort` | `3556` | TUI와 `teamai usage`가 통신하는 제어 채널(`/probe`, `GET /usage`). |
 | `proxy.clientToken` | 자동 생성 | 릴레이되는 모든 클라이언트가 보내야 하는 로컬 토큰. |
 | `switchThreshold` | `0.98` | 이 사용률을 넘으면 해당 계정을 더 이상 선택하지 않음. |
 | `warmupIntervalMs` | `300000` | 백그라운드 재측정 주기. `0`이면 비활성화. |
 | `maxConcurrentPerAccount` | `16` | 계정당 동시 처리 요청 수. `0`이면 무제한. |
 | `fableReserveThreshold` | `0.8` | 이 값 이상으로 Fable 창을 쓴 계정을 비-Fable 요청에 우선 배정. `1`이면 모델 인식 라우팅 비활성화. |
+| `display.hidden` | — | 선택. `v` 메뉴에서 끈 대시보드 항목, 예: `["section:codex", "activity"]`. 표시 전용. |
 | `proxy.legacyPorts` | — | 선택. 프로바이더별로 계속 응답할 추가 포트 — 예: `{ "claude": [3400] }`. |
 
 다른 프로세스가 포트를 이미 점유하고 있다면 포트를 바꾸세요. 기동 실패의 가장 흔한 원인이며, 이유는 `server-start.log`에 남습니다.
@@ -194,6 +321,8 @@ Fable 등급 429(`7d_oi`는 거절됐지만 공유 `5h`/`7d` 창은 아직 허�
 ## 범위와 준수 사항
 
 0.1 버전은 구독 OAuth 계정, 래퍼로 실행한 CLI 세션, 명시적으로 바인딩한 Codex App을 대상으로 합니다. 공개 OpenAI 호환 API를 제공하지 않고, Claude 요청을 Codex 요청으로 변환하지 않으며, Codex App 자체를 설치·실행하지 않고, 서로 다른 사람의 자격증명을 함께 묶지 않습니다. 제공자의 약관과 정책 준수 책임은 사용자에게 있습니다. 프로덕션·상업용 API 워크로드에는 제공자의 공식 API 과금 체계를 쓰세요.
+
+**Gemini / Antigravity는 의도적으로 지원하지 않습니다.** 모든 공급자의 약관이 여러 구독 계정을 돌려 쓰며 사용 한도를 우회하는 것을 통상적인 사용 밖으로 보지만, 실제로 집행하는 곳은 Google입니다. Antigravity FAQ는 "계정 로테이션 자동화"를 개인 요금제에서 지원하지 않는다고 명시하고, 약관은 서드파티 소프트웨어를 통한 Antigravity 접근을 정지 사유로 정하고 있으며, Antigravity·Gemini CLI 로그인을 묶어 쓰는 오픈소스 도구들에서는 2026년 내내 계정이 무더기로 정지됐다는 보고가 이어졌습니다(재위반 시 영구 정지). 또한 Antigravity CLI에는 문서화된 엔드포인트 변경 방법이 없고 개인 계정 로그인을 OS 키체인에만 두기 때문에, 묶어 쓰려면 TeamAI가 Google 토큰을 직접 보관해야 합니다. Google이 서드파티 도구용으로 안내하는 방법은 AI Studio 또는 Vertex API 키인데, 이는 구독 계정 풀이 아니라 사용량 기반 과금이라 TeamAI의 범위 밖입니다.
 
 ## 개발
 

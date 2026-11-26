@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AccountPool } from '../src/account-pool.js';
-import type { OAuthCredential, PersistedState, Provider, StoredAccount } from '../src/types.js';
+import type { OAuthCredential, PersistedState, Provider, QuotaSnapshot, RuntimeAccount, StoredAccount } from '../src/types.js';
 
 const provider: Provider = {
   id: 'codex', label: 'Codex', upstreamBase: 'https://example.test', normalizePath: (p) => p,
@@ -11,6 +11,8 @@ const provider: Provider = {
 const credential = (id: string): OAuthCredential => ({ accessToken: `token-${id}`, refreshToken: 'refresh', expiresAt: Date.now() + 60_000, accountId: id });
 const account = (id: string, priority: number | null = null): StoredAccount => ({ id, provider: 'codex', label: id, enabled: true, priority, credentialId: `codex:${id}`, createdAt: new Date().toISOString() });
 const state: PersistedState = { version: 1, accounts: {} };
+// fable-only needs a provider with a Fable tier (the flag is ignored otherwise)
+const fableProvider: Provider = { ...provider, fableModel: 'claude-fable' };
 
 test('selects explicit priority and keeps session affinity', () => {
   const pool = new AccountPool(provider, [account('a', 2), account('b', 1)], { 'codex:a': credential('a'), 'codex:b': credential('b') }, state, 0.98, 3);
@@ -60,7 +62,7 @@ test('a fully spent fleet is ordered by which account frees up soonest', () => {
   const spent = (id: string, resetsIn: number, weekly: number) => ({
     ...account(id), credential: credential(id), usage: weekly, resetsAt: Date.now() + resetsIn,
     windows: { '7d_oi': { usage: 1, resetsAt: Date.now() + resetsIn } },
-    profile: null, cooldownUntil: null, cooldownReason: null, lastUsed: null, error: null, inflight: 0,
+    profile: null, measuredAt: null, cooldownUntil: null, cooldownReason: null, lastUsed: null, error: null, inflight: 0,
   });
   // The LATER account has the lower weekly usage on purpose: once both are
   // spent, time-to-reset decides, not who used less getting there.
@@ -110,7 +112,7 @@ test('byHeadroom still orders accounts the pool would refuse to route to', () =>
   const spent = (id: string, resetsIn: number) => ({
     ...account(id), credential: credential(id), usage: 1, resetsAt: Date.now() + resetsIn,
     windows: { primary: { usage: 1, resetsAt: Date.now() + resetsIn } },
-    profile: null, cooldownUntil: null, cooldownReason: null, lastUsed: null, error: null, inflight: 0,
+    profile: null, measuredAt: null, cooldownUntil: null, cooldownReason: null, lastUsed: null, error: null, inflight: 0,
   });
   const later = spent('later', 120 * hour); const sooner = spent('sooner', 48 * hour);
   assert.ok(AccountPool.byHeadroom(sooner, later) < 0);
@@ -218,8 +220,10 @@ test('refreshLapsed refreshes errored and expiring accounts, skips healthy ones'
   const pool = new AccountPool(p, [account('err'), account('soon'), account('healthy'), account('notoken')],
     { 'codex:err': cred('err', now + 60 * 60_000), 'codex:soon': cred('soon', now + 60_000), 'codex:healthy': cred('healthy', now + 60 * 60_000), 'codex:notoken': { accessToken: 't', refreshToken: null, expiresAt: now + 60_000, accountId: 'notoken' } }, state);
   pool.accounts.find((a) => a.id === 'err')!.error = 'boom';
-  const count = await pool.refreshLapsed();
-  assert.deepEqual(count, { healed: 2, failed: 0 });
+  const sweep = await pool.refreshLapsed();
+  assert.deepEqual({ ...sweep, outcomes: undefined }, { healed: 2, failed: 0, unreachable: 0, outcomes: undefined });
+  // Only the errored account's recovery is named; the routine renewal is just counted.
+  assert.deepEqual(sweep.outcomes, [{ label: 'err', kind: 'healed', message: 'token refreshed' }]);
   assert.deepEqual(refreshed.sort(), ['err', 'soon']); // healthy skipped; notoken has no refresh token
 });
 
@@ -405,8 +409,11 @@ test('the lapsed-token sweep reports only real renewals and benches a token that
   const flaky: Provider = { ...provider, refresh: async (c) => { if (c.accountId === 'b') throw new Error('invalid_grant'); return { ...c, accessToken: 'renewed', expiresAt: Date.now() + 3_600_000 }; } };
   const expired = (id: string) => ({ ...credential(id), expiresAt: Date.now() - 1 });
   const pool = new AccountPool(flaky, [account('a'), account('b')], { 'codex:a': expired('a'), 'codex:b': expired('b') }, state);
-  assert.deepEqual(await pool.refreshLapsed(), { healed: 1, failed: 1 });
+  const sweep = await pool.refreshLapsed();
+  assert.deepEqual([sweep.healed, sweep.failed, sweep.unreachable], [1, 1, 0]);
   const a = pool.accounts.find((x) => x.id === 'a')!; const b = pool.accounts.find((x) => x.id === 'b')!;
+  assert.equal(b.errorKind, 'refused', 'a refusal is what needs a re-login');
+  assert.deepEqual(sweep.outcomes.map((o) => [o.label, o.kind]), [['b', 'refused']]);
   assert.equal(a.credential.accessToken, 'renewed'); assert.equal(a.error, null);
   assert.match(b.error!, /token refresh failed: invalid_grant/);
   assert.equal(pool.acquire('s')?.id, 'a', 'the account with a dead token is not routed to');
@@ -461,4 +468,298 @@ test('a shortfall made of network benches is reported as unreachable, with the e
   // With no network bench left the answer is quota, as before.
   pool.cooldown(a, 60_000, 'quota');
   assert.equal(pool.explainShortfall(new Set(), false).reason, 'quota_exhausted');
+});
+
+test('refreshUsage re-reads only readings older than the limit, busy accounts included', async () => {
+  const read: string[] = [];
+  const usageProvider: Provider = { ...provider, fetchUsage: async (c) => { read.push(c.accountId); return { routingUsage: 0.4, routingResetsAt: null, windows: { primary: { usage: 0.4, resetsAt: null } } }; } };
+  const pool = new AccountPool(usageProvider, [account('stale'), account('fresh'), account('busy'), account('broken')], { 'codex:stale': credential('stale'), 'codex:fresh': credential('fresh'), 'codex:busy': credential('busy'), 'codex:broken': credential('broken') }, state);
+  const [stale, fresh, busy, broken] = pool.accounts;
+  stale!.measuredAt = Date.now() - 10 * 60_000; fresh!.measuredAt = Date.now() - 60_000; busy!.inflight = 1; broken!.error = 'token refresh failed';
+  const measured = await pool.refreshUsage(5 * 60_000);
+  assert.deepEqual([...measured].sort(), ['busy', 'stale']);
+  assert.deepEqual(read.sort(), ['busy', 'stale']);
+  assert.equal(stale!.windows.primary?.usage, 0.4);
+  assert.ok(Date.now() - stale!.measuredAt! < 1_000);
+});
+
+test('R reads usage first and probes only the accounts the endpoint could not read', async () => {
+  const probed: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string, init: { headers: Record<string, string> }) => { probed.push(init.headers.authorization!); return new Response(null, { status: 200 }); }) as typeof fetch;
+  try {
+    const usageProvider: Provider = {
+      ...provider,
+      fetchUsage: async (c) => { if (c.accountId === 'down') throw new Error('usage 503'); return { routingUsage: 0.2, routingResetsAt: null, windows: { primary: { usage: 0.2, resetsAt: null } } }; },
+      defaultProbe: () => ({ path: '/p', model: 'm', version: '', beta: null, system: null, userAgent: null, query: '', elicitsModelWeekly: false }),
+      probeRequest: (_t, c) => ({ url: 'https://example.test/p', headers: { authorization: c.accountId }, body: '{}' }),
+    };
+    const pool = new AccountPool(usageProvider, [account('up'), account('down')], { 'codex:up': credential('up'), 'codex:down': credential('down') }, state);
+    const result = await pool.probeAll();
+    assert.deepEqual(probed, ['down']);
+    assert.equal(result.targets, 2);
+    assert.equal(result.measured, 1);
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('measuredAt survives a restart via exported state', () => {
+  const pool = new AccountPool(provider, [account('a')], { 'codex:a': credential('a') }, state);
+  pool.accounts[0]!.measuredAt = 1234;
+  const output: PersistedState = { version: 1, accounts: {} }; pool.exportState(output);
+  const restored = new AccountPool(provider, [account('a')], { 'codex:a': credential('a') }, output);
+  assert.equal(restored.accounts[0]!.measuredAt, 1234);
+});
+
+test('a token endpoint the network cannot reach is retried, not reported as needing a re-login', async () => {
+  // fetch's own shape for "no response at all": a TypeError with the socket error on cause.
+  const offline: Provider = { ...provider, refresh: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ETIMEDOUT' } }); } };
+  const pool = new AccountPool(offline, [account('a')], { 'codex:a': { ...credential('a'), expiresAt: Date.now() - 1 } }, state);
+  const sweep = await pool.refreshLapsed();
+  assert.deepEqual([sweep.healed, sweep.failed, sweep.unreachable], [0, 0, 1]);
+  const a = pool.accounts[0]!;
+  assert.match(a.error!, /unreachable \(ETIMEDOUT\); retrying/);
+  assert.equal(a.errorKind, 'unreachable');
+  assert.equal(pool.acquire('s'), null, 'an expired token still cannot serve while the network is down');
+});
+
+test('sweepExpired drops an inert window with no reset, keeping measured ones', () => {
+  const pool = new AccountPool(provider, [account('a')], { 'codex:a': credential('a') }, { version: 1, accounts: {} });
+  const now = Date.now();
+  pool.accounts[0]!.windows = { '5h': { usage: 0, resetsAt: null }, '7d': { usage: 0.4, resetsAt: now + 86_400_000 }, '7d_oi': { usage: 0, resetsAt: now + 86_400_000 } };
+  pool.sweepExpired();
+  assert.deepEqual(Object.keys(pool.accounts[0]!.windows).sort(), ['7d', '7d_oi']);
+});
+
+test('a Fable-only account takes Fable first, never another model, and Fable spills once its budget is gone', () => {
+  const stored = [{ ...account('home'), fableOnly: true }, account('a'), account('b')];
+  const credentials = { 'codex:home': credential('home'), 'codex:a': credential('a'), 'codex:b': credential('b') };
+  const win = (fable: number, weekly: number) => ({ usage: weekly, resetsAt: null, windows: { '7d': { usage: weekly, resetsAt: null }, '7d_oi': { usage: fable, resetsAt: null } }, profile: null, cooldownUntil: null, lastUsed: null, error: null });
+  const fresh = () => new AccountPool(fableProvider, stored, credentials, { version: 1, accounts: { 'codex:home': win(0.5, 0.05), 'codex:a': win(0, 0.1), 'codex:b': win(0, 0.1) } });
+  // Fable goes home even though the others have far more headroom
+  const pool = fresh();
+  const f = pool.acquire('s', new Set(), true); assert.equal(f?.id, 'home'); pool.release(f!);
+  // the same session's Opus/Haiku turns never land there
+  for (let i = 0; i < 5; i++) { const g = pool.acquire(`g${i}`, new Set(), false); assert.notEqual(g?.id, 'home'); pool.release(g!); }
+  // a session pinned elsewhere for Fable moves home
+  const moved = fresh(); moved.accounts.find((a) => a.id === 'home')!.enabled = false;
+  const away = moved.acquire('p', new Set(), true); assert.notEqual(away?.id, 'home'); moved.release(away!);
+  moved.accounts.find((a) => a.id === 'home')!.enabled = true;
+  assert.equal(moved.acquire('p', new Set(), true)?.id, 'home');
+  // home's Fable spent → Fable spills to the pool; a non-Fable request still never takes it
+  const spent = new AccountPool(fableProvider, stored, credentials, { version: 1, accounts: { 'codex:home': win(1, 0.6), 'codex:a': win(0, 0.1), 'codex:b': win(0, 0.1) } });
+  assert.notEqual(spent.acquire('x', new Set(), true)?.id, 'home');
+  const only = new AccountPool(fableProvider, [stored[0]!], { 'codex:home': credential('home') }, { version: 1, accounts: { 'codex:home': win(0.2, 0.2) } });
+  assert.equal(only.acquire('y', new Set(), false), null);
+  // with its Fable spent the rest of its week is not wasted: other models may use it
+  const after = new AccountPool(fableProvider, [stored[0]!], { 'codex:home': credential('home') }, { version: 1, accounts: { 'codex:home': win(1, 0.5) } });
+  assert.equal(after.acquire('z', new Set(), false)?.id, 'home');
+});
+
+test('fable-only: reload, restart, cap spill, ranking over an explicit #1, unmeasured Fable, and the 429 message', () => {
+  const win = (fable: number | null, weekly: number, resetsAt: number | null = null) => ({ usage: weekly, resetsAt: null, windows: { '7d': { usage: weekly, resetsAt: null }, ...(fable === null ? {} : { '7d_oi': { usage: fable, resetsAt } }) }, profile: null, cooldownUntil: null, lastUsed: null, error: null });
+  const credentials = { 'codex:home': credential('home'), 'codex:a': credential('a') };
+  // config reload (sync) carries the flag on and off
+  const pool = new AccountPool(fableProvider, [account('home'), account('a')], credentials, { version: 1, accounts: { 'codex:home': win(0.1, 0.1), 'codex:a': win(0.1, 0.1) } });
+  pool.sync([{ ...account('home'), fableOnly: true }, account('a')], credentials);
+  for (let i = 0; i < 3; i++) { const g = pool.acquire(`s${i}`, new Set(), false); assert.equal(g?.id, 'a'); pool.release(g!); }
+  pool.sync([account('home'), account('a')], credentials);
+  assert.equal(pool.accounts.find((a) => a.id === 'home')?.fableOnly, undefined);
+  // an explicit #1 ordinary account does not outrank the Fable home for Fable
+  const ranked = new AccountPool(fableProvider, [{ ...account('home'), fableOnly: true }, account('a', 1)], credentials, { version: 1, accounts: { 'codex:home': win(0.3, 0.3), 'codex:a': win(0, 0) } });
+  assert.equal(ranked.acquire('f', new Set(), true)?.id, 'home');
+  // home at its concurrency cap → Fable spills, the non-Fable shortfall says why
+  const capped = new AccountPool(fableProvider, [{ ...account('home'), fableOnly: true }, account('a')], credentials, { version: 1, accounts: { 'codex:home': win(0.3, 0.3), 'codex:a': win(0, 0) } }, 0.98, 1);
+  const first = capped.acquire('c1', new Set(), true); assert.equal(first?.id, 'home');
+  assert.equal(capped.acquire('c2', new Set(), true)?.id, 'a');
+  // unmeasured Fable window still counts as Fable budget left: no other model goes there
+  const unmeasured = new AccountPool(fableProvider, [{ ...account('home'), fableOnly: true }], { 'codex:home': credential('home') }, { version: 1, accounts: { 'codex:home': win(null, 0.1) } });
+  assert.equal(unmeasured.acquire('u', new Set(), false), null);
+  const why = unmeasured.explainShortfall(new Set(), false);
+  assert.equal(why.reason, 'quota_exhausted');
+  assert.match(why.message, /1 kept for Fable only/);
+});
+
+test('a Fable window marked spent by a 429 stays spent when a poll of the same window reads 99%', () => {
+  const resetsAt = Date.now() + 86_400_000;
+  const quota = (fable: number, at = resetsAt) => ({ routingUsage: 0.5, routingResetsAt: null, windows: { '7d': { usage: 0.5, resetsAt: null }, '7d_oi': { usage: fable, resetsAt: at } } });
+  let next = quota(0.99);
+  const p: Provider = { ...fableProvider, readQuota: () => next };
+  const pool = new AccountPool(p, [{ ...account('home'), fableOnly: true }, account('a')], { 'codex:home': credential('home'), 'codex:a': credential('a') }, state);
+  const home = pool.accounts.find((a) => a.id === 'home')!;
+  home.windows = { '7d_oi': { usage: 0.5, resetsAt } };
+  pool.markFableSpent(home, 0);
+  pool.updateQuota(home, new Headers());
+  assert.equal(home.windows['7d_oi']?.usage, 1);
+  // a new window (a Fable reset ticket, or the weekly rollover) is taken as read
+  next = quota(0.99, resetsAt + 7 * 86_400_000);
+  pool.updateQuota(home, new Headers());
+  assert.equal(home.windows['7d_oi']?.usage, 0.99);
+  // the floor is part of the opt-in: an ordinary account takes the same poll as read
+  const plain = pool.accounts.find((a) => a.id === 'a')!;
+  next = quota(0.99);
+  plain.windows = { '7d_oi': { usage: 0.5, resetsAt } };
+  pool.markFableSpent(plain, 0);
+  pool.updateQuota(plain, new Headers());
+  assert.equal(plain.windows['7d_oi']?.usage, 0.99);
+});
+
+test('fable-only: saturation, the 99% floor, a Codex account ignores the flag', () => {
+  const win = (fable: number, weekly: number) => ({ usage: weekly, resetsAt: null, windows: { '7d': { usage: weekly, resetsAt: null }, '7d_oi': { usage: fable, resetsAt: null } }, profile: null, cooldownUntil: null, lastUsed: null, error: null });
+  const credentials = { 'codex:home': credential('home'), 'codex:a': credential('a') };
+  // the ordinary account is spent and the fable-only one is at its cap: a non-Fable
+  // request is out of budget, not "retry in 5 s" forever
+  const pool = new AccountPool(fableProvider, [{ ...account('home'), fableOnly: true }, account('a')], credentials, { version: 1, accounts: { 'codex:home': win(0.2, 0.2), 'codex:a': win(0, 1) } }, 0.98, 1);
+  const f = pool.acquire('f', new Set(), true); assert.equal(f?.id, 'home');
+  assert.equal(pool.acquire('g', new Set(), false), null);
+  assert.equal(pool.explainShortfall(new Set(), false).reason, 'quota_exhausted');
+  // a poll that reads well below the spent mark (a new reading, not rounding) is taken as read
+  let next: QuotaSnapshot = { routingUsage: 0.2, routingResetsAt: null, windows: { '7d_oi': { usage: 0.5, resetsAt: null } } };
+  const p = new AccountPool({ ...fableProvider, readQuota: () => next }, [{ ...account('home'), fableOnly: true }], { 'codex:home': credential('home') }, state);
+  const home = p.accounts[0]!; p.markFableSpent(home, 0);
+  p.updateQuota(home, new Headers()); assert.equal(home.windows['7d_oi']?.usage, 0.5);
+  // over 100% from a header still counts as spent for the floor
+  home.windows = { '7d_oi': { usage: 1.02, resetsAt: null } };
+  next = { routingUsage: 0.2, routingResetsAt: null, windows: { '7d_oi': { usage: 0.99, resetsAt: Date.now() + 1000 } } };
+  p.updateQuota(home, new Headers()); assert.equal(home.windows['7d_oi']?.usage, 1);
+  // the flag on a provider without a Fable tier is ignored rather than idling the account
+  const codex = new AccountPool(provider, [{ ...account('c'), fableOnly: true }], { 'codex:c': credential('c') }, state);
+  assert.equal(codex.acquire('x', new Set(), false)?.id, 'c');
+});
+
+test('reset tickets survive a restart: exportState → constructor', () => {
+  const win = { usage: 0.2, resetsAt: null, windows: { '7d': { usage: 0.2, resetsAt: null } }, profile: null, cooldownUntil: null, lastUsed: null, error: null };
+  const before = new AccountPool(provider, [account('a')], { 'codex:a': credential('a') }, { version: 1, accounts: { 'codex:a': { ...win, resetCredits: { general: 1, fable: 3, nextExpiry: 5 } } } });
+  const saved: PersistedState = { version: 1, accounts: {} }; before.exportState(saved);
+  assert.deepEqual(saved.accounts['codex:a']?.resetCredits, { general: 1, fable: 3, nextExpiry: 5 });
+  const after = new AccountPool(provider, [account('a')], { 'codex:a': credential('a') }, saved);
+  assert.deepEqual(after.accounts[0]?.resetCredits, { general: 1, fable: 3, nextExpiry: 5 });
+  // a reading without tickets keeps the last count
+  const p = new AccountPool({ ...provider, readQuota: () => ({ routingUsage: 0.3, routingResetsAt: null, windows: {} }) }, [account('a')], { 'codex:a': credential('a') }, saved);
+  p.updateQuota(p.accounts[0]!, new Headers());
+  assert.deepEqual(p.accounts[0]?.resetCredits, { general: 1, fable: 3, nextExpiry: 5 });
+});
+
+test('refreshUsage hands the live client user-agent to the usage read', async () => {
+  const agents: Array<string | null | undefined> = [];
+  const usageProvider: Provider = { ...provider, fetchUsage: async (_c, ua) => { agents.push(ua); return { routingUsage: 0.1, routingResetsAt: null, windows: {} }; } };
+  const probes = { codex: { path: '/x', model: 'm', version: '', beta: null, system: null, userAgent: 'claude-cli/9.9.9 (external, cli)', query: '', elicitsModelWeekly: false } };
+  const pool = new AccountPool(usageProvider, [account('a')], { 'codex:a': credential('a') }, { version: 1, accounts: {}, probes });
+  await pool.refreshUsage(0);
+  assert.deepEqual(agents, ['claude-cli/9.9.9 (external, cli)']);
+  const bare = new AccountPool(usageProvider, [account('b')], { 'codex:b': credential('b') }, state);
+  agents.length = 0; await bare.refreshUsage(0);
+  assert.deepEqual(agents, [null]);
+});
+
+test('a usage read that lost the race to proxied headers still keeps the tickets it carried', async () => {
+  const tickets = { general: 1, fable: 2, nextExpiry: null, readAt: Date.now() };
+  const usageProvider: Provider = { ...provider, fetchUsage: async () => { pool.accounts[0]!.measuredAt = Date.now() + 1_000; return { routingUsage: 0.9, routingResetsAt: null, windows: {}, resetCredits: tickets }; } };
+  const pool = new AccountPool(usageProvider, [account('a')], { 'codex:a': credential('a') }, state);
+  pool.accounts[0]!.usage = 0.1;
+  await pool.refreshUsage(0);
+  assert.equal(pool.accounts[0]!.usage, 0.1); // the newer header reading stands
+  assert.deepEqual(pool.accounts[0]!.resetCredits, tickets);
+});
+
+test('the quick retry renews only accounts the token endpoint did not answer for, and clears the kind on success', async () => {
+  const tried: string[] = []; let online = false;
+  const p: Provider = { ...provider, refresh: async (c) => {
+    tried.push(c.accountId!);
+    if (c.accountId === 'dead') throw Object.assign(new Error('OAuth refresh failed (400)'), { status: 400 });
+    if (c.accountId === 'soon') return c; // renewed but still near expiry: due again for the regular sweep
+    if (!online) throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ETIMEDOUT' } });
+    return { ...c, accessToken: 'renewed', expiresAt: Date.now() + 3_600_000 };
+  } };
+  const expired = (id: string) => ({ ...credential(id), expiresAt: Date.now() - 1 });
+  const pool = new AccountPool(p, [account('net'), account('dead'), account('soon')], { 'codex:net': expired('net'), 'codex:dead': expired('dead'), 'codex:soon': { ...credential('soon'), expiresAt: Date.now() + 60_000 } }, state);
+  await pool.refreshLapsed();
+  const net = pool.accounts.find((a) => a.id === 'net')!; const dead = pool.accounts.find((a) => a.id === 'dead')!;
+  assert.equal(net.errorKind, 'unreachable'); assert.equal(dead.errorKind, 'refused');
+  tried.length = 0; online = true;
+  const sweep = await pool.refreshLapsed({ onlyUnreachable: true });
+  assert.deepEqual(tried, ['net'], 'a refused token and a merely expiring one wait for the regular sweep');
+  assert.deepEqual(sweep.outcomes, [{ label: 'net', kind: 'healed', message: 'token refreshed' }]);
+  assert.equal(net.error, null); assert.equal(net.errorKind, null);
+  assert.equal(dead.errorKind, 'refused');
+});
+
+test('the error kind is exported with the state', async () => {
+  const p: Provider = { ...provider, refresh: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }); } };
+  const pool = new AccountPool(p, [account('a')], { 'codex:a': { ...credential('a'), expiresAt: Date.now() - 1 } }, state);
+  await pool.refreshLapsed();
+  const output: PersistedState = { version: 1, accounts: {} }; pool.exportState(output);
+  assert.equal(output.accounts['codex:a']!.errorKind, 'unreachable');
+});
+
+test('a token endpoint that is overloaded or down (429, 5xx) is retried; only a 4xx refusal needs a re-login', async () => {
+  const statusOf: Record<string, number> = { busy: 429, down: 503, dead: 400 };
+  const p: Provider = { ...provider, refresh: async (c) => { throw Object.assign(new Error(`OAuth refresh failed (${statusOf[c.accountId!]})`), { status: statusOf[c.accountId!] }); } };
+  const expired = (id: string) => ({ ...credential(id), expiresAt: Date.now() - 1 });
+  const pool = new AccountPool(p, [account('busy'), account('down'), account('dead')], { 'codex:busy': expired('busy'), 'codex:down': expired('down'), 'codex:dead': expired('dead') }, state);
+  const sweep = await pool.refreshLapsed();
+  assert.deepEqual([sweep.unreachable, sweep.failed], [2, 1]);
+  assert.deepEqual(pool.accounts.map((a) => a.errorKind), ['unreachable', 'unreachable', 'refused']);
+});
+
+test('a sweep that finds another running reports itself as skipped', async () => {
+  let release: () => void = () => {};
+  const p: Provider = { ...provider, refresh: async (c) => { await new Promise<void>((r) => { release = r; }); return c; } };
+  const pool = new AccountPool(p, [account('a')], { 'codex:a': { ...credential('a'), expiresAt: Date.now() - 1 } }, state);
+  const first = pool.refreshLapsed();
+  assert.equal((await pool.refreshLapsed({ onlyUnreachable: true })).skipped, true);
+  release(); assert.equal((await first).skipped, undefined);
+});
+
+test('an organization that refuses OAuth benches the account until a usage read answers again', async () => {
+  let blocked = true;
+  const usageProvider: Provider = { ...provider, refresh: async (c) => ({ ...c, accessToken: 'renewed' }),
+    fetchUsage: async () => { if (blocked) throw Object.assign(new Error('Claude usage failed (403)'), { status: 403, blocked: true }); return { routingUsage: 0.3, routingResetsAt: null, windows: { primary: { usage: 0.3, resetsAt: null } } }; } };
+  const pool = new AccountPool(usageProvider, [account('a'), account('b')], { 'codex:a': credential('a'), 'codex:b': credential('b') }, state);
+  const a = pool.accounts[0]!;
+  pool.markBlocked(a);
+  assert.equal(a.errorKind, 'blocked');
+  const chosen = pool.acquire('s'); assert.equal(chosen?.id, 'b'); pool.release(chosen!);
+  // a new token is not an answer: the block stays, and the keep-alive sweep leaves it alone
+  await pool.refresh(a, true); assert.equal(a.errorKind, 'blocked');
+  pool.accounts[1]!.credential.expiresAt = Date.now() + 3_600_000;
+  const sweep = await pool.refreshLapsed(); assert.equal(sweep.outcomes.length, 0);
+  // still refused: the read is marked failed, the block holds
+  await pool.refreshUsage(0);
+  assert.equal(a.measureError, '403'); assert.equal(a.errorKind, 'blocked');
+  // the organization answers again: benched no more, and the failure clears with the reading
+  blocked = false;
+  const measured = await pool.refreshUsage(0);
+  assert(measured.has('a')); assert.equal(a.error, null); assert.equal(a.measureError, null); assert.equal(a.usage, 0.3);
+});
+
+test('a failed usage read is recorded as its status or network cause, and a 403 that is not a block does not bench', async () => {
+  const failing: Provider = { ...provider, fetchUsage: async (c) => { if (c.accountId === 'a') throw Object.assign(new Error('Claude usage failed (403)'), { status: 403, blocked: false }); throw Object.assign(new Error('timed out'), { name: 'TimeoutError' }); } };
+  const pool = new AccountPool(failing, [account('a'), account('b')], { 'codex:a': credential('a'), 'codex:b': credential('b') }, state);
+  await pool.refreshUsage(0);
+  assert.equal(pool.accounts[0]!.measureError, '403'); assert.equal(pool.accounts[0]!.error, null);
+  assert.equal(pool.accounts[1]!.measureError, 'timeout');
+  const output: PersistedState = { version: 1, accounts: {} }; pool.exportState(output);
+  assert.equal(output.accounts['codex:a']?.measureError, '403');
+});
+
+test('a subscription in arrears is spent last, but still serves when nothing else can', () => {
+  const pool = new AccountPool(provider, [account('late'), account('paid')], { 'codex:late': credential('late'), 'codex:paid': credential('paid') }, state);
+  const profile = (status: string) => ({ status, createdAt: null, rateLimitTier: null, orgType: null, hasClaudeMax: null, hasClaudePro: null, fetchedAt: 0 });
+  const [late, paid] = pool.accounts as [RuntimeAccount, RuntimeAccount];
+  late.profile = profile('past_due'); late.usage = 0.1; paid.profile = profile('active'); paid.usage = 0.6;
+  const first = pool.acquire('one'); assert.equal(first?.id, 'paid'); pool.release(first!);
+  paid.enabled = false;
+  const fallback = pool.acquire('two'); assert.equal(fallback?.id, 'late');
+});
+
+test('a keep-alive refresh that fails on a blocked account leaves the block in place', async () => {
+  let fail = true;
+  const flaky: Provider = { ...provider, refresh: async (c) => { if (fail) throw new TypeError('fetch failed'); return { ...c, expiresAt: Date.now() + 3_600_000 }; } };
+  const pool = new AccountPool(flaky, [account('a')], { 'codex:a': { ...credential('a'), expiresAt: Date.now() } }, state);
+  const a = pool.accounts[0]!;
+  pool.markBlocked(a);
+  await pool.refreshLapsed(); assert.equal(a.errorKind, 'blocked');
+  fail = false;
+  await pool.refreshLapsed(); assert.equal(a.errorKind, 'blocked');
+  assert.equal(pool.acquire('s'), null);
 });

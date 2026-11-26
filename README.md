@@ -2,13 +2,13 @@
 
 **English** · [한국어](README.ko.md) · [日本語](README.ja.md) · [中文](README.zh-CN.md) · [Español](README.es.md)
 
-TeamAI is a local multi-account relay for **Claude Code** and the official **Codex CLI**. It keeps a separate account pool for each provider and retries a request with another account when the selected subscription is unavailable or out of quota.
+TeamAI is a local multi-account relay for **Claude Code**, the official **Codex CLI** and the official **Grok CLI**. It keeps a separate account pool for each provider and retries a request with another account when the selected subscription is unavailable or out of quota.
 
 ![TeamAI dashboard](docs/dashboard.png)
 
 <sub>The dashboard above is a real capture, taken with <code>teamai capture --redact full</code>: real quota and activity, no account addresses.</sub>
 
-> TeamAI is an independent open-source project. It is not affiliated with Anthropic, OpenAI, or the unrelated service at teamai.com.
+> TeamAI is an independent open-source project. It is not affiliated with Anthropic, OpenAI, xAI, or the unrelated service at teamai.com.
 
 ## This fork (choa712/team-ai)
 
@@ -20,30 +20,49 @@ This is a fork of [soulduse/team-ai](https://github.com/soulduse/team-ai). It tr
 - **Health-aware status and stop.** `status` and `stop` separate a recorded pid from a health-probed one and report the supervisor, so a dead-but-recorded server reads as `unhealthy` rather than `running`.
 - **Launcher rename `tac` to `taic`.** The relayed Claude launcher is `taic`, which avoids clashing with the coreutils `tac`.
 - **Dependency pin.** `js-yaml` is pinned through `overrides`.
-- **Shared accounts through TeamClaude Cloud.** `teamai cloud link|pull|push|status|unlink` uses a TeamClaude Cloud key as an account registry, so the same Claude accounts can be used from several machines. Refreshing and switching stay in TeamAI; see [Sharing accounts across machines](#sharing-accounts-across-machines).
-- **Imports keep the newer token.** Re-importing an account keeps whichever credential expires later, so an older copy can no longer replace a refresh token this machine already rotated.
+- **A request that may have run upstream is never re-sent.** A connection that dropped after the body went out (`ECONNRESET`, a closed socket, a header timeout) is answered `502` with the cause and `x-teamai-502-reason: may_have_run`; it is neither retried nor sent to another account, since upstream may already have run it. A connection that was never made still fails over. Upstream re-sends such a request; this fork does not.
 - **A connection failure is retried, not reported as spent quota.** When the relay itself cannot reach upstream (`fetch failed`: a route or DNS blip), the failure is treated as transient when the connection was never made (`ECONNREFUSED`, `ENOTFOUND`, a connect timeout): the relay retries after the two-second bench, a request that arrives while every account is benched waits for the bench instead of hearing `429 quota_exhausted`, and a bench too long to wait out is answered `503` with a `Retry-After`. The cause (`ECONNREFUSED`, `ENOTFOUND`, ...) is written to the activity log.
+- **Launchers work on Windows.** npm's Windows shims start every command as `node <file>`, so with all launchers pointing at `cli.js`, `tax`, `taic`, `tai` and `tag` ran as plain `teamai`. Each launcher now has an entry file of its own (`src/bin/`). Upstream has the same defect for `tac`.
+- **One-command install on Windows and a safer one on macOS.** `scripts\install.cmd` (see Install), a user bin fallback when `npm link` is refused, a `~/.zshrc` created when a new Mac has none, and a warning when the relay port is already taken.
+- **No TeamClaude Cloud.** The fork used to share Claude accounts through TeamClaude Cloud; that service has ended and the feature is gone. Accounts are logged in on each machine.
 - **Activity log on disk.** Every relay event is appended to `~/.config/teamai/events.log` (rotated at 8 MB, one previous file kept as `.1`), in addition to the 200-entry ring the dashboard shows — which is only minutes deep under a busy fleet.
 
 ## Requirements
 
 - Node.js 20+
-- macOS or Linux
+- macOS, Linux, or Windows
 - `claude` and/or `codex` installed separately
-- Your own Claude Pro/Max or ChatGPT Codex subscription accounts
+- Your own Claude Pro/Max/Ultra, ChatGPT Codex or SuperGrok subscription accounts
 
 ## Install
 
+macOS and Linux:
+
 ```bash
-git clone https://github.com/soulduse/team-ai.git
+git clone https://github.com/choa712/team-ai.git
 cd team-ai
-./scripts/install.sh
+./scripts/install.sh --with-shell
 ```
 
-`install.sh` installs dependencies, builds, links the `teamai`/`tai`/`taic`/`tax`
-commands, and offers to add the shell block. It is idempotent — re-run it to
-upgrade. Pass `--no-shell` to skip the shell block, or `--dry-run` to see what it
-would do.
+Windows (`cmd.exe` or PowerShell, under any execution policy):
+
+```powershell
+git clone https://github.com/choa712/team-ai.git
+cd team-ai
+scripts\install.cmd
+```
+
+Both install dependencies, build, link the `teamai`/`tai`/`taic`/`tax`/`tag`
+commands and check that they resolve. They are idempotent: `git pull` and
+re-run to upgrade. `install.sh` adds the shell block with `--with-shell`, skips
+it with `--no-shell` and asks otherwise; `--dry-run` shows the plan. When npm
+cannot link into its global prefix, the commands go to `~/.local/bin` (macOS,
+Linux) or `%LOCALAPPDATA%\TeamAI\bin` (Windows) and that directory is put on
+PATH. On Windows the installer also removes the TeamAI `.ps1` shims when the
+execution policy would refuse them, so PowerShell runs the `.cmd` instead, and
+`scripts\install.cmd -Uninstall` removes the commands again. Both warn when the
+Claude or Codex port is held by another program, such as a TeamClaude relay
+still running.
 
 To do the same by hand:
 
@@ -52,6 +71,11 @@ npm install
 npm run build          # required: dist/ is not committed
 npm link
 ```
+
+On Windows `npm link` creates `teamai`/`tai`/`taic`/`tax`/`tag` commands for
+`cmd.exe` and PowerShell, and the launchers start an npm-installed
+`claude.cmd`/`codex.cmd` with every argument escaped for `cmd.exe`. The shell
+setup and login-item sections below are for macOS and Linux.
 
 Automating this from an AI agent? See [AGENTS.md](AGENTS.md), which states the
 same steps as deterministic commands with verification and failure branches.
@@ -63,7 +87,7 @@ teamai login
 tai
 ```
 
-`login` asks whether to add `[1] Claude` or `[2] Codex`. Repeat it for additional accounts. `tai` is the short session command and is equivalent to `teamai start`: it launches the local relay and opens the dashboard. From the TUI press `1` to launch Claude Code or `2` to launch Codex. When the client exits, the dashboard returns.
+`login` asks whether to add `[1] Claude`, `[2] Codex` or `[3] Grok`. Repeat it for additional accounts. `tai` is the short session command and is equivalent to `teamai start`: it launches the local relay and opens the dashboard. From the TUI press `1` to launch Claude Code, `2` to launch Codex or `3` to launch Grok. When the client exits, the dashboard returns.
 
 For a direct provider session, use the dedicated launchers. They automatically start the TeamAI relay when necessary and pass every trailing argument to the official client:
 
@@ -72,9 +96,11 @@ taic                  # Claude Code through the TeamAI account pool
 taic --resume         # same as: teamai claude --resume
 tax                   # Codex through the TeamAI account pool
 tax resume            # same as: teamai codex resume
+tag                   # Grok CLI through the TeamAI account pool
 teamai claude         # long form of taic
 teamai codex          # long form of tax
-teamai session        # choose [1] Claude or [2] Codex interactively
+teamai grok           # long form of tag
+teamai session        # choose [1] Claude, [2] Codex or [3] Grok interactively
 ```
 
 The names intentionally avoid replacing an existing TeamClaude `tc` shell function and the standard `tac` text utility. `tc` can continue to target TeamClaude while `taic` and `tax` target TeamAI.
@@ -142,6 +168,8 @@ only the child relay causes the supervisor to replace it.
 
 Codex uses its normal browser login flow. TeamAI does not require ChatGPT's optional device-code authentication setting to be enabled.
 
+Claude login opens the authorization page in the default browser (`open` on macOS, `xdg-open` on Linux, `rundll32` on Windows). The URL is always printed too, so on a headless box with no browser opener the login still goes ahead: open it on any machine and finish there.
+
 Credential import is optional and only works when an exportable credential file exists:
 
 ```bash
@@ -158,34 +186,12 @@ teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json
 
 Recent Claude Code versions may store credentials in the macOS Keychain rather than `~/.claude/.credentials.json`; use `teamai login` in that case. `import` never modifies the original TeamClaude, Claude Code, or Codex files. TeamAI uses a persistent isolated Codex home for relayed sessions, so the user's original `~/.codex` remains untouched.
 
-## Sharing accounts across machines
-
-An Anthropic refresh token is single-use: whichever machine rotates it first invalidates every other copy. When the same Claude accounts run on several machines, each one refreshing on its own sooner or later leaves the others holding a dead token, which shows up as repeated re-login prompts.
-
-With a TeamClaude Cloud key linked, TeamAI treats the cloud as a registry and a token mailbox, never as the refresher:
-
-- A refresh always rotates this machine's own chain, then pushes the new pair at once. The cloud keeps the pair with the later expiry, so a late or duplicate push cannot overwrite a newer one.
-- A refused refresh means another machine rotated first. TeamAI then takes the pair that machine published, after checking upstream that its access token is accepted, or continues from its chain.
-- Every ten minutes the server does the same recovery for accounts whose refresh was refused, and re-sends pairs whose push failed or that the cloud lags behind.
-- A cloud copy never replaces a working token or a fresh login on this machine; it only replaces a chain that was already refused. Accounts are never added or removed by the timer.
-
-If the cloud cannot be reached, refreshes still happen locally and the push is retried later.
-
-```bash
-teamai cloud link --from-teamclaude ~/.config/teamclaude.json   # reuse TeamClaude's key; nothing on the command line
-teamai cloud link --key-stdin < key.txt                         # or pass the key on stdin
-teamai cloud pull      # add accounts this machine does not have; known accounts keep their tokens
-teamai cloud push      # publish this machine's Claude accounts
-teamai cloud status
-teamai cloud unlink
-```
-
-The key is stored in `$TEAMAI_HOME/cloud.json` with mode `0600`, or read from `TEAMAI_CLOUD_KEY`. `link` and `unlink` restart a supervised server so the change takes effect. Every machine that shares the accounts should run TeamAI with the same key linked (a TeamClaude proxy on the same key also works, since both sides publish what they rotate). Only Claude accounts are shared; Codex is unaffected.
+**Grok.** `teamai login grok` runs `grok login` in a throwaway `GROK_HOME`, so each account gets a sign-in of its own and your `~/.grok` session is neither replaced nor shared. Only xAI's own sign-in (`auth.x.ai`) can be pooled; an API key or a company SSO login cannot. `teamai import grok` reads `~/.grok/auth.json` without modifying it, but the imported account then shares one refresh token with your own `grok`: whichever refreshes first can sign the other out, so prefer `login` for an account you also use directly. A relayed session (`tag`) runs in `$TEAMAI_HOME/grok-home` with the relay's client token as its API key — your `config.toml` is copied in and `skills`, `installed-plugins` and `hooks` are linked, but no sign-in is — so every model request reaches the relay, which sends it on with a pooled account. Grok's weekly limit is read from the same endpoint its `/usage` screen uses, which spends no quota.
 
 ## Operations
 
 ```bash
-teamai status                                  # server state + account table
+teamai status                                  # server state + account table + recent notices
 teamai accounts [claude|codex]                 # account table only
 teamai start                                   # start relay, open dashboard
 teamai stop                                    # stop the relay
@@ -196,11 +202,12 @@ teamai tui                                     # dashboard only, no auto-start
 teamai codex-app bind                          # route Codex App through TeamAI
 teamai codex-app status
 teamai codex-app unbind                        # restore the previous provider
-teamai cloud pull|push|status                   # share accounts through TeamClaude Cloud
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # or: auto
+teamai fable-only claude user@example.com on  # or: off
 teamai capture [--redact partial|full|none] [--out DIR]   # dashboard → .txt + .png, no TTY needed
+teamai usage [--json] [--redact partial|full|none]       # quota per account and window, as a table or JSON
 ```
 
 `codex-app bind` changes only the top-level `model_provider` and appends a
@@ -232,29 +239,161 @@ falls back to a reserved one rather than failing. A Fable request keeps the
 plain least-spent order; set `fableReserveThreshold` to `1` to turn the split
 off.
 
-A Fable-tier 429 (`7d_oi` rejected while the shared `5h`/`7d` windows are still
+A Fable-tier 429 (`7d_oi` rejected while the shared `7d` window is still
 allowed) benches only that account's Fable window, not the account: every other
 model keeps being served from it, instead of the whole account sitting idle for
 up to a week over a budget only the top model spends. A 429 that rejects a
 shared window benches the account as usual.
 
-The full-screen TUI groups Claude and Codex accounts and keeps the currently selected account anchored even when usage changes. Claude rows show the `5h session`, `7d overall`, and model-scoped `7d Fable` windows independently; Codex rows show its primary and secondary windows, each titled with the span that account actually reports (`1w limit`). Quotas are learned from official-client responses and retained across restarts.
+**Fable-only accounts.** Off by default for every account: `teamai fable-only claude <account> on` turns one Claude account into the home for Fable. While its model-weekly (Fable) window still has budget, every Fable request goes there first — ahead of any other account, even a pinned priority — and no request for another model (Opus, Sonnet, Haiku) is routed to it (only the relay's own background quota probes may touch it). Fable's allowance is at most half of the weekly limit, so once that window is spent the rest of the account's week would sit idle: from then on Fable spills to the other accounts and the fable-only account serves every other model like any other. The dashboard shows its state as `fable` while it is reserved. A running relay picks the change up on `R` in the dashboard or `teamai restart`.
 
-The footer exposes the same account workflow as TeamClaude: launch Claude/Codex, select, switch, enable/disable, order, delete, add/login, re-measure (`R`), and quit. `switch` pins the selected account to the front of its provider pool; order mode can assign a rank or return an account to automatic scheduling. Claude profile refreshes show the plan tier and unhealthy subscription states such as `past_due` in red.
+**Limit-reset tickets.** Claude may grant an account limit-reset tickets. The `resets` column and `teamai accounts` show how many each account holds: `R<n>` resets the whole weekly limit, `F<n>` only the Fable window. They are read from the same usage request the relay already makes (`?cedar_ember=1`); TeamAI only displays them and never redeems one — use them from Claude itself. The column appears only when some account holds tickets and the row still fits the terminal width. A count nobody has re-read in a day may already be spent, so it is dimmed (`, stale` in `teamai accounts`). If upstream refuses the ticket request for an account while the plain read works, the relay reads that account's quota the plain way and stops asking it for tickets for six hours.
 
-`p` saves a capture of the dashboard, and `teamai capture` does the same from a script or an agent, no terminal required. Each capture is a pair of files under `~/.config/teamai/captures/` (or `--out DIR`): the frame as text with its colors intact, and the same frame as a PNG drawn with a built-in bitmap font, so nothing beyond Node is needed. Account addresses are masked before the frame is drawn — in the account column, the footer and the activity log alike — as `de•••••••••w@gm•••.com` by default; `--redact full` replaces them with `account #N`, and `--redact none` keeps them for a capture that stays private. From the dashboard, `p` also reveals the PNG in your file manager and puts the image on the clipboard — on macOS out of the box, on Linux where `xdg-open` and `wl-copy` or `xclip` are installed — and the footer says which of those happened. The image at the top of this README is one such capture.
+The full-screen TUI groups Claude and Codex accounts and keeps the currently selected account anchored even when usage changes. Claude rows show the `7d overall` and model-scoped `7d Fable` windows independently — Claude folded its 5-hour session limit into the weekly one in November 2026, so a `5h session` column appears only while some account still reports a live 5-hour window; Codex rows show its primary and secondary windows, each titled with the span that account actually reports (`1w limit`); Grok rows show the plan's weekly limit, the figure its `/usage` screen shows. Quotas are learned from official-client responses and retained across restarts.
 
-`R` re-measures quota across the whole fleet. Quota is never polled from a separate endpoint — it is learned from the rate-limit headers upstream returns, so an account that has served no traffic shows `-` until something measures it. `R` replays a known-accepted request shape against every idle account in parallel (including already-measured and throttled ones, whose 429s still carry authoritative headers) and reports an honest `measured/targets` count. That shape is committed only from a real 2xx that flowed through the proxy, so until one request has succeeded `R` reports that no probe template exists yet rather than guessing a payload. Accounts missing the model-scoped weekly (Fable) window get one extra top-up probe, because that window only appears on responses to Fable-tier requests.
+The footer exposes the same account workflow as TeamClaude: launch Claude/Codex/Grok, select, switch, enable/disable, order, delete, add/login, re-measure (`R`), and quit. `switch` pins the selected account to the front of its provider pool; order mode can assign a rank or return an account to automatic scheduling. Claude profile refreshes show the plan tier (`Ultra` (formerly Max 20x), `Max 5x`, `Pro`; a tier TeamAI does not recognise is shown by its reported name rather than as `OAuth`) and unhealthy subscription states such as `past_due` in red. Codex shows the plan named in its access token. Grok's token carries the plan only as a number: `7` is shown as `Super`, any other as `tier N`; because the number is fixed when the token is issued, a plan change shows after the next token refresh. An account whose subscription is in arrears (`past_due`, `unpaid`) is spent last: it still serves, but only once no healthy account can take the request, because upstream may cut it off mid-session.
+
+`v` opens a show/hide menu: each account section (Claude, Codex, Grok), each gauge (Claude 5h session, 7d overall, 7d Fable, reset tickets; Codex first and second limit; Grok weekly limit), the plan, state, order, renewal and measured-at columns, and the activity log can be switched off and back on with Space or Enter. The choice is saved to `config.json` as `display.hidden`, so it holds across restarts and in `teamai capture`; it changes only what is drawn, never routing, and the cursor skips hidden sections. In the footer, `s` (pin to the front) is labelled `pin` and `d` `del`; when the hints are wider than the terminal, the least-needed ones (`↑↓ move` first) are dropped, while quit and the launch keys always stay.
+
+`p` saves a capture of the dashboard, and `teamai capture` does the same from a script or an agent, no terminal required. Each capture is a pair of files under `~/.config/teamai/captures/` (or `--out DIR`): the frame as text with its colors intact, and the same frame as a PNG drawn with a built-in bitmap font, so nothing beyond Node is needed. Account addresses are masked before the frame is drawn — in the account column, the footer and the activity log alike — as `de•••••••••w@gm•••.com` by default; `--redact full` replaces them with `account #N`, and `--redact none` keeps them for a capture that stays private. From the dashboard, `P` (shift) takes the `account #N` capture and `p` the default one; both also reveal the PNG in your file manager and put the image on the clipboard — on macOS out of the box, on Linux where `xdg-open` and `wl-copy` or `xclip` are installed; on Windows the files are saved but neither step runs — and the footer says which of those happened. The image at the top of this README is one such capture.
+
+`R` re-measures quota across the whole fleet. Quota is never polled from a separate endpoint — it is learned from the rate-limit headers upstream returns, so an account that has served no traffic shows `-` until something measures it. `R` replays a known-accepted request shape against every idle account in parallel (including already-measured and throttled ones, whose 429s still carry authoritative headers) and reports an honest `measured/targets` count. That shape is committed only from a real 2xx that flowed through the proxy, so until one request has succeeded `R` reports that no probe template exists yet rather than guessing a payload. Accounts missing the model-scoped weekly (Fable) window get one extra top-up probe, because that window only appears on responses to Fable-tier requests. `R` also re-reads every account's subscription status, so a bill just paid stops showing `past_due` without waiting for the six-hourly refresh. While it runs, the footer shows a yellow spinner with how many accounts have been read and the elapsed time, and each row's measured-at column shows a spinner until that account is read, then a green `✓ updated`; when it finishes, an account that could not be read shows a red `✗` and why (`blocked`, `re-login`, `retrying`, or the failed read's status such as `403`) for a few seconds, and the footer sums up in green, yellow or red with up to three of those accounts named.
 
 The server also warms up on its own every five minutes (`warmupIntervalMs`, 0 to disable): it clears quota windows upstream has already reset and measures only the accounts that are unmeasured, so a settled fleet costs nothing per tick and a window that rolls over refills without anyone pressing `R`. An account whose upstream never reports quota is dropped after three fruitless attempts, and that budget is renewed whenever its window resets or you press `R`.
 
 Idle accounts are kept alive on the same five-minute cycle: any account whose token is expiring or whose last attempt errored is refreshed, one at a time. Ordinary traffic sticks to a few accounts and warm-up deliberately never refreshes, so without this an account no one uses could let its refresh-token chain lapse and be invalidated upstream. The sweep is sequential on purpose — refreshing the whole fleet at once after a long downtime would burst the token endpoint into a rate limit.
 
+A failed refresh is told apart by cause, and the dashboard's `state` column shows which. A token endpoint that did not answer (a timeout, a dropped connection) or said it was overloaded or down (429, 5xx) shows as yellow `retrying`: the token is not dead, the account is only benched, and the relay retries it 30 seconds later, doubling up to 4 minutes, until it answers — no re-login needed. Only a refusal from the token endpoint (a revoked or expired refresh token) shows as red `error`, and that is the case that needs `teamai login`. Red `blocked` is not a token problem: Claude answered `403 oauth_not_allowed_for_organization`, which Anthropic does while the subscription is past due. The account is benched at once rather than retried every 30 minutes, the usage endpoint (which spends no quota) is re-read on the warm-up cycle, and the account comes back by itself as soon as it answers — after the bill is paid. When a usage read fails, the measured-at column turns red and names the reason (`3h ago (403)`): the figures are the last ones known, but nothing is refreshing them. Each failure and recovery is kept with the account's label in a notice log apart from the request lines, and `teamai status` prints the last ten under the account table.
+
 Learned quota (usage, windows, reset times, subscription profile) is written to disk and restored on the next start, so the dashboard and ranking survive a restart without re-measuring; the probe shape `R` replays is persisted the same way. Per-response signals are not: a cooldown or an error is deliberately dropped on restart, so an account is never re-benched by a stale 429's retry-after — if it really is spent, the next request re-derives the right state.
 
 If more requests arrive at once than the fleet's combined per-account concurrency can serve, the relay rejects the overflow with `429` (`x-teamai-429-reason: concurrency_saturated`) before reading the request body, rather than buffering unbounded bodies. The same header distinguishes a busy fleet from a spent one (`quota_exhausted`) on the "no account available" 429.
 
-The `~D-N` subscription value is an estimate, not an authoritative expiry date: Anthropic's profile endpoint exposes subscription status and creation time, but no current billing-period end. TeamAI therefore estimates the next monthly billing anniversary and marks it with `~`. Profile state is refreshed at server startup and every six hours.
+The `~D-N` subscription value is an estimate, not an authoritative expiry date: Anthropic's profile endpoint exposes subscription status and creation time, but no current billing-period end. TeamAI therefore estimates the next monthly billing anniversary and marks it with `~`. Profile state is refreshed at server startup, every six hours, and whenever you press `R`.
+
+## Checking usage from other sessions and scripts
+
+The dashboard is for you; `teamai usage` is the same data for everything else —
+another Claude Code or Codex session, a shell script, a status line, an agent
+deciding whether to start a long job.
+
+```bash
+teamai usage                    # table: every account, every window, time to reset
+teamai usage --json             # the same as JSON
+teamai usage --json --redact full   # accounts as "account #N"
+```
+
+```text
+TeamAI usage (live from the server, 2026-11-17T02:17:41.007Z)
+
+claude: 3/9 available, next reset 9h43m
+  ○ account #1  7d 98% (2d15h)  7d_oi 100% (2d15h)
+  ● account #5  7d 5% (6d17h)  7d_oi 8% (6d17h)
+  ● account #6  7d 35% (3d11h)  7d_oi 69% (3d11h)  [2 in flight]
+
+codex: 1/1 available, next reset 1d5h
+  ● account #8  primary 37% (1d5h)  secondary 0%
+```
+
+When the relay is running, the report comes live from its pools, including
+requests in flight and why an account is cooling down. When it is not (or is an
+older version without the endpoint), the same report is built from
+`state.json`, and `source` says which one you got. Nothing is measured to answer
+it: it reads what the relay already knows and spends no quota, so it is safe to
+call as often as you like.
+
+The JSON, abridged:
+
+```json
+{
+  "source": "live",
+  "generatedAt": "2026-11-17T02:17:41.007Z",
+  "providers": {
+    "claude": {
+      "summary": { "accounts": 9, "enabled": 9, "available": 3, "nextResetAt": "2026-11-17T12:00:00.475Z" },
+      "accounts": [{
+        "id": "…", "label": "de•••••••••w@gm•••.com", "enabled": true, "priority": null,
+        "plan": "default_claude_max_20x", "usage": 0.05,
+        "windows": { "7d": { "usage": 0.05, "resetsAt": "…", "resetsInMs": 579600000 },
+                     "7d_oi": { "usage": 0.08, "resetsAt": "…", "resetsInMs": 579600000 } },
+        "measuredAt": "…", "resetTickets": null, "cooldownUntil": null, "cooldownReason": null,
+        "error": null, "errorKind": null, "measureError": null, "inflight": 0, "available": true
+      }]
+    },
+    "codex": { "summary": { "…": "…" }, "accounts": [] }
+  }
+}
+```
+
+`usage` is a share from 0 to 1. Window names are the ones upstream reports:
+Claude's `7d` (overall weekly), `7d_oi` (the top model's weekly) and `5h` while
+it still exists; Codex's `primary` and `secondary`; Grok's `weekly`. `available` means enabled,
+not erroring, not cooling down, and under `switchThreshold`. `inflight` is
+`null` when the report came from `state.json`. `resetTickets` is `null` for Codex and for a Claude account never read with tickets; otherwise `{ general, fable, nextExpiry, readAt, stale }`, where `stale` means the counts are over a day old. Account addresses are masked as
+in captures (`--redact`); tokens and credentials are never part of the report.
+
+### The HTTP endpoint
+
+The same report is served on the control port, bound to `127.0.0.1` and gated by
+the relay's client token like everything else there:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:3556/usage?redact=partial"
+```
+
+`3556` is the default `proxy.controlPort`; if you changed it, use your value (`jq .proxy.controlPort ~/.config/teamai/config.json`). Inside a session started with `taic`, `$ANTHROPIC_AUTH_TOKEN` already holds that
+token. Elsewhere, `teamai usage --json` is simpler: it reads the token from your
+config itself.
+
+### Ways to use it
+
+**Ask before a long job.** An agent, or a script, can check headroom before
+starting something that will burn through a lot of quota:
+
+```bash
+available=$(teamai usage --json | jq '.providers.claude.summary.available')
+[ "$available" -gt 0 ] || { echo "No Claude account free right now"; exit 1; }
+```
+
+**Wait for a reset instead of failing.** A batch job can sleep until the
+soonest window rolls over:
+
+```bash
+until [ "$(teamai usage --json | jq '.providers.claude.summary.available')" -gt 0 ]; do
+  sleep 600
+done
+```
+
+**Show it in Claude Code's status line.** Point `statusLine` in
+`~/.claude/settings.json` at a small script; it reads the endpoint directly so
+it stays fast:
+
+```bash
+#!/bin/sh
+# ~/.claude/teamai-statusline.sh
+config="${TEAMAI_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/teamai}/config.json"
+port=$(jq -r '.proxy.controlPort // 3556' "$config")
+curl -s -m 1 -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "http://127.0.0.1:$port/usage" |
+  jq -r '.providers.claude.summary |
+    "TeamAI \(.available)/\(.enabled) free" +
+    (if .nextResetAt then " · reset in \(((.nextResetAt | sub("\\.[0-9]+Z$";"Z") | fromdate) - now) / 3600 | floor)h" else "" end)'
+```
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.claude/teamai-statusline.sh" } }
+```
+
+**Tell an agent about it.** Add a line to your project's `CLAUDE.md` or
+`AGENTS.md` — "Before a long or parallel job, run `teamai usage --json` and
+check `providers.claude.summary.available`" — and every session in that project
+can see how much room the fleet has, without opening the dashboard.
+
+**Alert when the fleet runs dry.** A cron job or a LaunchAgent can poll the
+summary and send a notification when `available` drops to 0, or list the
+accounts whose `errorKind` is `refused` so you know which ones need `teamai login`
+again (`unreachable` means the relay is retrying on its own; `blocked` means the
+organization refuses OAuth — check that account's billing). `measureError` names
+why the last usage read failed (`403`, `timeout`) and is `null` once a reading lands.
 
 ## Configuration
 
@@ -269,12 +408,14 @@ Configuration and credentials live in `$TEAMAI_HOME`, falling back to
 | `proxy.host` | `127.0.0.1` | Bind address. Loopback only by design. |
 | `proxy.claudePort` | `3456` | Claude relay port. |
 | `proxy.codexPort` | `3457` | Codex relay port. |
-| `proxy.controlPort` | `3556` | Control channel the TUI talks to. |
+| `proxy.grokPort` | `3458` | Grok relay port. Optional; an older config without it uses the default. |
+| `proxy.controlPort` | `3556` | Control channel the TUI and `teamai usage` talk to (`/probe`, `GET /usage`). |
 | `proxy.clientToken` | generated | Local token every relayed client must send. |
 | `switchThreshold` | `0.98` | Usage ratio above which an account stops being selected. |
 | `warmupIntervalMs` | `300000` | Background re-measure interval. `0` disables it. |
 | `maxConcurrentPerAccount` | `16` | In-flight requests allowed per account. `0` means unlimited. |
 | `fableReserveThreshold` | `0.8` | Fable-window usage at or above which an account is preferred for non-Fable requests. `1` turns model-aware routing off. |
+| `display.hidden` | — | Optional. Dashboard parts switched off from the `v` menu, e.g. `["section:codex", "activity"]`. Display only. |
 | `proxy.legacyPorts` | — | Optional. Extra ports to keep answering on, per provider — e.g. `{ "claude": [3400] }`. |
 
 Change a port if something else already owns it — that is the usual cause of a
@@ -291,6 +432,8 @@ rather than allowed to take the relay down.
 ## Scope and compliance
 
 Version 0.1 targets subscription OAuth accounts, wrapper-launched CLI sessions, and an explicitly bound Codex App. It does not expose a public OpenAI-compatible API, convert Claude requests to Codex requests, launch or install Codex App itself, or pool credentials between different people. You are responsible for complying with provider terms and policies. Production/commercial API workloads should use the providers' official API billing mechanisms.
+
+**Gemini / Antigravity is not supported, on purpose.** Every provider's terms treat rotating several subscription accounts to get around usage limits as outside ordinary use, but Google is the one that enforces it: its Antigravity FAQ names "automating account rotation" as unsupported on consumer plans, its terms make reaching Antigravity through third-party software grounds for suspension, and open-source tools that pool Antigravity or Gemini CLI logins have reported accounts disabled in waves through 2026, with a repeat violation meaning a permanent ban. The Antigravity CLI also has no documented endpoint override and keeps its consumer sign-in in the OS keychain, so it could only be pooled by TeamAI holding Google tokens itself. Google's advice for third-party tools is an AI Studio or Vertex API key, which is pay-as-you-go rather than a subscription pool, so it is outside what TeamAI does.
 
 ## Development
 

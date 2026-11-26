@@ -2,20 +2,20 @@
 
 [English](README.md) · [한국어](README.ko.md) · [日本語](README.ja.md) · **中文** · [Español](README.es.md)
 
-TeamAI 是面向 **Claude Code** 和官方 **Codex CLI** 的本地多账号中继。它为每个服务商维护独立的账号池，当所选订阅账号不可用或配额耗尽时，会自动换一个账号重试请求。
+TeamAI 是面向 **Claude Code**、官方 **Codex CLI** 和官方 **Grok CLI** 的本地多账号中继。它为每个服务商维护独立的账号池，当所选订阅账号不可用或配额耗尽时，会自动换一个账号重试请求。
 
 ![TeamAI 仪表盘](docs/dashboard.png)
 
 <sub>上方的仪表盘是用 <code>teamai capture --redact full</code> 得到的真实截取：真实的配额与活动日志，没有账号地址。</sub>
 
-> TeamAI 是一个独立的开源项目，与 Anthropic、OpenAI 以及与之无关的 teamai.com 服务均无任何关联。
+> TeamAI 是一个独立的开源项目，与 Anthropic、OpenAI、xAI 以及与之无关的 teamai.com 服务均无任何关联。
 
 ## 环境要求
 
 - Node.js 20 及以上
-- macOS 或 Linux
+- macOS、Linux 或 Windows
 - 单独安装的 `claude` 和／或 `codex`
-- 你自己的 Claude Pro/Max 或 ChatGPT Codex 订阅账号
+- 你自己的 Claude Pro/Max/Ultra、ChatGPT Codex 或 SuperGrok 订阅账号
 
 ## 安装
 
@@ -35,6 +35,8 @@ npm run build          # 必需：dist/ 未提交到仓库
 npm link
 ```
 
+在 Windows 上，`install.sh` 需要 bash shell，请改用上面的手动步骤。`npm link` 会为 `cmd.exe` 和 PowerShell 创建 `teamai`/`tai`/`taic`/`tax` 命令，启动器会把每个参数按 `cmd.exe` 规则转义后运行 npm 安装的 `claude.cmd`/`codex.cmd`。下文的 Shell 配置和登录项章节仅适用于 macOS 与 Linux。
+
 打算用 AI 智能体来自动化安装？请参阅 [AGENTS.md](AGENTS.md)，其中把相同的步骤写成了带校验环节与失败分支的确定性命令。
 
 ## 快速开始
@@ -44,7 +46,7 @@ teamai login
 tai
 ```
 
-`login` 会询问要添加 `[1] Claude` 还是 `[2] Codex`。要添加更多账号，重复执行即可。`tai` 是简写的会话命令，等价于 `teamai start`：启动本地中继并打开仪表盘。在 TUI 中按 `1` 启动 Claude Code，按 `2` 启动 Codex。客户端退出后会回到仪表盘。
+`login` 会询问要添加 `[1] Claude`、`[2] Codex` 还是 `[3] Grok`。要添加更多账号，重复执行即可。`tai` 是简写的会话命令，等价于 `teamai start`：启动本地中继并打开仪表盘。在 TUI 中按 `1` 启动 Claude Code，按 `2` 启动 Codex，按 `3` 启动 Grok。客户端退出后会回到仪表盘。
 
 若想直接开启某个服务商的会话，请使用专用启动命令。它们会在必要时自动拉起 TeamAI 中继，并把后面跟的所有参数原样传给官方客户端：
 
@@ -53,9 +55,11 @@ taic                  # 经由 TeamAI 账号池的 Claude Code
 taic --resume         # 等同于：teamai claude --resume
 tax                   # 经由 TeamAI 账号池的 Codex
 tax resume            # 等同于：teamai codex resume
+tag                   # 经由 TeamAI 账号池的 Grok CLI
 teamai claude         # taic 的完整写法
 teamai codex          # tax 的完整写法
-teamai session        # 交互式选择 [1] Claude 或 [2] Codex
+teamai grok           # tag 的完整写法
+teamai session        # 交互式选择 [1] Claude、[2] Codex 或 [3] Grok
 ```
 
 这些名称是有意取的，以免覆盖已有的 TeamClaude `tc` shell 函数和标准 `tac` 文本工具。`tc` 可以继续指向 TeamClaude，而 `taic` 和 `tax` 指向 TeamAI。
@@ -106,6 +110,8 @@ Node 路径请用 `command -v node` 查到的真实路径填写；LaunchAgent �
 
 Codex 沿用其常规的浏览器登录流程。TeamAI 并不要求开启 ChatGPT 中那个可选的设备码（device-code）认证设置。
 
+Claude 登录会用默认浏览器打开授权页面（macOS 用 `open`，Linux 用 `xdg-open`，Windows 用 `rundll32`）。URL 也总会一并打印出来，所以在无法打开浏览器的无头机器上登录也不会中断：在任意设备上打开该 URL 完成即可。
+
 导入凭据是可选的，且仅在存在可导出的凭据文件时才有效：
 
 ```bash
@@ -118,10 +124,12 @@ teamai import codex
 
 较新版本的 Claude Code 可能把凭据存放在 macOS 钥匙串而不是 `~/.claude/.credentials.json` 中；这种情况下请改用 `teamai login`。`import` 绝不会修改原有的 TeamClaude、Claude Code 或 Codex 文件。TeamAI 为中继会话使用一个持久化的隔离 Codex 主目录，因此用户原本的 `~/.codex` 保持原样。
 
+**Grok.** `teamai login grok` 会在一个临时的 `GROK_HOME` 中运行 `grok login`，因此每个账号都有各自独立的登录，你的 `~/.grok` 会话既不会被替换，也不会被共享。只有 xAI 自己的登录（`auth.x.ai`）可以加入账号池；API 密钥或公司 SSO 登录不行。`teamai import grok` 会读取 `~/.grok/auth.json` 而不修改它，但导入的账号随后会与你自己的 `grok` 共用同一个刷新令牌：谁先刷新，谁就可能把另一方登出，所以对于你也会直接使用的账号，最好用 `login` 添加。中继会话（`tag`）在 `$TEAMAI_HOME/grok-home` 中运行，并以中继的客户端令牌作为 API 密钥——你的 `config.toml` 会被复制进去，`skills`、`installed-plugins` 和 `hooks` 会被链接，但登录信息不会——因此每个模型请求都会到达中继，再由中继用账号池中的账号转发出去。Grok 的每周限额读取自其 `/usage` 界面所用的同一个端点，不消耗配额。
+
 ## 运维
 
 ```bash
-teamai status                                  # 服务器状态 + 账号表
+teamai status                                  # 服务器状态 + 账号表 + 最近通知
 teamai accounts [claude|codex]                 # 仅账号表
 teamai start                                   # 启动中继并打开仪表盘
 teamai stop                                    # 停止中继
@@ -131,32 +139,139 @@ teamai tui                                     # 仅仪表盘，不自动启动
 teamai disable codex user@example.com
 teamai enable codex user@example.com
 teamai priority claude user@example.com 1      # 或者：auto
+teamai fable-only claude user@example.com on  # 或者：off
 teamai capture [--redact partial|full|none] [--out DIR]   # 把仪表盘保存为 .txt 和 .png（无需 TTY）
+teamai usage [--json] [--redact partial|full|none]       # 按账号和窗口查看用量（表格或 JSON）
 ```
 
 账号按剩余配额多少排序，消耗最少的排在最前，仪表盘和账号池自身的选取逻辑用的是同一套顺序——所以最上面那一行就是下一个请求将要使用的账号。Claude 的判定依据是按模型计的周窗口（Fable），而不是总的那个，因为实际上最先拒绝顶级模型的正是这个窗口。一旦所有账号都耗尽，它们就全部并列，排序便退化为谁先恢复谁在前——在今天没有任何账号能处理请求的情况下，距离重置的时间是区分它们的唯一依据（Claude 看 Fable 窗口，Codex 看它的周窗口）。未经测量的账号排在最后（未知不等同于用尽），手动固定的优先级依然优先生效，按 `c` 可切换回配置的顺序。
 
 **模型感知路由。** 只有顶级模型（Claude 的 Fable 档）才会动用按模型计的周窗口，因此并不需要它的请求——Opus、Sonnet、Haiku——会被从仍有 Fable 余量的账号上引开，转而分给那些 Fable 窗口已经用尽（达到或超过 `fableReserveThreshold`）的账号，并在这一组内按总的周窗口排序。这样就把每个账号稀缺的 Fable 余量留给真正需要它的请求，同时把原本闲置的周窗口余量利用起来。当没有已用尽的账号空闲时，请求会回退到一个被保留的账号，而不是直接失败。Fable 请求仍沿用普通的"消耗最少优先"顺序；把 `fableReserveThreshold` 设为 `1` 即可关闭这种拆分。
 
-Fable 档的 429（`7d_oi` 被拒，而共享的 `5h`／`7d` 窗口仍为允许）只会把该账号的 Fable 窗口搁置，而不是整个账号：其余各模型仍会继续由它服务，而不至于让整个账号为了一份只有顶级模型才消耗的余量而空闲长达一周。若某个 429 拒绝的是共享窗口，则照常搁置整个账号。
+Fable 档的 429（`7d_oi` 被拒，而共享的 `7d` 窗口仍为允许）只会把该账号的 Fable 窗口搁置，而不是整个账号：其余各模型仍会继续由它服务，而不至于让整个账号为了一份只有顶级模型才消耗的余量而空闲长达一周。若某个 429 拒绝的是共享窗口，则照常搁置整个账号。
 
-全屏 TUI 会把 Claude 和 Codex 账号分组显示，并在用量变化时保持当前选中的账号位置不动。Claude 行分别独立显示 `5h session`、`7d overall` 以及按模型划分的 `7d Fable` 三个窗口；Codex 行显示其主、次两个窗口，每个窗口的标题取自该账号实际上报的时间跨度（`1w limit`）。配额是从官方客户端的响应中学习得来的，并会在重启后保留。
+**Fable 专用账号。** 默认对所有账号关闭。`teamai fable-only claude <账号> on` 把一个 Claude 账号设为 Fable 专用。只要该账号的按模型周（Fable）窗口还有额度，所有 Fable 请求都会先发往它——优先于其他任何账号，包括固定优先级——且不会把其他模型（Opus、Sonnet、Haiku）的请求路由给它（只有中继自身的后台额度探测例外）。Fable 额度最多为周上限的一半，窗口用完后该账号剩余的周额度就会闲置，所以此后 Fable 会转到其他账号，而 Fable 专用账号像普通账号一样处理其他模型。保留期间仪表盘状态显示为 `fable`。正在运行的中继会在仪表盘按 `R` 或执行 `teamai restart` 后生效。
 
-底栏提供与 TeamClaude 相同的账号操作流程：启动 Claude/Codex、选择、切换、启用／禁用、排序、删除、添加／登录、重新测量（`R`）以及退出。`switch` 会把选中的账号固定到其所属服务商账号池的最前面；排序模式下可以指定名次，也可以把某个账号交回自动调度。刷新 Claude 资料时会显示套餐等级，并以红色标出 `past_due` 这类异常的订阅状态。
+**限额重置券。** Claude 可能会给账号发放限额重置券。`resets` 列和 `teamai accounts` 显示每个账号持有的数量：`R<n>` 重置整个周限额，`F<n>` 只重置 Fable 窗口。数据来自中继已经发送的用量请求（`?cedar_ember=1`）；TeamAI 只显示、从不使用重置券——请在 Claude 中自行使用。只有当某个账号持有重置券且该行仍能放进终端宽度时才显示此列。超过一天未重新读取的数量可能已被使用，因此会变暗显示（`teamai accounts` 中标为 `, stale`）。如果某个账号的重置券请求被拒绝而普通读取正常，中继会对该账号按普通方式只读取额度，并在六小时内不再为它请求重置券。
 
-`p` 会把仪表盘截取并保存，`teamai capture` 则可以在没有终端的情况下从脚本或代理完成同样的事。每次截取会在 `~/.config/teamai/captures/`（或 `--out DIR`）下留下一对文件：保留原有颜色的文本帧，以及用内置位图字体绘制的同一帧 PNG，除 Node 之外不需要任何东西。账号地址在绘制帧之前就已被遮盖，因此账号列、页脚和活动日志中都不会残留。默认是 `de•••••••••w@gm•••.com` 这样的部分遮盖；`--redact full` 会替换为 `account #N`；`--redact none` 则保留地址，用于只给自己看的截取。在仪表盘中按 `p`，除了保存之外，还会在文件管理器中定位到该 PNG，并把图片复制到剪贴板——macOS 上开箱即用，Linux 上需要安装 `xdg-open` 以及 `wl-copy` 或 `xclip`。页脚会说明哪些操作实际完成了。本 README 顶部的图片就是这样得到的一次截取。
+全屏 TUI 会把 Claude 和 Codex 账号分组显示，并在用量变化时保持当前选中的账号位置不动。Claude 行分别独立显示 `7d overall` 以及按模型划分的 `7d Fable` 窗口（Claude 已于 2026 年 11 月把 5 小时会话限额并入每周限额，因此只有当某个账号仍上报有效的 5 小时窗口时才会出现 `5h session` 列）；Codex 行显示其主、次两个窗口，每个窗口的标题取自该账号实际上报的时间跨度（`1w limit`）；Grok 行显示套餐的每周限额，即其 `/usage` 界面显示的数值。配额是从官方客户端的响应中学习得来的，并会在重启后保留。
 
-`R` 会对整批账号重新测量配额。配额从来不是通过轮询某个单独的接口获取的——它是从上游返回的 rate-limit 响应头中学习来的，因此一个还没承载过任何流量的账号会一直显示 `-`，直到有什么东西去测量它。`R` 会把一个已知会被接受的请求形态并行重放到每个空闲账号上（包括已测量过的和已被限流的账号，后者的 429 响应同样带有权威的响应头），并如实报告 `measured/targets` 计数。这个请求形态只有在真正经代理成功返回 2xx 后才会被确定下来，所以在还没有一次成功请求之前，`R` 会告知尚不存在探测模板，而不是去猜测一个请求体。缺少按模型计的周窗口（Fable）的账号会额外收到一次补充探测，因为该窗口只会出现在 Fable 级别请求的响应里。
+底栏提供与 TeamClaude 相同的账号操作流程：启动 Claude/Codex/Grok、选择、切换、启用／禁用、排序、删除、添加／登录、重新测量（`R`）以及退出。`switch` 会把选中的账号固定到其所属服务商账号池的最前面；排序模式下可以指定名次，也可以把某个账号交回自动调度。刷新 Claude 资料时会显示套餐等级（`Ultra`（原 Max 20x）、`Max 5x`、`Pro`；TeamAI 不认识的等级按上报的名称显示，而不是 `OAuth`），并以红色标出 `past_due` 这类异常的订阅状态。订阅欠费的账号（`past_due`、`unpaid`）最后才用：它仍会提供服务，但只在没有正常账号能接下请求时使用，因为上游可能在会话中途将其切断。 Grok 的令牌只以数字表示套餐：`7` 显示为 `Super`，其他值显示为 `tier N`；该数字在令牌签发时固定，因此套餐变更要在下一次令牌刷新后才会显示。
+
+按 `v` 打开显示设置菜单：账号分区（Claude、Codex、Grok）、各个仪表（Claude 的 5h session、7d overall、7d Fable、重置券；Codex 的第一、第二限额；Grok 的每周限额）、plan／state／order／续费日／测量时间列以及 Activity 日志，都可以用空格或回车开关。选择保存在 `config.json` 的 `display.hidden` 中，重启后和 `teamai capture` 里同样生效；它只改变显示内容，不影响路由，光标也会跳过隐藏的分区。底栏把 `s`（置顶固定）简写为 `pin`，`d` 简写为 `del`；当提示宽度超过终端时，会先去掉最不常用的提示（首先是 `↑↓ move`），而退出键和启动键始终保留。
+
+`p` 会把仪表盘截取并保存，`teamai capture` 则可以在没有终端的情况下从脚本或代理完成同样的事。每次截取会在 `~/.config/teamai/captures/`（或 `--out DIR`）下留下一对文件：保留原有颜色的文本帧，以及用内置位图字体绘制的同一帧 PNG，除 Node 之外不需要任何东西。账号地址在绘制帧之前就已被遮盖，因此账号列、页脚和活动日志中都不会残留。默认是 `de•••••••••w@gm•••.com` 这样的部分遮盖；`--redact full` 会替换为 `account #N`；`--redact none` 则保留地址，用于只给自己看的截取。在仪表盘中，`p` 使用默认遮盖，`P`（shift）则以 `account #N` 截取；两者除了保存之外，还会在文件管理器中定位到该 PNG，并把图片复制到剪贴板——macOS 上开箱即用，Linux 上需要安装 `xdg-open` 以及 `wl-copy` 或 `xclip`；Windows 上只保存文件，这两步都不会执行。页脚会说明哪些操作实际完成了。本 README 顶部的图片就是这样得到的一次截取。
+
+`R` 会对整批账号重新测量配额。配额从来不是通过轮询某个单独的接口获取的——它是从上游返回的 rate-limit 响应头中学习来的，因此一个还没承载过任何流量的账号会一直显示 `-`，直到有什么东西去测量它。`R` 会把一个已知会被接受的请求形态并行重放到每个空闲账号上（包括已测量过的和已被限流的账号，后者的 429 响应同样带有权威的响应头），并如实报告 `measured/targets` 计数。这个请求形态只有在真正经代理成功返回 2xx 后才会被确定下来，所以在还没有一次成功请求之前，`R` 会告知尚不存在探测模板，而不是去猜测一个请求体。缺少按模型计的周窗口（Fable）的账号会额外收到一次补充探测，因为该窗口只会出现在 Fable 级别请求的响应里。`R` 还会重新读取每个账号的订阅状态，所以刚付完款的账号无需等待六小时一次的刷新，`past_due` 就会消失。测量期间，底栏会显示黄色旋转指示、已读取的账号数和已用时间；每一行的测量时间列在读到该账号之前显示旋转指示，读到后显示绿色 `✓ updated`。结束后，未能读取的账号会在几秒内显示红色 `✗` 及原因（`blocked`、`re-login`、`retrying`，或读取失败的状态码，如 `403`），底栏以绿、黄、红色汇总结果，并点名最多三个这样的账号。
 
 服务端自身也会每五分钟做一次预热（`warmupIntervalMs`，设为 0 可禁用）：它会清理上游已经重置的配额窗口，并只测量那些尚未测量的账号，因此在一个稳定的账号集群上每个周期几乎不产生任何开销，而窗口一旦轮转就会自动补满，无需任何人去按 `R`。如果某个账号的上游始终不上报配额，在三次徒劳的尝试之后它会被剔除；而每当该窗口重置或你按下 `R`，这份尝试预算就会重新发放。
 
 空闲账号也会在这同一个五分钟周期里被保活：凡是令牌即将过期、或上一次尝试出错的账号，都会被逐个刷新。日常流量往往只集中在少数几个账号上，而预热又刻意从不刷新令牌，所以若没有这一步，一个无人使用的账号就可能让它的 refresh-token 链条失效，进而被上游吊销。这次扫描是刻意串行的——在长时间停机之后一次性刷新整批账号，会把令牌接口打成一波限流。
 
+刷新失败会按原因区分，仪表盘的 `state` 列会显示是哪一种。令牌接口没有响应（超时、连接中断）或返回过载、故障（429、5xx）时显示为黄色 `retrying`：令牌并没有失效，账号只是暂时停用，中继会在 30 秒后重试，并把间隔逐次翻倍、最长 4 分钟，直到接口响应——无需重新登录。只有令牌接口拒绝刷新（refresh token 被吊销或过期）时才显示为红色 `error`，这时才需要 `teamai login`。红色 `blocked` 不是令牌问题：Claude 返回了 `403 oauth_not_allowed_for_organization`，Anthropic 在订阅欠费期间会这样拒绝。该账号会立即停用，而不是每 30 分钟重试一次；预热周期会重新读取不消耗配额的用量接口，一旦它恢复响应（付款完成后），账号会自动回归。用量读取失败时，测量时间列会变红并注明原因（`3h ago (403)`）：数字是最后已知的值，但目前没有任何东西在刷新它们。每次失败与恢复都会连同账号标签记入一份与请求日志分开的通知记录，`teamai status` 会在账号表下方列出最近 10 条。
+
 学习得来的配额（用量、各窗口、重置时间、订阅资料）会写入磁盘并在下次启动时恢复，因此重启后仪表盘和排序无需重新测量即可延续；`R` 重放所用的探测形态也以同样方式持久化。而按响应产生的临时信号则不会：冷却（cooldown）和错误状态会在重启时被有意丢弃，这样账号就不会被某个过期 429 的 retry-after 再次搁置——如果它确实已经用尽，下一个请求会重新推导出正确的状态。
 
 当同时到达的请求数超过整批账号按账号并发上限所能承载的总量时，中继会在读取请求体之前就用 `429`（`x-teamai-429-reason: concurrency_saturated`）拒掉溢出的部分，而不是无上限地缓冲请求体。在"没有可用账号"的 429 上，同一个响应头也用来区分是账号繁忙还是已耗尽（`quota_exhausted`）。
 
-`~D-N` 这个订阅数值是一个估算，并非权威的到期日期：Anthropic 的资料接口会暴露订阅状态和创建时间，但不提供当前计费周期的结束时间。因此 TeamAI 只能推算下一个月度计费周年日，并用 `~` 标注。资料状态会在服务端启动时刷新，此后每六小时刷新一次。
+`~D-N` 这个订阅数值是一个估算，并非权威的到期日期：Anthropic 的资料接口会暴露订阅状态和创建时间，但不提供当前计费周期的结束时间。因此 TeamAI 只能推算下一个月度计费周年日，并用 `~` 标注。资料状态会在服务端启动时刷新，此后每六小时刷新一次，按下 `R` 时也会刷新。
+
+## 在其他会话和脚本中查看用量
+
+仪表盘是给人看的，`teamai usage` 则把同样的数据提供给其他一切：另一个 Claude Code 或 Codex 会话、Shell 脚本、状态栏，或者正在判断要不要开始长任务的智能体。
+
+```bash
+teamai usage                    # 表格：每个账号的所有窗口及距重置的时间
+teamai usage --json             # 同样的内容，JSON 格式
+teamai usage --json --redact full   # 账号显示为“account #N”
+```
+
+```text
+TeamAI usage (live from the server, 2026-11-17T02:17:41.007Z)
+
+claude: 3/9 available, next reset 9h43m
+  ○ account #1  7d 98% (2d15h)  7d_oi 100% (2d15h)
+  ● account #5  7d 5% (6d17h)  7d_oi 8% (6d17h)
+  ● account #6  7d 35% (3d11h)  7d_oi 69% (3d11h)  [2 in flight]
+
+codex: 1/1 available, next reset 1d5h
+  ● account #8  primary 37% (1d5h)  secondary 0%
+```
+
+中继运行时，报告直接来自服务器内存，包括进行中的请求数和账号冷却的原因。服务器未运行（或是没有该端点的旧版本）时，会用 `state.json` 生成同样的报告，`source` 字段注明来源。生成报告不会重新测量，因此不消耗配额，随便调用多少次都可以。
+
+JSON（节选）：
+
+```json
+{
+  "source": "live",
+  "generatedAt": "2026-11-17T02:17:41.007Z",
+  "providers": {
+    "claude": {
+      "summary": { "accounts": 9, "enabled": 9, "available": 3, "nextResetAt": "2026-11-17T12:00:00.475Z" },
+      "accounts": [{
+        "id": "…", "label": "de•••••••••w@gm•••.com", "enabled": true, "priority": null,
+        "plan": "default_claude_max_20x", "usage": 0.05,
+        "windows": { "7d": { "usage": 0.05, "resetsAt": "…", "resetsInMs": 579600000 },
+                     "7d_oi": { "usage": 0.08, "resetsAt": "…", "resetsInMs": 579600000 } },
+        "measuredAt": "…", "resetTickets": null, "cooldownUntil": null, "cooldownReason": null,
+        "error": null, "errorKind": null, "measureError": null, "inflight": 0, "available": true
+      }]
+    },
+    "codex": { "summary": { "…": "…" }, "accounts": [] }
+  }
+}
+```
+
+`usage` 是 0 到 1 之间的比例。窗口名称与上游报告的一致：Claude 为 `7d`（总体周额度）、`7d_oi`（顶级模型周额度），以及仍存在时的 `5h`；Codex 为 `primary` 和 `secondary`；Grok 为 `weekly`。`available` 表示已启用、无错误、未在冷却且低于 `switchThreshold`。报告来自 `state.json` 时 `inflight` 为 `null`。`resetTickets` 对 Codex 账号和从未读取到重置券的 Claude 账号为 `null`，否则为 `{ general, fable, nextExpiry, readAt, stale }`，其中 `stale` 表示该数量已超过一天未更新。账号地址的遮蔽方式与截图相同（`--redact`），令牌和凭据永远不会出现在报告中。
+
+### HTTP 端点
+
+控制端口也提供同样的报告。它只监听 `127.0.0.1`，和其他路径一样需要中继的客户端令牌：
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:3556/usage?redact=partial"
+```
+
+`3556` 是 `proxy.controlPort` 的默认值；如果改过，请用你设置的值（`jq .proxy.controlPort ~/.config/teamai/config.json`）。在用 `taic` 启动的会话中，`$ANTHROPIC_AUTH_TOKEN` 就是这个令牌。其他地方用 `teamai usage --json` 更简单，它会自己从配置读取令牌。
+
+### 可以这样用
+
+**长任务开始前先检查。** 智能体或脚本在开始大量消耗配额的工作前确认余量：
+
+```bash
+available=$(teamai usage --json | jq '.providers.claude.summary.available')
+[ "$available" -gt 0 ] || { echo "No Claude account free right now"; exit 1; }
+```
+
+**等到重置，而不是直接失败。** 批处理任务可以一直等到最早的窗口重置：
+
+```bash
+until [ "$(teamai usage --json | jq '.providers.claude.summary.available')" -gt 0 ]; do
+  sleep 600
+done
+```
+
+**显示在 Claude Code 状态栏。** 让 `~/.claude/settings.json` 里的 `statusLine` 指向一个小脚本；它直接读取端点，所以很快：
+
+```bash
+#!/bin/sh
+# ~/.claude/teamai-statusline.sh
+config="${TEAMAI_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/teamai}/config.json"
+port=$(jq -r '.proxy.controlPort // 3556' "$config")
+curl -s -m 1 -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" "http://127.0.0.1:$port/usage" |
+  jq -r '.providers.claude.summary |
+    "TeamAI \(.available)/\(.enabled) free" +
+    (if .nextResetAt then " · reset in \(((.nextResetAt | sub("\\.[0-9]+Z$";"Z") | fromdate) - now) / 3600 | floor)h" else "" end)'
+```
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.claude/teamai-statusline.sh" } }
+```
+
+**告诉智能体。** 在项目的 `CLAUDE.md` 或 `AGENTS.md` 里加一行：“开始长任务或并行任务前，运行 `teamai usage --json` 并检查 `providers.claude.summary.available`”。这样该项目的每个会话不用打开仪表盘也能知道还剩多少余量。
+
+**额度耗尽时提醒。** 用 cron 或 LaunchAgent 定期读取摘要，在 `available` 降到 0 时发通知；列出 `errorKind` 为 `refused` 的账号，就能知道哪些需要重新 `teamai login`（`unreachable` 表示中继正在自动重试；`blocked` 表示组织拒绝 OAuth，请检查该账号的付款）。`measureError` 说明最近一次用量读取失败的原因（`403`、`timeout`），测量成功后变为 `null`。
 
 ## 配置
 
@@ -169,12 +284,14 @@ Fable 档的 429（`7d_oi` 被拒，而共享的 `5h`／`7d` 窗口仍为允许�
 | `proxy.host` | `127.0.0.1` | 绑定地址。按设计仅限回环地址。 |
 | `proxy.claudePort` | `3456` | Claude 中继端口。 |
 | `proxy.codexPort` | `3457` | Codex 中继端口。 |
-| `proxy.controlPort` | `3556` | TUI 通信所用的控制通道。 |
+| `proxy.grokPort` | `3458` | Grok 中继端口。可选；没有此项的旧配置会使用默认值。 |
+| `proxy.controlPort` | `3556` | TUI 和 `teamai usage` 通信所用的控制通道（`/probe`、`GET /usage`）。 |
 | `proxy.clientToken` | 自动生成 | 每个被中继的客户端都必须发送的本地令牌。 |
 | `switchThreshold` | `0.98` | 用量比例超过该值后，该账号不再被选中。 |
 | `warmupIntervalMs` | `300000` | 后台重新测量的间隔。`0` 表示禁用。 |
 | `maxConcurrentPerAccount` | `16` | 每个账号允许的并发在途请求数。设为 `0` 表示无限制。 |
 | `fableReserveThreshold` | `0.8` | 当账号的 Fable 窗口用量达到或超过该值时，优先把非 Fable 请求分给它。设为 1 关闭模型感知路由。 |
+| `display.hidden` | — | 可选。在 `v` 菜单中关闭的仪表盘项目，例如 `["section:codex", "activity"]`。仅影响显示。 |
 | `proxy.legacyPorts` | — | 可选。按提供方继续应答的额外端口 — 例如 { "claude": [3400] }。 |
 
 如果某个端口已被别的程序占用，请改掉它——这正是启动失败最常见的原因，具体原因会记录在 `server-start.log` 中。
@@ -184,6 +301,8 @@ Fable 档的 429（`7d_oi` 被拒，而共享的 `5h`／`7d` 窗口仍为允许�
 ## 适用范围与合规
 
 0.1 版本面向的是订阅制 OAuth 账号以及由包装器启动的 CLI 会话。它不对外提供 OpenAI 兼容的公开 API，不把 Claude 请求转换成 Codex 请求，不支持 Codex Desktop，也不会把不同人的凭据混在一个池里共用。遵守各服务商条款与政策的责任在你自己。生产环境／商业用途的 API 负载应当使用服务商官方的 API 计费方式。
+
+**有意不支持 Gemini / Antigravity。** 各家服务商的条款都把轮换多个订阅账号以绕过用量限制视为超出正常使用范围，但真正执行的是 Google：Antigravity 的 FAQ 明确写明个人方案不支持“自动轮换账号”，条款把通过第三方软件访问 Antigravity 列为停用理由，而把 Antigravity 或 Gemini CLI 登录凭据集中使用的开源工具在 2026 年全年都报告过账号被成批停用（再次违规即永久封禁）。此外，Antigravity CLI 没有任何文档化的端点改写方式，个人账号的登录凭据只保存在系统钥匙串中，要集中使用就只能由 TeamAI 自己持有 Google 令牌。Google 为第三方工具推荐的是 AI Studio 或 Vertex API 密钥，那是按量计费而不是订阅账号池，不在 TeamAI 的范围之内。
 
 ## 开发
 
@@ -199,3 +318,5 @@ npm run lint
 
 <!-- transient-recovery-2026-09-22 -->
 临时上游错误保留原始 HTTP 状态、正文和 Retry-After。切换账号后最多重试两轮，每轮等待不超过 10 秒，总等待不超过 20 秒。更长的等待交给客户端，成功的流不会重放。Codex HTTP 重试保持关闭，避免重复重试。构建后需重启中继才能生效。
+
+> Translation update pending: see the canonical English README for the Windows installer (`scripts\install.cmd`), the `taic`/`tax` launcher fix on Windows, and the clone URL of this fork.

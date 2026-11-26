@@ -68,6 +68,70 @@ test('Codex App bind and unbind use restrictive files without touching unrelated
   }
 });
 
+test('Codex App bind and unbind wait for the binding lock, so they cannot interleave', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-app-lock-')); const teamaiHome = join(root, 'teamai'); const codexHome = join(root, 'codex');
+  const oldTeamai = process.env.TEAMAI_HOME; const oldCodex = process.env.CODEX_HOME;
+  process.env.TEAMAI_HOME = teamaiHome; process.env.CODEX_HOME = codexHome;
+  await mkdir(codexHome, { recursive: true });
+  const original = 'model_provider = "openai"\n';
+  await writeFile(join(codexHome, 'config.toml'), original);
+  await saveConfig(config());
+  const lockDir = `${paths().codexAppBinding}.lock.d`; const held = join(lockDir, '1000');
+  const { rm } = await import('node:fs/promises');
+  // Another bind or unbind holds the lock: a live holder that took it just now.
+  const hold = async (): Promise<void> => { await mkdir(lockDir, { recursive: true }); await writeFile(held, JSON.stringify({ pid: process.pid, at: new Date().toISOString() })); };
+  const release = (): Promise<void> => writeFile(`${held}.released`, '');
+  try {
+    await bindCodexApp();
+    const bound = await readFile(join(codexHome, 'config.toml'), 'utf8');
+    await hold();
+    const unbinding = unbindCodexApp();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), bound, 'unbind waits while the lock is held');
+    assert.equal(JSON.parse(await readFile(paths().codexAppBinding, 'utf8')).phase, 'bound');
+    await release();
+    await unbinding;
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original, 'and finishes once it is released');
+    await rm(lockDir, { recursive: true, force: true }); await hold();
+    const binding = bindCodexApp();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original, 'bind waits too');
+    await release();
+    await binding;
+    assert.equal((await codexAppStatus()).bound, true);
+    await unbindCodexApp();
+  } finally {
+    await rm(lockDir, { recursive: true, force: true });
+    if (oldTeamai === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = oldTeamai;
+    if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
+  }
+});
+
+test('an unbind that stopped after restoring the config is finished by the next one, and bind works again', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-app-resume-')); const teamaiHome = join(root, 'teamai'); const codexHome = join(root, 'codex');
+  const oldTeamai = process.env.TEAMAI_HOME; const oldCodex = process.env.CODEX_HOME;
+  process.env.TEAMAI_HOME = teamaiHome; process.env.CODEX_HOME = codexHome;
+  await mkdir(codexHome, { recursive: true });
+  const original = 'model_provider = "openai"\n';
+  await writeFile(join(codexHome, 'config.toml'), original);
+  await saveConfig(config());
+  try {
+    await bindCodexApp();
+    // The process stopped between restoring config.toml and removing the state.
+    await writeFile(join(codexHome, 'config.toml'), original);
+    assert.equal(JSON.parse(await readFile(paths().codexAppBinding, 'utf8')).phase, 'bound');
+    assert.equal(await unbindCodexApp(), join(codexHome, 'config.toml'));
+    await assert.rejects(access(paths().codexAppBinding), 'the leftover state is cleared');
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original);
+    await bindCodexApp();
+    assert.equal((await codexAppStatus()).bound, true, 'bind is not blocked by the earlier interruption');
+    await unbindCodexApp();
+  } finally {
+    if (oldTeamai === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = oldTeamai;
+    if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
+  }
+});
+
 test('Codex App binding recognises a quoted model_provider key instead of adding a second one', () => {
   for (const key of ['"model_provider"', "'model_provider'"]) {
     const original = `${key} = "openai"\n`;

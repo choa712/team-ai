@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Socket } from 'node:net';
 import { AccountPool } from './account-pool.js';
-import type { Provider } from './types.js';
+import type { Provider, RuntimeAccount } from './types.js';
 
 // Upper bound on waiting for upstream response headers only. Never applies to the body.
 const HEADER_TIMEOUT_MS = 300_000;
@@ -18,6 +18,13 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   const parts: Buffer[] = []; let size = 0;
   for await (const chunk of req) { const value = Buffer.from(chunk); size += value.length; if (size > MAX_BODY) throw Object.assign(new Error('Request too large'), { status: 413 }); parts.push(value); }
   return Buffer.concat(parts);
+}
+// "network error" alone hid whether a token refresh or the upstream call
+// failed, and why: fetch wraps the socket error, so the code lives on cause.
+export function describeError(error: unknown): string {
+  const err = error as { name?: string; message?: string; cause?: { code?: string; message?: string } } | null;
+  const code = err?.cause?.code; const detail = err?.cause?.message || err?.message || String(error);
+  return code ? `${code} ${detail}` : detail;
 }
 function incomingHeaders(req: IncomingMessage): Headers { const headers = new Headers(); for (const [k, v] of Object.entries(req.headers)) { if (Array.isArray(v)) v.forEach((x) => headers.append(k, x)); else if (v !== undefined) headers.set(k, v); } return headers; }
 // Which session a request belongs to, for account affinity. The provider reads
@@ -70,6 +77,8 @@ const NETWORK_COOLDOWN_MS = 2_000;
 const CONNECT_FAILURE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL', 'EAI_NODATA', 'EAI_NONAME', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'EADDRNOTAVAIL', 'UND_ERR_CONNECT_TIMEOUT']);
 export function requestNeverSent(error: unknown): boolean {
   const cause = (error as { cause?: unknown } | null)?.cause;
+  // fetch refuses a port on its blocklist before connecting at all.
+  if (cause instanceof Error && cause.message === 'bad port' && !(cause as { code?: unknown }).code) return true;
   const codes = cause instanceof AggregateError ? cause.errors.map((e) => (e as { code?: unknown } | null)?.code) : [(cause as { code?: unknown } | null)?.code];
   return codes.length > 0 && codes.every((code) => typeof code === 'string' && CONNECT_FAILURE_CODES.has(code));
 }
@@ -90,27 +99,26 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
   const wantsFable = pool.provider.usesFableBudget?.(path, body) ?? false;
   let lastFailure: { response: Response; body: string; transient: boolean } | null = null;
   const transientAccounts = new Set<string>();
+  // A 403 benches an account for 30 minutes, but the same 403 from every
+  // account means the request is refused, not the accounts: one such request
+  // swept the whole Codex fleet into a simultaneous 30-minute cooldown at 16-19%
+  // weekly usage (2026-10-09/10, three times). Hold the bench until another
+  // account proves it can serve this request.
+  const forbidden: Array<{ account: RuntimeAccount; ms: number }> = [];
   let retryRounds = 0;
   let retryWaitMs = 0;
   let nextRetryAt = 0;
-  // Set once an attempt may have delivered the request (a connection that
-  // died after the body went out). From then on the request is never
-  // re-sent by a retry round, whatever later attempts report: a connect
-  // refusal on the next account would otherwise re-arm the rounds and send
-  // to it what the first account may already have run.
-  let maybeDelivered = false;
   while (!res.destroyed) {
     const account = pool.acquire(session, excluded, wantsFable);
     if (!account) {
       // Exhausting this request's candidates does not mean exhausting quota.
       // Only retry explicit pre-stream transient HTTP failures; never replay a
       // successful/partially streamed response. Keep retries in the relay.
-      // Once an attempt may have delivered the request (maybeDelivered), no
-      // failure of any kind earns a retry: a 503 from the next account used to
-      // re-arm the rounds and re-send what the first account may have run.
+      // A request that may have run upstream never gets here: it is answered
+      // at once (see the network-error branch below).
       if (lastFailure) {
         const delay = Math.max(1000 * 2 ** retryRounds, nextRetryAt - Date.now()) + Math.floor(Math.random() * 200);
-        if (lastFailure.transient && transientAccounts.size && !maybeDelivered && retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
+        if (lastFailure.transient && transientAccounts.size && retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
           retryRounds++; retryWaitMs += delay;
           onChange(`${pool.provider.label} transient retry ${retryRounds}/2 after ${delay}ms`);
           await waitForRetry(delay, res);
@@ -152,8 +160,10 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       return json(res, 429, { error: shortfall.message }, headers);
     }
     let response: Response;
+    let phase = 'token refresh';
     try {
       await pool.refresh(account);
+      phase = 'upstream';
       const headers = pool.provider.buildHeaders(incomingHeaders(req), account);
       const sendBody = pool.provider.rewriteBody(body, account);
       headers.set('content-length', String(sendBody.length));
@@ -177,26 +187,24 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       // account still benched — answered as a quota 429, which Codex
       // (request_max_retries=0) took as final. Now the failure is kept as the
       // request's transient record so the retry rounds above run, timed to the
-      // bench so the first round is not spent on accounts still benched.
-      const detail = describeFetchError(error);
+      // bench so the first round is not spent on accounts still benched. A
+      // failed token refresh never sent the request either.
+      const detail = `${phase}: ${describeFetchError(error)}`;
       const failure = { response: new Response(null, { status: 502, headers: { 'content-type': 'application/json' } }), body: JSON.stringify({ error: `Upstream connection failed: ${detail}` }) };
       pool.release(account); pool.cooldown(account, NETWORK_COOLDOWN_MS, 'network'); excluded.add(account.id);
-      if (requestNeverSent(error) && !maybeDelivered) {
+      if (phase === 'token refresh' || requestNeverSent(error)) {
         lastFailure = { ...failure, transient: true }; transientAccounts.add(account.id);
         nextRetryAt = Math.max(nextRetryAt, Date.now() + NETWORK_COOLDOWN_MS + 50);
-        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail})`);
+        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error (${detail}); failover`);
         continue;
       }
-      // The connection was made and died later (or an earlier attempt's did):
-      // whether upstream ran the request is unknown, so no retry round may
-      // re-send it — a retry already earned by an earlier connect failure is
-      // forfeited, and a later connect failure does not earn one back.
-      // Failover to the next account is unchanged; once every account has
-      // been tried the 502 is final and the client decides.
-      maybeDelivered = true;
-      lastFailure = { ...failure, transient: false }; transientAccounts.clear();
-      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover (${detail}; not retried, the request may have reached upstream)`);
-      continue;
+      // The connection was made and died later: whether upstream ran the
+      // request is unknown. Sending it again, by a retry round or to the next
+      // account, could run it twice, so it is not sent anywhere else. The 502
+      // names the cause and the client decides (Claude Code retries a 502 on
+      // its own).
+      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error (${detail}); not re-sent: the request may have reached upstream`);
+      return json(res, 502, { error: `Upstream connection failed: ${detail}` }, { 'x-teamai-502-reason': 'may_have_run' });
     }
     pool.updateQuota(account, response.headers);
     if (!response.ok) {
@@ -215,8 +223,9 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       if (!(lastFailure?.transient && transientAccounts.size && decision.kind !== 'transient')) lastFailure = { response, body: errorBody, transient: decision.kind === 'transient' };
       if (decision.kind === 'auth' && !authRetried) {
         authRetried = true;
-        try { await pool.refresh(account, true); } catch (error) { pool.fail(account, (error as Error).message); excluded.add(account.id); }
-        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} auth refresh`); continue;
+        let outcome = 'auth refresh';
+        try { await pool.refresh(account, true); } catch (error) { outcome = pool.recordRefreshFailure(account, error) === 'unreachable' ? 'auth refresh unreachable; retrying' : 'auth refresh refused — re-login needed'; excluded.add(account.id); }
+        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${outcome}`); continue;
       }
       if (decision.kind === 'quota' || decision.kind === 'model-quota') pool.commitProbeFromQuotaRejection(path, incomingHeaders(req), body, response.headers);
       // Only the top model's budget is gone. Benching the account would idle it
@@ -242,7 +251,26 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
         nextRetryAt = Math.max(nextRetryAt, Date.now() + decision.retryAfterMs);
         continue;
       }
-      if (decision.kind === 'quota' || decision.kind === 'forbidden') {
+      // The organization refuses OAuth: the 403 names the account, so it is
+      // benched now — no waiting for another account to prove the request good.
+      if (decision.kind === 'blocked') {
+        pool.markBlocked(account); excluded.add(account.id);
+        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} blocked: organization refuses OAuth (check billing); failover`);
+        continue;
+      }
+      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} ${decision.kind} body: ${errorBody.replace(/\s+/g, ' ').slice(0, 300)}`);
+      if (decision.kind === 'forbidden') {
+        excluded.add(account.id);
+        if (forbidden.length) {
+          copyHeaders(response, res); res.writeHead(response.status); res.end(errorBody);
+          onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} on a second account; request refused, no cooldown`);
+          return;
+        }
+        forbidden.push({ account, ms: decision.retryAfterMs });
+        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} forbidden; failover (bench pending)`);
+        continue;
+      }
+      if (decision.kind === 'quota') {
         pool.cooldown(account, decision.retryAfterMs, decision.kind); excluded.add(account.id); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} ${decision.kind}; failover`);
         // A spent account after a transient one must not end the request: the
         // transient account still has its retry rounds, and the decision block
@@ -254,6 +282,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       }
       copyHeaders(response, res); res.writeHead(response.status); res.end(errorBody); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status}`); return;
     }
+    for (const item of forbidden) { pool.cooldown(item.account, item.ms, 'forbidden'); onChange(`${pool.provider.label} ${item.account.label} benched: 403 while ${account.label} served the same request`); }
     pool.commitProbe(path, incomingHeaders(req), body, response.headers);
     copyHeaders(response, res); res.writeHead(response.status);
     // A stream that breaks after the 200 was written used to be logged as a

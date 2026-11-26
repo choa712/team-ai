@@ -1,9 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
-import { decodeJwt } from './auth.js';
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { claudeOrganization, codexUserId } from './auth.js';
 import type { OAuthCredential, PersistedState, ProviderId, StoredAccount, TeamAIConfig } from './types.js';
+
+const DEFAULT_GROK_PORT = 3458;
 
 export function dataDir(): string {
   return process.env.TEAMAI_HOME || join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'teamai');
@@ -19,21 +21,49 @@ export const paths = () => ({
 });
 
 export function defaultConfig(): TeamAIConfig {
-  return { version: 1, proxy: { host: '127.0.0.1', claudePort: 3456, codexPort: 3457, controlPort: 3556, clientToken: `tai-${randomBytes(24).toString('base64url')}` }, switchThreshold: 0.98, warmupIntervalMs: 5 * 60_000, maxConcurrentPerAccount: 16, fableReserveThreshold: 0.8, accounts: [] };
+  return { version: 1, proxy: { host: '127.0.0.1', claudePort: 3456, codexPort: 3457, grokPort: DEFAULT_GROK_PORT, controlPort: 3556, clientToken: `tai-${randomBytes(24).toString('base64url')}` }, switchThreshold: 0.98, warmupIntervalMs: 5 * 60_000, maxConcurrentPerAccount: 16, fableReserveThreshold: 0.8, accounts: [] };
+}
+
+// The port a provider's relay listens on. Grok's is optional in config (added
+// later), so an older config falls back to the built-in default.
+export function providerPort(proxy: TeamAIConfig['proxy'], id: ProviderId): number {
+  return id === 'claude' ? proxy.claudePort : id === 'codex' ? proxy.codexPort : proxy.grokPort ?? DEFAULT_GROK_PORT;
 }
 
 async function readJson<T>(path: string, fallback: T): Promise<T> {
   try { return JSON.parse(await readFile(path, 'utf8')) as T; } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fallback; throw error; }
 }
 
-export async function atomicWriteText(path: string, contents: string): Promise<void> {
+// One temp file per write, not per process: a save that outlives its timeout
+// can still be in flight when the next one starts, and sharing a temp name let
+// the two interleave into one file.
+let tempSeq = 0;
+// commit, when given, is asked right before the rename and can veto it; the
+// temp file is removed and false returned.
+export async function atomicWrite(path: string, value: unknown, commit?: () => Promise<boolean>): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temp = `${path}.${process.pid}.tmp`;
-  await writeFile(temp, contents, { mode: 0o600 });
-  await rename(temp, path);
+  const temp = `${path}.${process.pid}.${++tempSeq}.tmp`;
+  try {
+    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    if (commit && !await commit()) return false;
+    await rename(temp, path);
+    return true;
+  } finally { await rm(temp, { force: true }); }
 }
 
-export async function atomicWrite(path: string, value: unknown): Promise<void> { await atomicWriteText(path, `${JSON.stringify(value, null, 2)}\n`); }
+// Text files that are not JSON (the Codex config.toml): same temp-and-rename,
+// and the same veto as atomicWrite (asked right before the rename).
+export async function atomicWriteText(path: string, contents: string, commit?: () => Promise<boolean>): Promise<boolean> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temp = `${path}.${process.pid}.${++tempSeq}.tmp`;
+  try {
+    await writeFile(temp, contents, { mode: 0o600 });
+    if (commit && !await commit()) return false;
+    await rename(temp, path);
+    return true;
+  } finally { await rm(temp, { force: true }); }
+}
+
 
 // The activity log: one line per relay event, appended as it happens. The ring
 // in state.json keeps 200 events, which under a busy fleet is four minutes —
@@ -54,63 +84,83 @@ export async function loadConfig(): Promise<TeamAIConfig> { return readJson(path
 export async function saveConfig(config: TeamAIConfig): Promise<void> { await atomicWrite(paths().config, config); }
 export async function loadCredentials(): Promise<Record<string, OAuthCredential>> { return readJson(paths().credentials, {}); }
 export async function saveCredentials(value: Record<string, OAuthCredential>): Promise<void> { await atomicWrite(paths().credentials, value); }
+// The file exactly as stored, for a writer that must not overwrite what another
+// process (a re-login in the TUI) wrote after it last looked.
+export async function readCredentialsText(): Promise<string> {
+  try { return await readFile(paths().credentials, 'utf8'); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error; }
+}
+// Write only if the file still reads as expected; false means it changed since
+// and nothing was written. The check sits after the temp write, so a save
+// delayed for minutes is judged against the file as it is when it lands.
+export async function saveCredentialsIfUnchanged(value: Record<string, OAuthCredential>, expected: string, current: () => boolean = () => true): Promise<boolean> {
+  return atomicWrite(paths().credentials, value, async () => current() && await readCredentialsText() === expected);
+}
 export async function loadState(): Promise<PersistedState> { return readJson(paths().state, { version: 1, accounts: {}, events: [] }); }
-export async function saveState(value: PersistedState): Promise<void> { await atomicWrite(paths().state, value); }
+export async function saveState(value: PersistedState, commit?: () => Promise<boolean>): Promise<boolean> { return atomicWrite(paths().state, value, commit); }
 
-// 'replace' is for a login the user just completed, which wins over anything,
-// even a revoked token with a later expiry. 'keep-newer' is for copies
-// (import): they never replace a logged-in credential and otherwise the later
-// expiry wins. 'add-only' (cloud pull) never touches a credential already held.
-// A Codex login keys its account by the token's chatgpt_account_id claim, while
-// a codex-multi-auth import keys it by a workspace id, which for a personal
-// account is an org id (org-…). Matching on the stored id alone turned a
-// re-login of such an import into a second entry beside the dead one. So a
-// login also renews the one entry whose stored token carries the same claim,
-// unless that entry's id is itself a ChatGPT account id: then it names a
-// workspace exactly, and sharing a token does not make it the same one.
-const CHATGPT_ACCOUNT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-function codexAccountOf(credential: OAuthCredential | undefined): string | null {
-  const auth = credential ? decodeJwt(credential.accessToken)['https://api.openai.com/auth'] : null;
-  const id = auth && typeof auth === 'object' ? (auth as Record<string, unknown>).chatgpt_account_id : null;
-  return typeof id === 'string' ? id : null;
+// The key a stored account is known by: the account id, plus the user for a
+// Codex workspace that several members share, or the organization for a Claude
+// person who holds more than one subscription.
+export function accountKey(credential: OAuthCredential): string {
+  if (credential.userId) return `${credential.accountId}:${credential.userId}`;
+  return credential.organizationId ? `${credential.accountId}:${credential.organizationId}` : credential.accountId;
 }
 
-export async function upsertAccounts(provider: ProviderId, values: Array<{ label: string; credential: OAuthCredential }>, policy: 'keep-newer' | 'replace' | 'add-only' = 'keep-newer'): Promise<StoredAccount[]> {
-  const config = await loadConfig();
-  const credentials = await loadCredentials();
-  const accounts = values.map(({ label, credential: given }) => {
-    const claimed = provider === 'codex' && policy === 'replace' ? codexAccountOf(given) : null;
-    const byClaim = claimed ? config.accounts.filter((a) => a.provider === provider && !CHATGPT_ACCOUNT_ID.test(a.id) && codexAccountOf(credentials[a.credentialId]) === claimed) : [];
-    const existing = config.accounts.find((a) => a.provider === provider && a.id === given.accountId) || (byClaim.length === 1 ? byClaim[0] : undefined);
-    const credentialId = existing?.credentialId || `${provider}:${given.accountId}`;
-    const current = credentials[credentialId];
-    const credential = policy === 'replace' ? { ...given, loggedInAt: Date.now() } : given;
-    const account: StoredAccount = existing || { id: credential.accountId, provider, label, enabled: true, priority: null, credentialId, createdAt: new Date().toISOString() };
-    account.label = label || account.label;
-    if (!existing) config.accounts.push(account);
-    // An import can carry an older copy of a token this machine already rotated
-    // (a stale export, a lagging cloud). Writing it back would replace a live
-    // refresh token with a spent one, so the later expiry wins; a copy with no
-    // known expiry is taken as given, as before.
-    const copyLosesToLogin = policy !== 'replace' && (current?.loggedInAt ?? 0) > (credential.loggedInAt ?? 0);
-    const write = policy === 'replace' || !current || (policy === 'keep-newer' && !copyLosesToLogin && (current.expiresAt === null || credential.expiresAt === null || credential.expiresAt >= current.expiresAt));
-    // An import that replaces the pair held for an existing account is the user
-    // handing a token over. Stamp it, or a running server (which adopts only
-    // what it can tell is newer) writes its own copy back over it on the next
-    // save. The stamp is not a login stamp: a later import may still replace it.
-    // Re-importing the pair already held changes nothing, so it keeps the stamps it has.
-    const samePair = current !== undefined && current.accessToken === credential.accessToken && current.refreshToken === credential.refreshToken;
-    const handedOver = policy === 'keep-newer' && current !== undefined && !samePair;
-    if (write && !(policy === 'keep-newer' && samePair)) credentials[credentialId] = handedOver ? { ...credential, importedAt: Date.now() } : credential;
-    return account;
+// Codex accounts stored before the user joined the key are keyed by the
+// workspace alone. Such a record is adopted only when it holds the same user;
+// another member of that workspace gets a row of their own instead of
+// overwriting it.
+async function legacyAccount(config: TeamAIConfig, credentials: Record<string, OAuthCredential>, provider: ProviderId, label: string, credential: OAuthCredential): Promise<StoredAccount | undefined> {
+  if (credential.organizationId) return legacyClaudeAccount(config, credentials, provider, credential);
+  if (!credential.userId) return undefined;
+  return config.accounts.find((a) => {
+    if (a.provider !== provider || a.id !== credential.accountId) return false;
+    // The held token's user decides when it has one; the label (an email) is
+    // only a fallback, since two members without an email claim share a label.
+    const held = credentials[a.credentialId]; const heldUser = held ? codexUserId(held.accessToken) : null;
+    return heldUser ? heldUser === credential.userId : a.label === label;
   });
-  await saveCredentials(credentials);
-  await saveConfig(config);
-  return accounts;
+}
+
+// Claude accounts stored before the organization joined the key are keyed by
+// the person alone. Such a record is adopted when its token belongs to the same
+// organization, or when its token can no longer be renewed: a re-login usually
+// follows exactly that, and keeping the dead record beside the new one would
+// leave a duplicate that only errors. A Claude token is opaque, so telling
+// takes a profile call; only when upstream cannot be reached does the login get
+// a row of its own — a duplicate can be disabled, an overwritten subscription
+// cannot be recovered.
+async function legacyClaudeAccount(config: TeamAIConfig, credentials: Record<string, OAuthCredential>, provider: ProviderId, credential: OAuthCredential): Promise<StoredAccount | undefined> {
+  for (const a of config.accounts) {
+    if (a.provider !== provider || a.id !== credential.accountId) continue;
+    const held = credentials[a.credentialId]; if (!held) continue;
+    if (held.organizationId) { if (held.organizationId === credential.organizationId) return a; continue; }
+    const found = await claudeOrganization(held);
+    if (found === 'lost') return a;
+    if (found === 'unknown') continue;
+    // A renewal spent the stored refresh token, so the renewed credential is
+    // kept even when this login turns out to be another organization's.
+    if (found.renewed) credentials[a.credentialId] = { ...found.renewed, ...(found.organizationId ? { organizationId: found.organizationId } : {}) };
+    if (found.organizationId === credential.organizationId) return a;
+  }
+  return undefined;
 }
 
 export async function upsertAccount(provider: ProviderId, label: string, credential: OAuthCredential): Promise<StoredAccount> {
-  return (await upsertAccounts(provider, [{ label, credential }], 'replace'))[0]!;
+  const config = await loadConfig();
+  const credentials = await loadCredentials();
+  const key = accountKey(credential);
+  const existing = config.accounts.find((a) => a.provider === provider && a.id === key) || await legacyAccount(config, credentials, provider, label, credential);
+  const credentialId = existing?.credentialId || `${provider}:${key}`;
+  const account: StoredAccount = existing || { id: key, provider, label, enabled: true, priority: null, credentialId, createdAt: new Date().toISOString() };
+  // A migrated record keeps its credentialId, so its saved usage history stays attached.
+  account.id = key;
+  account.label = label || account.label;
+  if (!existing) config.accounts.push(account);
+  credentials[credentialId] = credential;
+  await saveCredentials(credentials);
+  await saveConfig(config);
+  return account;
 }
 
 export async function removeAccount(credentialId: string): Promise<boolean> {

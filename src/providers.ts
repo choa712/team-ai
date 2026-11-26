@@ -1,4 +1,4 @@
-import type { OAuthCredential, Provider } from './types.js';
+import type { OAuthCredential, Provider, ProviderId, QuotaSnapshot, QuotaWindow, ResetCredits } from './types.js';
 
 // accept-encoding is dropped too: fetch negotiates and decompresses on its own,
 // and echoing the client's preference upstream only invites a compressed body we
@@ -70,7 +70,7 @@ function sessionId(value: unknown): string | null { return typeof value === 'str
 
 async function tokenRefresh(url: string, contentType: string, body: string): Promise<Record<string, unknown>> {
   const response = await fetch(url, { method: 'POST', headers: { 'content-type': contentType, accept: 'application/json' }, body, signal: AbortSignal.timeout(30_000) });
-  if (!response.ok) throw new Error(`OAuth refresh failed (${response.status})`);
+  if (!response.ok) throw Object.assign(new Error(`OAuth refresh failed (${response.status})`), { status: response.status });
   return await response.json() as Record<string, unknown>;
 }
 
@@ -85,6 +85,96 @@ function timestamp(raw: string | null): number | null {
   if (/^\d+(?:\.\d+)?$/.test(raw) && Number.isFinite(numeric)) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
   const parsed = Date.parse(raw);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+// Claude's /api/oauth/usage, reduced to the windows the proxy already names
+// from response headers: `limits` carries the session, the weekly total and
+// the model-scoped weekly (Fable) bucket, each with its own reset. The legacy
+// five_hour/seven_day fields back it up for a response without `limits`.
+interface ClaudeUsageLimit { kind?: string; percent?: number; resets_at?: string | null; scope?: { model?: { display_name?: string | null } | null } | null }
+interface ClaudeUsageWindow { utilization?: number | null; resets_at?: string | null }
+const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+// Used for the ticket read until the relay has seen a live Claude Code request.
+const TICKETS_USER_AGENT = 'claude-cli/2.1.322 (external, cli)';
+// After upstream refuses the ticket form for an account, plain reads only for this long.
+// Per account: one account's refusal (an ineligible seat, say) says nothing about the rest.
+const TICKETS_RETRY_MS = 6 * 3_600_000;
+const ticketsRefusedUntil = new Map<string, number>();
+
+// Anthropic's answer, on every OAuth endpoint, while it refuses OAuth for an
+// organization — seen while a subscription was past due (2026-11-22). It names
+// the account, not the request, so it is not a 403 to doubt.
+const OAUTH_BLOCKED = 'oauth_not_allowed_for_organization';
+export function claudeOAuthBlocked(body: string): boolean { return body.includes(OAUTH_BLOCKED); }
+
+// A failed usage read, carrying its HTTP status and whether the organization is
+// refusing OAuth, so the pool can show why and bench a blocked account.
+export class UsageReadError extends Error {
+  constructor(readonly status: number, readonly blocked: boolean, detail = String(status)) { super(`Claude usage failed (${detail})${blocked ? ` ${OAUTH_BLOCKED}` : ''}`); }
+}
+async function usageReadError(response: Response, detail?: string): Promise<UsageReadError> {
+  const body = await response.text().catch(() => '');
+  return new UsageReadError(response.status, claudeOAuthBlocked(body), detail);
+}
+
+// `cedar_ember` (asked for with ?cedar_ember=1) lists the limit-reset tickets. A
+// ticket whose `clears` names `seven_day` resets the whole weekly limit; one
+// that does not clears only the model-scoped (Fable) window. Paused or used-up
+// grants are not counted.
+export function claudeResetCredits(data: unknown): ResetCredits | null {
+  const ember = (data as { cedar_ember?: { eligible?: unknown; grants?: unknown } } | null)?.cedar_ember;
+  if (!ember || typeof ember !== 'object') return null;
+  const now = Date.now();
+  const credits: ResetCredits = { general: 0, fable: 0, nextExpiry: null, readAt: now };
+  // an account that lost eligibility (or has no grants) shows none, not a stale count
+  if (ember.eligible === false || !Array.isArray(ember.grants)) return credits;
+  for (const raw of ember.grants as Array<Record<string, unknown> | null>) {
+    if (!raw || raw.paused === true) continue;
+    const left = typeof raw.resets_left === 'number' && Number.isInteger(raw.resets_left) ? raw.resets_left : 1;
+    if (left <= 0) continue;
+    const ends = timestamp(typeof raw.ends_at === 'string' ? raw.ends_at : null);
+    if (ends !== null && ends <= now) continue;
+    const clears = Array.isArray(raw.clears) ? raw.clears : [];
+    if (clears.includes('seven_day')) credits.general += left;
+    else if (clears.includes('seven_day_overage_included')) credits.fable += left;
+    else continue; // a ticket for a window TeamAI does not show
+    if (ends !== null && (credits.nextExpiry === null || ends < credits.nextExpiry)) credits.nextExpiry = ends;
+  }
+  return credits;
+}
+
+export function claudeUsageQuota(data: { limits?: ClaudeUsageLimit[] | null; five_hour?: ClaudeUsageWindow | null; seven_day?: ClaudeUsageWindow | null; cedar_ember?: unknown }): QuotaSnapshot | null {
+  const windows: Record<string, QuotaWindow> = {};
+  const put = (name: string, percent: number | null | undefined, reset: string | null | undefined): void => {
+    if (typeof percent === 'number' && Number.isFinite(percent)) windows[name] = { usage: Math.max(0, Math.min(1, percent / 100)), resetsAt: timestamp(reset ?? null) };
+  };
+  for (const limit of data.limits ?? []) {
+    if (limit.kind === 'session') put('5h', limit.percent, limit.resets_at);
+    else if (limit.kind === 'weekly_all') put('7d', limit.percent, limit.resets_at);
+    else if (limit.kind === 'weekly_scoped' && /fable/i.test(limit.scope?.model?.display_name ?? '')) put('7d_oi', limit.percent, limit.resets_at);
+  }
+  if (!windows['5h']) put('5h', data.five_hour?.utilization, data.five_hour?.resets_at);
+  if (!windows['7d']) put('7d', data.seven_day?.utilization, data.seven_day?.resets_at);
+  if (!Object.keys(windows).length) return null;
+  const routing = ['5h', '7d'].map((name) => windows[name]).filter((x) => x?.usage != null).sort((a, b) => (b?.usage ?? 0) - (a?.usage ?? 0))[0];
+  const resetCredits = claudeResetCredits(data);
+  return { routingUsage: routing?.usage ?? null, routingResetsAt: routing?.resetsAt ?? null, windows, ...(resetCredits ? { resetCredits } : {}) };
+}
+
+// Codex's /wham/usage: the same primary/secondary windows the x-codex-* headers
+// carry, with the window length in seconds rather than minutes.
+interface CodexUsageWindow { used_percent?: number | null; limit_window_seconds?: number | null; reset_after_seconds?: number | null; reset_at?: number | null }
+export function codexUsageQuota(data: { rate_limit?: { primary_window?: CodexUsageWindow | null; secondary_window?: CodexUsageWindow | null } | null }): QuotaSnapshot | null {
+  const windows: Record<string, QuotaWindow> = {};
+  for (const [name, window] of [['primary', data.rate_limit?.primary_window], ['secondary', data.rate_limit?.secondary_window]] as const) {
+    if (!window || typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent)) continue;
+    const reset = typeof window.reset_at === 'number' && window.reset_at > 0 ? (window.reset_at < 10_000_000_000 ? window.reset_at * 1000 : window.reset_at)
+      : typeof window.reset_after_seconds === 'number' && window.reset_after_seconds > 0 ? Date.now() + window.reset_after_seconds * 1000 : null;
+    const minutes = typeof window.limit_window_seconds === 'number' && window.limit_window_seconds > 0 ? Math.round(window.limit_window_seconds / 60) : null;
+    windows[name] = { usage: Math.max(0, Math.min(1, window.used_percent / 100)), resetsAt: reset, minutes };
+  }
+  const binding = Object.values(windows).sort((a, b) => (b.usage ?? 0) - (a.usage ?? 0))[0];
+  return binding ? { routingUsage: binding.usage, routingResetsAt: binding.resetsAt, windows } : null;
 }
 
 export const claudeProvider: Provider = {
@@ -118,15 +208,20 @@ export const claudeProvider: Provider = {
     const names = new Set<string>();
     for (const [key] of headers) { const match = /^anthropic-ratelimit-unified-(5h|7d(?:_[a-z0-9]+)?)-(?:utilization|reset)$/i.exec(key); if (match?.[1]) names.add(match[1]); }
     for (const name of names) {
-      const usage = Number(headers.get(`anthropic-ratelimit-unified-${name}-utilization`));
+      // Number(null) is 0, so an absent utilization header would otherwise
+      // read as a measured empty window rather than as no measurement.
+      const raw = headers.get(`anthropic-ratelimit-unified-${name}-utilization`);
+      const usage = raw === null || raw.trim() === '' ? NaN : Number(raw);
       const reset = timestamp(headers.get(`anthropic-ratelimit-unified-${name}-reset`));
+      if (!Number.isFinite(usage) && reset === null) continue;
       windows[name] = { usage: Number.isFinite(usage) ? usage : null, resetsAt: reset };
     }
     const routing = ['5h', '7d'].map((name) => windows[name]).filter((x) => x?.usage !== null && x?.usage !== undefined).sort((a, b) => (b?.usage ?? 0) - (a?.usage ?? 0))[0];
     return Object.keys(windows).length ? { routingUsage: routing?.usage ?? null, routingResetsAt: routing?.resetsAt ?? null, windows } : null;
   },
-  classifyFailure(status, headers) {
+  classifyFailure(status, headers, body) {
     if (status === 401) return { kind: 'auth', retryAfterMs: 0 };
+    if (status === 403 && claudeOAuthBlocked(body)) return { kind: 'blocked', retryAfterMs: 0 };
     if (status === 403) return { kind: 'forbidden', retryAfterMs: 30 * 60_000 };
     if (status === 429) {
       // A rejected status can appear on a named window (5h, 7d, 7d_oi, …) OR on
@@ -224,6 +319,31 @@ export const claudeProvider: Provider = {
     if (!response.ok) throw new Error(`Claude profile failed (${response.status})`);
     const data = await response.json() as { account?: { has_claude_max?: boolean; has_claude_pro?: boolean }; organization?: { subscription_status?: string; subscription_created_at?: string; rate_limit_tier?: string; organization_type?: string } };
     return { status: data.organization?.subscription_status ?? null, createdAt: data.organization?.subscription_created_at ?? null, rateLimitTier: data.organization?.rate_limit_tier ?? null, orgType: data.organization?.organization_type ?? null, hasClaudeMax: data.account?.has_claude_max ?? null, hasClaudePro: data.account?.has_claude_pro ?? null, fetchedAt: Date.now() };
+  },
+  async fetchUsage(credential, userAgent) {
+    const headers = { authorization: `Bearer ${credential.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' };
+    // The reset-ticket grants come back only with ?cedar_ember=1 and Claude Code's client
+    // headers: the user-agent the relay learned from the live client, else a known-good one.
+    if (Date.now() >= (ticketsRefusedUntil.get(credential.accountId) ?? 0)) {
+      const agent = userAgent && /^claude-cli\//.test(userAgent) ? userAgent : TICKETS_USER_AGENT;
+      const response = await fetch(`${CLAUDE_USAGE_URL}?cedar_ember=1`, { headers: { ...headers, 'user-agent': agent, 'x-app': 'cli' }, signal: AbortSignal.timeout(15_000) });
+      // The tickets are extra: if that request form is refused (400/403/404), read the quota the
+      // plain way and stop asking for a while, so every poll does not cost two requests. Not on
+      // 401 (dead token), 429 (rate limited) or 5xx (outage): a second call there only adds load.
+      if (![400, 403, 404].includes(response.status)) {
+        if (!response.ok) throw await usageReadError(response);
+        return claudeUsageQuota(await response.json() as Parameters<typeof claudeUsageQuota>[0]);
+      }
+      await response.body?.cancel();
+      const plain = await fetch(CLAUDE_USAGE_URL, { headers, signal: AbortSignal.timeout(15_000) });
+      if (!plain.ok) throw await usageReadError(plain, `${response.status}, then ${plain.status}`);
+      // Only now is it the ticket form that was refused: the same token reads the plain form fine.
+      ticketsRefusedUntil.set(credential.accountId, Date.now() + TICKETS_RETRY_MS);
+      return claudeUsageQuota(await plain.json() as Parameters<typeof claudeUsageQuota>[0]);
+    }
+    const response = await fetch(CLAUDE_USAGE_URL, { headers, signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw await usageReadError(response);
+    return claudeUsageQuota(await response.json() as Parameters<typeof claudeUsageQuota>[0]);
   },
 };
 
@@ -356,6 +476,101 @@ export const codexProvider: Provider = {
     if (template.system) payload.instructions = template.system;
     return { url: `https://chatgpt.com/backend-api${template.path}`, headers, body: JSON.stringify(payload) };
   },
+  async fetchUsage(credential) {
+    const response = await fetch('https://chatgpt.com/backend-api/wham/usage', { headers: { authorization: `Bearer ${credential.accessToken}`, 'chatgpt-account-id': credential.accountId }, signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`Codex usage failed (${response.status})`);
+    return codexUsageQuota(await response.json() as Parameters<typeof codexUsageQuota>[0]);
+  },
 };
 
-export const providers: Record<'claude' | 'codex', Provider> = { claude: claudeProvider, codex: codexProvider };
+// The Grok CLI's public OAuth client (PKCE, no secret) — the key its auth.json
+// files the session under, and what a refresh must name.
+export const GROK_CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
+const GROK_UPSTREAM = 'https://cli-chat-proxy.grok.com';
+// 429 codes the Grok CLI itself treats as "plan spent" rather than "slow down".
+const GROK_QUOTA_CODES = /^(usage_limit_reached|usage_pool_exhausted|quota_exceeded|insufficient_quota)$/;
+
+// Grok's /v1/billing?format=credits, the read-out behind its /usage screen:
+// one weekly window as a percentage, with the period it belongs to. A period
+// with nothing used yet (a fresh week, or right after a plan upgrade) leaves
+// creditUsagePercent out entirely, so a known period without it reads as 0%.
+interface GrokBillingPeriod { start?: string | null; end?: string | null }
+export function grokUsageQuota(data: { config?: { creditUsagePercent?: number | null; currentPeriod?: GrokBillingPeriod | null; billingPeriodStart?: string | null; billingPeriodEnd?: string | null } | null }): QuotaSnapshot | null {
+  const config = data.config;
+  const start = timestamp(config?.currentPeriod?.start ?? config?.billingPeriodStart ?? null);
+  const end = timestamp(config?.currentPeriod?.end ?? config?.billingPeriodEnd ?? null);
+  const reported = config?.creditUsagePercent;
+  const percent = typeof reported === 'number' && Number.isFinite(reported) ? reported : reported == null && end !== null ? 0 : null;
+  if (percent === null) return null;
+  const usage = Math.max(0, Math.min(1, percent / 100));
+  const minutes = start !== null && end !== null && end > start ? Math.round((end - start) / 60_000) : null;
+  return { routingUsage: usage, routingResetsAt: end, windows: { weekly: { usage, resetsAt: end, minutes } } };
+}
+
+export const grokProvider: Provider = {
+  id: 'grok', label: 'Grok', upstreamBase: GROK_UPSTREAM,
+  // A relayed Grok CLI runs on an API key (the client token), which limits it
+  // to model listing and model calls; nothing else needs an account.
+  normalizePath(path) {
+    const { pathname, search } = new URL(path, 'http://localhost');
+    return ['/v1/responses', '/v1/chat/completions', '/v1/models'].includes(pathname) ? pathname + search : null;
+  },
+  buildHeaders(incoming, account) {
+    const headers = outboundHeaders(incoming);
+    headers.set('authorization', `Bearer ${account.credential.accessToken}`);
+    headers.set('x-xai-token-auth', 'xai-grok-cli');
+    return headers;
+  },
+  rewriteBody(body) { return body; },
+  // The conversation group is fixed for a Grok session; prompt_cache_key backs
+  // it up for a request that carries no header.
+  sessionKey(headers, body) {
+    const fromHeaders = sessionId(headers.get('x-grok-conv-group-id')) ?? sessionId(headers.get('x-grok-session-id'));
+    if (fromHeaders) return fromHeaders;
+    if (body.length === 0) return null;
+    try { return sessionId((JSON.parse(body.toString('utf8')) as Record<string, unknown>).prompt_cache_key); } catch { return null; }
+  },
+  // Responses carry only per-minute x-ratelimit-* figures, not the plan's
+  // weekly limit; that comes from fetchUsage.
+  readQuota() { return null; },
+  classifyFailure(status, headers, body) {
+    if (status === 401) return { kind: 'auth', retryAfterMs: 0 };
+    if (status === 403) return { kind: 'forbidden', retryAfterMs: 30 * 60_000 };
+    if (status === 429) {
+      let codes: string[] = [];
+      try { const parsed = JSON.parse(body); codes = [parsed?.error?.code, parsed?.error?.type, parsed?.code, parsed?.error_type].filter((v): v is string => typeof v === 'string'); } catch { codes = [body.trim()]; }
+      // A spent plan names no retry-after we have seen; an hour keeps the account
+      // benched without re-trying it every minute, and the usage sweep clears it
+      // as soon as the weekly window is read as reset.
+      return codes.some((code) => GROK_QUOTA_CODES.test(code)) ? { kind: 'quota', retryAfterMs: retryAfter(headers, 3_600_000) } : { kind: 'transient', retryAfterMs: retryAfter(headers) };
+    }
+    if (status >= 500) return { kind: 'transient', retryAfterMs: retryAfter(headers, 1_000) };
+    return { kind: 'fatal', retryAfterMs: 0 };
+  },
+  async refresh(credential: OAuthCredential) {
+    if (!credential.refreshToken) throw new Error('No Grok refresh token');
+    const data = await tokenRefresh('https://auth.x.ai/oauth2/token', 'application/x-www-form-urlencoded', new URLSearchParams({ grant_type: 'refresh_token', refresh_token: credential.refreshToken, client_id: GROK_CLIENT_ID }).toString());
+    return { ...credential, accessToken: String(data.access_token), refreshToken: typeof data.refresh_token === 'string' ? data.refresh_token : credential.refreshToken, expiresAt: expiry(data) };
+  },
+  async fetchUsage(credential) {
+    const response = await fetch(`${GROK_UPSTREAM}/v1/billing?format=credits`, { headers: { authorization: `Bearer ${credential.accessToken}`, 'x-xai-token-auth': 'xai-grok-cli' }, signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`Grok usage failed (${response.status})`);
+    return grokUsageQuota(await response.json() as Parameters<typeof grokUsageQuota>[0]);
+  },
+  async fetchProfile(credential) {
+    // xAI has no plan endpoint the CLI token can reach; the plan rides in the
+    // access token's numeric `tier` claim, fixed when the token was issued — so
+    // a plan change shows only once the token is next refreshed.
+    const part = credential.accessToken.split('.')[1];
+    let tier: string | null = null;
+    if (part) {
+      try {
+        const claims = JSON.parse(Buffer.from(part, 'base64url').toString()) as Record<string, unknown>;
+        if (typeof claims.tier === 'number' || typeof claims.tier === 'string') tier = String(claims.tier);
+      } catch { /* opaque token */ }
+    }
+    return { status: 'active', createdAt: null, rateLimitTier: tier, orgType: null, hasClaudeMax: null, hasClaudePro: null, fetchedAt: Date.now() };
+  },
+};
+
+export const providers: Record<ProviderId, Provider> = { claude: claudeProvider, codex: codexProvider, grok: grokProvider };

@@ -18,6 +18,22 @@ test('imports all OAuth accounts from TeamClaude config without modifying it', a
   assert.equal(await readFile(path, 'utf8'), fixture);
 });
 
+test('codex-multi-auth members of one workspace stay two accounts, keyed by their user', async () => {
+  const jwt = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  const token = (user: string): string => jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'workspace-shared', chatgpt_user_id: user } });
+  const dir = await mkdtemp(join(tmpdir(), 'teamai-codex-multi-auth-members-')); const path = join(dir, 'openai-codex-accounts.json');
+  await writeFile(path, JSON.stringify({ version: 1, accounts: [
+    { email: 'a@corp.com', accessToken: token('user-a'), refreshToken: 'ra', expiresAt: 1, accountId: 'workspace-shared' },
+    { email: 'b@corp.com', accessToken: token('user-b'), refreshToken: 'rb', expiresAt: 1, accountId: 'workspace-shared' },
+    { email: 'a@corp.com', accessToken: token('user-a'), refreshToken: 'ra2', expiresAt: 2, accountId: 'workspace-shared' },
+  ] }));
+  const imported = await importAuth('codex', path);
+  assert.deepEqual(imported.map((row) => [row.label, row.credential.accountId, row.credential.userId]), [
+    ['a@corp.com', 'workspace-shared', 'user-a'],
+    ['b@corp.com', 'workspace-shared', 'user-b'],
+  ], 'a second member is not dropped, and a repeated member is one account');
+});
+
 test('imports every codex-multi-auth account and preserves its selected workspace', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamai-codex-multi-auth-import-')); const path = join(dir, 'openai-codex-accounts.json');
   const fixture = JSON.stringify({
@@ -46,4 +62,47 @@ test('imports every codex-multi-auth account and preserves its selected workspac
   ]);
   assert.equal(imported[0]?.credential.refreshToken, 'refresh-one');
   assert.equal(await readFile(path, 'utf8'), fixture);
+});
+
+test('imports the Codex user alongside the workspace so workspace members stay distinct', async () => {
+  const jwt = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  const dir = await mkdtemp(join(tmpdir(), 'teamai-import-')); const path = join(dir, 'auth.json');
+  await writeFile(path, JSON.stringify({ tokens: {
+    access_token: jwt({ exp: 100, 'https://api.openai.com/auth': { chatgpt_account_id: 'workspace', chatgpt_user_id: 'user-b' } }),
+    id_token: jwt({ email: 'b@corp.com', sub: 'auth0|b', 'https://api.openai.com/auth': { chatgpt_account_id: 'workspace' } }),
+    refresh_token: 'refresh', account_id: 'workspace',
+  } }));
+  const [imported] = await importAuth('codex', path);
+  assert.equal(imported?.label, 'b@corp.com');
+  assert.equal(imported?.credential.accountId, 'workspace'); assert.equal(imported?.credential.userId, 'user-b');
+});
+
+test('a Claude credential carries its organization, and a Team seat says so in its label', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamai-claude-import-'));
+  const original = globalThis.fetch; t.after(() => { globalThis.fetch = original; });
+  let type = 'claude_team';
+  globalThis.fetch = (async () => new Response(JSON.stringify({ account: { uuid: 'person', email: 'me@corp.com' }, organization: { uuid: `org-${type}`, organization_type: type } }))) as typeof fetch;
+  const file = join(dir, 'credentials.json');
+  await writeFile(file, JSON.stringify({ claudeAiOauth: { accessToken: 'token', refreshToken: 'refresh', expiresAt: 1 } }));
+  const [team] = await importAuth('claude', file);
+  assert.equal(team?.label, 'me@corp.com (Team)'); assert.equal(team?.credential.organizationId, 'org-claude_team'); assert.equal(team?.credential.accountId, 'person');
+  type = 'claude_max';
+  const [personal] = await importAuth('claude', file);
+  assert.equal(personal?.label, 'me@corp.com'); assert.equal(personal?.credential.organizationId, 'org-claude_max');
+});
+
+test('imports the xAI sign-in from a Grok auth.json without modifying it, and skips others', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamai-grok-')); const path = join(dir, 'auth.json');
+  const fixture = JSON.stringify({
+    'https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828': { key: 'access-grok', refresh_token: 'refresh-grok', expires_at: '2026-11-20T07:04:11.917164Z', user_id: 'user-1', email: 'g@example.com', auth_mode: 'oidc' },
+    'https://acme.okta.com::client': { key: 'sso-token', user_id: 'sso-user', email: 'corp@example.com' },
+  });
+  await writeFile(path, fixture);
+  const [result, ...rest] = await importAuth('grok', path);
+  assert.equal(rest.length, 0);
+  assert.equal(result!.label, 'g@example.com');
+  assert.deepEqual(result!.credential, { accessToken: 'access-grok', refreshToken: 'refresh-grok', expiresAt: Date.parse('2026-11-20T07:04:11.917Z'), accountId: 'user-1' });
+  assert.equal(await readFile(path, 'utf8'), fixture);
+  await writeFile(path, JSON.stringify({ 'https://acme.okta.com::client': { key: 'k', user_id: 'u' } }));
+  await assert.rejects(importAuth('grok', path), /No Grok sign-in/);
 });

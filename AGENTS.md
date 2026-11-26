@@ -7,18 +7,27 @@ the two seem to differ, and report the discrepancy.
 
 ## What TeamAI is
 
-A local relay that fronts **Claude Code** and the official **Codex CLI** with a
-pool of the user's own subscription accounts, retrying on another account when
-one is out of quota. It is not an API gateway and holds no keys of its own.
+A local relay that fronts **Claude Code**, the official **Codex CLI** and the
+official **Grok CLI** with a pool of the user's own subscription accounts,
+retrying on another account when one is out of quota. It is not an API gateway and holds no keys of its own.
 
 ## Install
 
-Run from the repository root. The script is idempotent — safe to re-run.
+Run from the repository root. The scripts are idempotent — safe to re-run.
 
 ```bash
 ./scripts/install.sh --with-shell     # non-interactive; adds cl/co/tai to ~/.zshrc
 ./scripts/install.sh --no-shell       # leaves the user's rc file untouched
 ./scripts/install.sh --dry-run        # prints the plan, changes nothing
+```
+
+On Windows (works under any PowerShell execution policy):
+
+```powershell
+scripts\install.cmd                   # build, npm link, verify in a new session
+scripts\install.cmd -UserBin          # link into %LOCALAPPDATA%\TeamAI\bin instead
+scripts\install.cmd -DryRun
+scripts\install.cmd -Uninstall
 ```
 
 `--with-shell` writes to `~/.zshrc`. It backs the file up first and rewrites a
@@ -45,7 +54,9 @@ command -v teamai && teamai help >/dev/null && echo INSTALL_OK
 | Symptom | Cause | Action |
 | --- | --- | --- |
 | `Node 20+ required` | Node too old | Install Node 20+. Do not patch `engines`. |
-| `npm link` fails with `EACCES` | Global prefix not user-owned | `npm config set prefix ~/.npm-global`, add `~/.npm-global/bin` to PATH, retry. Do not use `sudo` unless the user approves it. |
+| `npm link` fails with `EACCES` | Global prefix not user-owned | The installers fall back on their own (`~/.local/bin`, `%LOCALAPPDATA%\TeamAI\bin`). After `--no-shell`, tell the user to add `~/.local/bin` to PATH. Do not use `sudo` unless the user approves it. |
+| PowerShell: `tax` cannot be loaded, running scripts is disabled | npm's `.ps1` shim under the Restricted policy | Re-run `scripts\install.cmd` (it removes the TeamAI `.ps1` shims when the policy blocks them), or `scripts\install.cmd -Ps1Shims remove`. Do not change the execution policy for the user. |
+| `warning: port 3456 is already used` | Another relay (often TeamClaude) holds the Claude port | Ask the user to stop it (`teamclaude stop`), or change `proxy.claudePort`. |
 | `teamai: command not found` after linking | npm bin dir not on PATH | Print `npm bin -g`, tell the user to add it to PATH. |
 | Build fails | Toolchain mismatch | Run `npm run typecheck` and report the output. Do not edit `tsconfig.json` to force it through. |
 
@@ -55,14 +66,7 @@ Login is interactive and opens a browser. **An agent cannot complete it.** Hand
 this to the user rather than attempting it:
 
 ```bash
-teamai login      # prompts: [1] Claude  [2] Codex
-```
-
-Linking a cloud key is non-interactive and never needs the key on the command line:
-
-```bash
-teamai cloud link --from-teamclaude ~/.config/teamclaude.json
-teamai cloud pull
+teamai login      # prompts: [1] Claude  [2] Codex  [3] Grok
 ```
 
 Import is non-interactive, but only works when an exportable credential file
@@ -72,6 +76,8 @@ exists (recent Claude Code versions use the macOS Keychain instead):
 teamai import claude --from ~/.config/teamclaude.json
 teamai import codex
 teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json --dry-run
+
+teamai import grok     # shares ~/.grok's refresh token; prefer login for a pooled account
 ```
 
 `import` never modifies the source files.
@@ -80,6 +86,7 @@ teamai import codex --from ~/.codex/multi-auth/openai-codex-accounts.json --dry-
 
 ```bash
 teamai status                             # server state + accounts; use this to check health
+teamai usage --json                       # quota per account/window as JSON; live, spends no quota
 teamai accounts [claude|codex]            # accounts only
 teamai start                              # start relay + open dashboard (needs a TTY)
 teamai stop
@@ -88,10 +95,10 @@ teamai server                             # run relay in the foreground (for a s
 teamai supervise                          # run relay with authenticated health recovery
 teamai tui                                # dashboard only (needs a TTY)
 teamai codex-app bind|unbind|status       # manage Codex App routing
-teamai cloud pull|push|status|unlink       # share accounts via TeamClaude Cloud
 teamai enable  <claude|codex> <account>
 teamai disable <claude|codex> <account>
 teamai priority <claude|codex> <account> <rank|auto>
+teamai fable-only claude <account> on|off   # Fable first; no other model while its Fable window has budget
 teamai capture [--redact partial|full|none] [--out DIR]   # dashboard → .txt + .png; no TTY needed
 ```
 
@@ -110,6 +117,12 @@ headlessly and writes it to `$TEAMAI_HOME/captures/` as `.txt` (colors kept)
 and `.png`, printing both paths. Account addresses are masked by default
 (`--redact partial`); `--redact full` numbers them, `--redact none` keeps them.
 Read the `.txt` for the data; never try to read the live TUI instead.
+
+For quota figures, prefer `teamai usage --json` over a capture: it is the
+same data as structured JSON (`source` is `live` when the server answered,
+`state` when it fell back to `state.json`). Over HTTP it is `GET /usage` on
+the control port with the client token; see the README section "Checking
+usage from other sessions and scripts".
 
 ### Launching sessions
 
@@ -143,9 +156,10 @@ before speculating; a port conflict is the common cause.
 | `src/runtime.ts` | Server lifecycle, warmup timer, profile refresh |
 | `src/account-pool.ts` | Selection order, quota windows, warmup probes |
 | `src/proxy.ts` | Request relaying and retry-on-another-account |
-| `src/providers.ts` | Claude/Codex specifics: headers, quota parsing, refresh |
+| `src/providers.ts` | Claude/Codex/Grok specifics: headers, quota parsing, refresh |
 | `src/frame.ts` | The dashboard as text: display order, gauges, the frame builder both the TUI and capture draw through |
 | `src/tui.ts` | Interactive loop and key handling |
+| `src/usage.ts` | `teamai usage` / `GET /usage`: the quota report as JSON or a table, masked like captures |
 | `src/capture.ts` | `teamai capture` / the `p` key: redact, build the frame, write `.txt` + `.png` |
 | `src/redact.ts` | Account-address masking (partial / full / none), applied to data before drawing |
 | `src/png.ts` | Dependency-free PNG encoder (own CRC-32: `zlib.crc32` is Node 22.2+) and SGR-to-pixel renderer |
@@ -153,8 +167,6 @@ before speculating; a port conflict is the common cause.
 | `src/storage.ts` | Config/state persistence, paths |
 | `src/auth.ts` | Login and credential import |
 | `src/codex-app.ts` | Reversible Codex App config binding |
-| `src/cloud-sync.ts` | TeamClaude Cloud client and the refresh coordinator (adopt newer, publish after rotating, recover a refused refresh) |
-| `src/cloud-fleet.ts` | Periodic token sync, `teamai cloud pull` / `push` |
 | `src/supervisor.ts` | Health-based relay process supervision |
 | `test/` | `node --test` suites |
 
@@ -171,10 +183,13 @@ npm run typecheck && npm test && npm run lint && npm run build
 
 - **Do not commit `dist/`.** It is gitignored and built on install.
 - **Do not weaken the loopback bind** or the generated client token.
-- **Do not log, echo, or copy credentials** from `$TEAMAI_HOME`, `~/.claude`, or
-  `~/.codex` into any output, test fixture, or commit.
-- **Do not touch the user's `~/.codex`.** Relayed sessions use an isolated Codex
-  home; keep it that way.
+- **Do not log, echo, or copy credentials** from `$TEAMAI_HOME`, `~/.claude`,
+  `~/.codex` or `~/.grok` into any output, test fixture, or commit.
+- **Do not touch the user's `~/.codex` or `~/.grok`.** Relayed sessions use an
+  isolated Codex home and Grok home; keep it that way.
+- **Do not add a Gemini / Antigravity provider.** Antigravity's terms forbid
+  proxying its subscription quota and it has no supported endpoint override;
+  see the README's "Scope and compliance".
 - **Do not edit `~/.zshrc` directly.** Use `scripts/install-shell.sh`, which
   backs up and rewrites its marked block.
 - **Keep the README and the code in agreement.** If you change quota ordering,

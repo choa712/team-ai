@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { claudeProvider, codexProvider } from '../src/providers.js';
-import type { RuntimeAccount } from '../src/types.js';
+import { claudeProvider, claudeResetCredits, claudeUsageQuota, codexProvider, codexUsageQuota, grokProvider, grokUsageQuota } from '../src/providers.js';
+import { resetTickets } from '../src/frame.js';
+import type { ResetCredits, RuntimeAccount } from '../src/types.js';
 
 const account = { id: 'acct', provider: 'codex', label: 'a', enabled: true, priority: null, credentialId: 'c', createdAt: '', credential: { accessToken: 'secret', refreshToken: null, expiresAt: null, accountId: 'account-1' }, usage: null, resetsAt: null, cooldownUntil: null, lastUsed: null, error: null, inflight: 0 } as RuntimeAccount;
 
@@ -201,4 +202,198 @@ test('Claude Code names its session in a header, or inside metadata.user_id when
   assert.equal(claudeProvider.sessionKey!(new Headers(), body), 'sess-7');
   assert.equal(claudeProvider.sessionKey!(new Headers(), Buffer.from('{"model":"x"}')), null);
   assert.equal(claudeProvider.sessionKey!(new Headers({ 'x-claude-code-session-id': 'x'.repeat(500) }), Buffer.alloc(0))?.length, 200);
+});
+
+test('reads Claude /api/oauth/usage limits into the header window names', () => {
+  // Shape captured from a live Max account (2026-09-29).
+  const quota = claudeUsageQuota({
+    five_hour: { utilization: 18, resets_at: '2026-09-29T10:30:00+00:00' },
+    seven_day: { utilization: 80, resets_at: '2026-10-01T18:00:00+00:00' },
+    limits: [
+      { kind: 'session', percent: 18, resets_at: '2026-09-29T10:30:00+00:00', scope: null },
+      { kind: 'weekly_all', percent: 80, resets_at: '2026-10-01T18:00:00+00:00', scope: null },
+      { kind: 'weekly_scoped', percent: 12, resets_at: '2026-10-01T18:00:00+00:00', scope: { model: { display_name: 'Fable' } } },
+    ],
+  });
+  assert.equal(quota?.windows['5h']?.usage, 0.18);
+  assert.equal(quota?.windows['7d']?.usage, 0.8);
+  assert.equal(quota?.windows['7d_oi']?.usage, 0.12);
+  assert.equal(quota?.windows['7d_oi']?.resetsAt, Date.parse('2026-10-01T18:00:00+00:00'));
+  assert.equal(quota?.routingUsage, 0.8);
+});
+
+test('falls back to the legacy Claude usage fields when limits is absent', () => {
+  const quota = claudeUsageQuota({ five_hour: { utilization: 5, resets_at: null }, seven_day: { utilization: 40, resets_at: '2026-10-01T18:00:00Z' } });
+  assert.equal(quota?.windows['5h']?.usage, 0.05);
+  assert.equal(quota?.windows['7d']?.usage, 0.4);
+  assert.equal(quota?.windows['7d_oi'], undefined);
+  assert.equal(claudeUsageQuota({}), null);
+});
+
+test('reads Codex /wham/usage windows with their length in minutes', () => {
+  const quota = codexUsageQuota({ rate_limit: { primary_window: { used_percent: 21, limit_window_seconds: 604800, reset_after_seconds: 379997, reset_at: 1791047442 }, secondary_window: null } });
+  assert.deepEqual(quota?.windows.primary, { usage: 0.21, resetsAt: 1791047442000, minutes: 10080 });
+  assert.equal(quota?.windows.secondary, undefined);
+  assert.equal(quota?.routingUsage, 0.21);
+  assert.equal(codexUsageQuota({ rate_limit: null }), null);
+});
+
+test('claude readQuota ignores a window whose headers carry no figure', () => {
+  const quota = claudeProvider.readQuota(new Headers({ 'anthropic-ratelimit-unified-5h-status': 'allowed', 'anthropic-ratelimit-unified-5h-reset': '', 'anthropic-ratelimit-unified-7d-utilization': '0.4', 'anthropic-ratelimit-unified-7d-reset': String(Math.floor(Date.now() / 1000) + 86_400) }));
+  assert.equal(quota?.windows['5h'], undefined);
+  assert.equal(quota?.windows['7d']?.usage, 0.4);
+  assert.equal(quota?.routingUsage, 0.4);
+});
+
+// counts only: readAt is the read time, checked on its own
+const counts = (c: ResetCredits | null | undefined) => c && { general: c.general, fable: c.fable, nextExpiry: c.nextExpiry };
+
+test('Claude reset tickets: whole-week vs Fable-only by `clears`, paused and used-up grants skipped', () => {
+  const grant = (clears: string[], extra: Record<string, unknown> = {}) => ({ id: 'g', label: 'x', clears, resets_left: 1, usable_now: true, paused: false, ends_at: '2027-03-09T07:59:00+00:00', ...extra });
+  const data = {
+    limits: [{ kind: 'weekly_all', percent: 10, resets_at: '2026-11-21T05:00:00+00:00' }],
+    cedar_ember: {
+      eligible: true,
+      grants: [
+        grant(['seven_day', 'seven_day_overage_included'], { ends_at: '2026-12-10T22:00:00+00:00' }),
+        grant(['seven_day_overage_included']),
+        grant(['seven_day_overage_included']),
+        grant(['seven_day_overage_included'], { resets_left: 2 }),
+        grant(['seven_day_overage_included'], { paused: true }),
+        grant(['seven_day'], { resets_left: 0 }),
+        null,
+      ],
+    },
+  };
+  assert.deepEqual(counts(claudeResetCredits(data)), { general: 1, fable: 4, nextExpiry: Date.parse('2026-12-10T22:00:00+00:00') });
+  assert.deepEqual(counts(claudeUsageQuota(data)?.resetCredits), { general: 1, fable: 4, nextExpiry: Date.parse('2026-12-10T22:00:00+00:00') });
+  // no cedar_ember in the response → the snapshot leaves the last reading alone
+  assert.equal('resetCredits' in (claudeUsageQuota({ limits: data.limits }) ?? {}), false);
+  assert.deepEqual(counts(claudeResetCredits({ cedar_ember: { eligible: true, grants: [] } })), { general: 0, fable: 0, nextExpiry: null });
+  assert.equal(resetTickets({ general: 1, fable: 3 }), 'R1 F3');
+  assert.equal(resetTickets({ general: 0, fable: 2 }), 'F2');
+  assert.equal(resetTickets({ general: 0, fable: 0 }), '');
+});
+
+test('Claude reset tickets: expired, unknown windows and lost eligibility are not counted', () => {
+  const g = (clears: string[], ends_at: string) => ({ id: 'g', clears, resets_left: 1, paused: false, ends_at });
+  const past = '2020-01-01T00:00:00+00:00'; const future = '2099-01-01T00:00:00+00:00';
+  assert.deepEqual(counts(claudeResetCredits({ cedar_ember: { eligible: true, grants: [g(['seven_day'], past), g(['five_hour'], future), g([], future), g(['seven_day_overage_included'], future)] } })), { general: 0, fable: 1, nextExpiry: Date.parse(future) });
+  assert.deepEqual(counts(claudeResetCredits({ cedar_ember: { eligible: false, grants: [g(['seven_day'], future)] } })), { general: 0, fable: 0, nextExpiry: null });
+  assert.deepEqual(counts(claudeResetCredits({ cedar_ember: { eligible: true } })), { general: 0, fable: 0, nextExpiry: null });
+  assert.equal(claudeResetCredits({}), null);
+  const read = claudeResetCredits({ cedar_ember: { eligible: true, grants: [] } });
+  assert.ok(read?.readAt && Math.abs(read.readAt - Date.now()) < 5_000);
+});
+
+test('Claude fetchUsage asks for tickets with the live UA, never retries 401/429/5xx, and stops asking once the form is refused', async () => {
+  const realFetch = globalThis.fetch;
+  const calls: Array<{ url: string; ua: string | null; app: string | null }> = [];
+  let statuses: number[] = [];
+  globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    calls.push({ url: String(input), ua: headers.get('user-agent'), app: headers.get('x-app') });
+    const status = statuses.shift() ?? 200;
+    const body = status === 200 ? { limits: [{ kind: 'weekly_all', percent: 40, resets_at: '2099-01-01T00:00:00Z' }], cedar_ember: { eligible: true, grants: [{ id: 'g', clears: ['seven_day_overage_included'], resets_left: 1, ends_at: '2099-01-01T00:00:00Z' }] } } : {};
+    return new Response(JSON.stringify(body), { status });
+  }) as typeof fetch;
+  const credFor = (accountId: string) => ({ accessToken: 't', refreshToken: null, expiresAt: Date.now() + 60_000, accountId }) as never;
+  const cred = credFor('acct-main');
+  const tickets = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1'; const plain = 'https://api.anthropic.com/api/oauth/usage';
+  try {
+    // no live client seen yet: the known-good CLI user-agent
+    const ok = await claudeProvider.fetchUsage!(cred);
+    assert.deepEqual(calls.map((c) => c.url), [tickets]);
+    assert.match(calls[0]?.ua ?? '', /^claude-cli\//); assert.equal(calls[0]?.app, 'cli');
+    assert.deepEqual(counts(ok?.resetCredits), { general: 0, fable: 1, nextExpiry: Date.parse('2099-01-01T00:00:00Z') });
+    // the live client's user-agent wins; a non-CLI one does not
+    calls.length = 0; await claudeProvider.fetchUsage!(cred, 'claude-cli/9.9.9 (external, cli)');
+    assert.equal(calls[0]?.ua, 'claude-cli/9.9.9 (external, cli)');
+    calls.length = 0; await claudeProvider.fetchUsage!(cred, 'curl/8');
+    assert.match(calls[0]?.ua ?? '', /^claude-cli\/2\./);
+    for (const status of [401, 429, 503]) {
+      calls.length = 0; statuses = [status];
+      await assert.rejects(claudeProvider.fetchUsage!(cred), new RegExp(`\\(${status}\\)`));
+      assert.deepEqual(calls.map((c) => c.url), [tickets]);
+    }
+    // refused form: the plain read answers, and later polls skip the ticket form
+    calls.length = 0; statuses = [400, 200];
+    const fallback = await claudeProvider.fetchUsage!(cred);
+    assert.deepEqual(calls.map((c) => c.url), [tickets, plain]);
+    assert.equal(fallback?.windows['7d']?.usage, 0.4);
+    calls.length = 0; await claudeProvider.fetchUsage!(cred);
+    assert.deepEqual(calls.map((c) => c.url), [plain]);
+    // that refusal was this account's: another account still asks for tickets
+    calls.length = 0; await claudeProvider.fetchUsage!(credFor('acct-other'));
+    assert.deepEqual(calls.map((c) => c.url), [tickets]);
+    // the plain read failing too means a bad token, not a refused form: no back-off
+    const broken = credFor('acct-broken');
+    calls.length = 0; statuses = [403, 403];
+    await assert.rejects(claudeProvider.fetchUsage!(broken), /\(403, then 403\)/);
+    calls.length = 0; await claudeProvider.fetchUsage!(broken);
+    assert.deepEqual(calls.map((c) => c.url), [tickets]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('Grok provider relays only model paths and swaps the client key for the account token', () => {
+  assert.equal(grokProvider.normalizePath('/v1/responses'), '/v1/responses');
+  assert.equal(grokProvider.normalizePath('/v1/models?x=1'), '/v1/models?x=1');
+  assert.equal(grokProvider.normalizePath('/v1/billing?format=credits'), null);
+  assert.equal(grokProvider.normalizePath('/v1/traces'), null);
+  const grokAccount = { ...account, provider: 'grok' } as RuntimeAccount;
+  const headers = grokProvider.buildHeaders(new Headers({ authorization: 'Bearer tai-client', 'x-xai-token-auth': 'xai-grok-cli', cookie: 'private', 'x-grok-conv-group-id': 'g1' }), grokAccount);
+  assert.equal(headers.get('authorization'), 'Bearer secret'); assert.equal(headers.get('x-xai-token-auth'), 'xai-grok-cli'); assert.equal(headers.has('cookie'), false); assert.equal(headers.get('x-grok-conv-group-id'), 'g1');
+});
+
+test('Grok provider keys a session by its conversation group, then prompt_cache_key', () => {
+  assert.equal(grokProvider.sessionKey!(new Headers({ 'x-grok-conv-group-id': 'group-1', 'x-grok-session-id': 's' }), Buffer.alloc(0)), 'group-1');
+  assert.equal(grokProvider.sessionKey!(new Headers({ 'x-grok-session-id': '' }), Buffer.from('{"prompt_cache_key":"cache-1"}')), 'cache-1');
+  assert.equal(grokProvider.sessionKey!(new Headers(), Buffer.from('not json')), null);
+});
+
+test('Grok failures: plan-spent 429s bench the account, others are transient', () => {
+  assert.equal(grokProvider.classifyFailure(401, new Headers(), '').kind, 'auth');
+  const spent = grokProvider.classifyFailure(429, new Headers(), '{"error":{"code":"usage_limit_reached"}}');
+  assert.equal(spent.kind, 'quota'); assert.equal(spent.retryAfterMs, 3_600_000);
+  assert.equal(grokProvider.classifyFailure(429, new Headers({ 'retry-after': '120' }), '{"error_type":"usage_pool_exhausted"}').retryAfterMs, 120_000);
+  assert.equal(grokProvider.classifyFailure(429, new Headers(), '{"error":{"code":"rate_limited"}}').kind, 'transient');
+  assert.equal(grokProvider.classifyFailure(503, new Headers(), '').kind, 'transient');
+  assert.equal(grokProvider.readQuota(new Headers({ 'x-ratelimit-remaining-requests': '1' })), null);
+});
+
+test('grokUsageQuota reads the weekly window from /v1/billing', () => {
+  const quota = grokUsageQuota({ config: { creditUsagePercent: 94, currentPeriod: { start: '2026-11-16T01:47:27.026512+00:00', end: '2026-11-23T01:47:27.026512+00:00' } } });
+  assert.equal(quota?.routingUsage, 0.94);
+  assert.equal(quota?.windows.weekly?.resetsAt, Date.parse('2026-11-23T01:47:27.026Z'));
+  assert.equal(quota?.windows.weekly?.minutes, 10080);
+  assert.equal(grokUsageQuota({ config: { creditUsagePercent: 140 } })?.routingUsage, 1);
+  // Nothing used yet: the percent is left out, the period is not.
+  const fresh = grokUsageQuota({ config: { currentPeriod: { start: '2026-11-18T11:50:46.079+00:00', end: '2026-11-25T11:50:46.079+00:00' }, billingPeriodStart: '2026-11-18T11:50:46.079+00:00', billingPeriodEnd: '2026-11-25T11:50:46.079+00:00' } });
+  assert.equal(fresh?.routingUsage, 0);
+  assert.equal(fresh?.windows.weekly?.resetsAt, Date.parse('2026-11-25T11:50:46.079Z'));
+  assert.equal(grokUsageQuota({ config: { billingPeriodEnd: '2026-11-25T11:50:46.079+00:00' } })?.routingUsage, 0);
+  assert.equal(grokUsageQuota({ config: {} }), null);
+  assert.equal(grokUsageQuota({}), null);
+});
+
+test('Grok profile: the plan is the access token\'s tier claim', async () => {
+  const token = (claims: Record<string, unknown>) => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  const cred = (accessToken: string) => ({ accessToken, refreshToken: null, expiresAt: null, accountId: 'a' });
+  assert.equal((await grokProvider.fetchProfile!(cred(token({ tier: 1 })))).rateLimitTier, '1');
+  assert.equal((await grokProvider.fetchProfile!(cred(token({ sub: 'x' })))).rateLimitTier, null);
+  assert.equal((await grokProvider.fetchProfile!(cred('opaque'))).rateLimitTier, null);
+});
+
+test('Claude: a 403 naming the organization OAuth block is blocked, any other 403 forbidden; a blocked usage read says so', async () => {
+  const blockedBody = '{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}}}';
+  assert.equal(claudeProvider.classifyFailure(403, new Headers(), blockedBody).kind, 'blocked');
+  assert.equal(claudeProvider.classifyFailure(403, new Headers(), '{"error":{"type":"permission_error"}}').kind, 'forbidden');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(blockedBody, { status: 403 })) as typeof fetch;
+  try {
+    const cred = { accessToken: 't', refreshToken: null, expiresAt: Date.now() + 60_000, accountId: 'acct-blocked' } as never;
+    await assert.rejects(claudeProvider.fetchUsage!(cred), (error: { status?: number; blocked?: boolean; message?: string }) => error.status === 403 && error.blocked === true && /\(403, then 403\)/.test(error.message ?? ''));
+  } finally { globalThis.fetch = realFetch; }
 });

@@ -1,8 +1,26 @@
-import type { OAuthCredential, PersistedState, ProbeTemplate, Provider, RuntimeAccount, Shortfall, StoredAccount } from './types.js';
+import { subscriptionHealthy, type LiveAccountStatus, type OAuthCredential, type PersistedState, type ProbeTemplate, type Provider, type QuotaSnapshot, type RefreshErrorKind, type RefreshSweep, type RuntimeAccount, type Shortfall, type StoredAccount } from './types.js';
 
 // An empty exclusion set, for judging an account on its own merits rather than
 // on what one request has already tried.
 const NO_EXCLUSIONS = new Set<string>();
+
+// fetch rejects with a TypeError when no response arrived at all (DNS, connect,
+// reset) and with a TimeoutError when its signal timed out; an HTTP refusal
+// is an ordinary Error thrown by the provider after reading the status.
+// No verdict on the token: the endpoint never answered, or answered that it
+// is overloaded or down (429, 5xx). Only a 4xx refusal says the token is dead.
+function isUnreachable(error: unknown): boolean {
+  const e = error as { name?: string; status?: number } | null;
+  return error instanceof TypeError || e?.name === 'TimeoutError' || e?.name === 'AbortError' || e?.status === 429 || (e?.status ?? 0) >= 500;
+}
+function networkCause(error: unknown): string { const e = error as { message?: string; cause?: { code?: string } } | null; return e?.cause?.code || e?.message || String(error); }
+// Why a usage read failed, short enough for the dashboard's age column: the
+// HTTP status when upstream answered, otherwise what the network said.
+function readFailure(error: unknown): string {
+  const e = error as { name?: string; status?: number } | null;
+  if (typeof e?.status === 'number') return String(e.status);
+  return e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'timeout' : networkCause(error);
+}
 
 export class AccountPool {
   readonly accounts: RuntimeAccount[];
@@ -13,10 +31,7 @@ export class AccountPool {
   readonly maxWarmupTries = 3;
   private refreshes = new Map<string, Promise<void>>();
   private sweepInFlight = false;
-  // Replaces a plain rotation when the accounts are shared with other machines
-  // (see cloud-sync.ts): the hook decides whether to rotate at all and publishes
-  // what it rotated. Null keeps the local-only behaviour.
-  refreshVia: ((account: RuntimeAccount, rotate: (credential: OAuthCredential) => Promise<OAuthCredential>) => Promise<OAuthCredential>) | null = null;
+  private usageRead: Promise<unknown> | null = null;
 
   // Accounts still holding Fable budget are kept for Fable. An account measured
   // below this line reserves its remainder; at or above it, it is the preferred
@@ -37,7 +52,7 @@ export class AccountPool {
       // retry-after came back to park seven accounts across restarts. If the
       // account really is spent, the next request re-derives the right cooldown
       // (model-quota → Fable only, real quota → whole account).
-      return { ...account, credential: credentials[account.credentialId]!, usage: saved?.usage ?? null, resetsAt: saved?.resetsAt ?? null, windows: saved?.windows ?? {}, profile: saved?.profile ?? null, cooldownUntil: null, cooldownReason: null, lastUsed: saved?.lastUsed ?? null, error: null, inflight: 0 };
+      return { ...account, credential: credentials[account.credentialId]!, usage: saved?.usage ?? null, resetsAt: saved?.resetsAt ?? null, windows: saved?.windows ?? {}, profile: saved?.profile ?? null, measuredAt: saved?.measuredAt ?? null, resetCredits: saved?.resetCredits ?? null, cooldownUntil: null, cooldownReason: null, lastUsed: saved?.lastUsed ?? null, error: null, errorKind: null, inflight: 0 };
     });
     // Restore the probe shape learned last run so warm-up and R work on a fresh
     // idle proxy, instead of falling back to a hardcoded client version.
@@ -159,14 +174,23 @@ export class AccountPool {
     const limit = lastResort ? 1 : this.threshold;
     if (!(account.enabled && !account.error && !excluded.has(account.id) && (!account.cooldownUntil || account.cooldownUntil <= now) && (account.usage === null || account.usage < limit))) return false;
     if (wantsFable && AccountPool.fableSpent(account, 1)) return false;
+    if (this.keptForFable(account, wantsFable)) return false;
     return true;
+  }
+
+  // A fable-only account turns away every other model while it still has Fable
+  // budget. Fable is at most half of the weekly limit, so once its Fable window
+  // is spent the rest of its week would sit idle: it then serves other models.
+  // Only a provider with a Fable tier honours the flag (Codex never asks for Fable).
+  private keptForFable(account: RuntimeAccount, wantsFable: boolean): boolean {
+    return !wantsFable && account.fableOnly === true && Boolean(this.provider.fableModel) && !AccountPool.fableSpent(account, 1);
   }
 
   // acquire returned nothing but at least one account is otherwise healthy and
   // merely at its concurrency cap: the request should be told to retry, not that
   // the fleet is out of quota.
-  saturatedButHealthy(excluded: Set<string> = new Set()): boolean {
-    return this.accounts.some((a) => this.availableIgnoringConcurrency(a, excluded, true, true) && this.atConcurrencyCap(a));
+  saturatedButHealthy(excluded: Set<string> = new Set(), wantsFable = true): boolean {
+    return this.accounts.some((a) => this.availableIgnoringConcurrency(a, excluded, wantsFable, true) && this.atConcurrencyCap(a));
   }
 
   // Why acquire() just came back empty, worded for the client that is about
@@ -176,32 +200,35 @@ export class AccountPool {
   // (other models still work), and the earliest moment anything rolls over.
   explainShortfall(excluded: Set<string>, wantsFable: boolean): Shortfall {
     const label = this.provider.label;
-    if (this.saturatedButHealthy(excluded)) {
+    if (this.saturatedButHealthy(excluded, wantsFable)) {
       return { reason: 'concurrency_saturated', retryAfterMs: 5_000, message: `Every ${label} account with budget left is at its concurrency cap (${this.maxConcurrent} requests in flight each). Retry in a few seconds.` };
     }
     const now = Date.now();
     const live = this.accounts.filter((a) => a.enabled && !a.error && !excluded.has(a.id));
     const resets: Array<{ at: number; label: string }> = [];
-    let fableSpent = 0; let overLimit = 0; let coolingDown = 0; let benched = 0;
+    let fableSpent = 0; let overLimit = 0; let coolingDown = 0; let benched = 0; let keptForFable = 0;
     const benches: number[] = [];
     for (const account of live) {
       const fable = AccountPool.fableWindow(account);
       if (wantsFable && AccountPool.fableSpent(account, 1)) { fableSpent++; if (fable?.resetsAt) resets.push({ at: fable.resetsAt, label: `${account.label} Fable weekly` }); continue; }
-      if (account.usage !== null && account.usage >= 1) { overLimit++; if (account.resetsAt) resets.push({ at: account.resetsAt, label: `${account.label} session` }); continue; }
+      if (account.usage !== null && account.usage >= 1) { overLimit++; if (account.resetsAt) resets.push({ at: account.resetsAt, label: `${account.label} usage limit` }); continue; }
       if (account.cooldownUntil && account.cooldownUntil > now) {
         // A network bench is not a rejection: one connection attempt failed
         // and the account is back in seconds. Counted apart, so the client is
         // told to wait rather than that its budget is gone — that wording sent
         // Codex (which does not retry a 429 under the relay) home for nothing.
         if (account.cooldownReason === 'network') { benched++; benches.push(account.cooldownUntil); continue; }
-        coolingDown++; resets.push({ at: account.cooldownUntil, label: `${account.label} cooldown` });
+        coolingDown++; resets.push({ at: account.cooldownUntil, label: `${account.label} cooldown` }); continue;
       }
+      // its Fable reset frees nothing for this request, so it is not offered as a reset time
+      if (this.keptForFable(account, wantsFable)) keptForFable++;
     }
     const parts: string[] = [];
     if (benched) parts.push(`${benched} paused after a connection failure`);
     if (fableSpent) parts.push(`${fableSpent} spent the Fable weekly budget`);
-    if (overLimit) parts.push(`${overLimit} used up the session window`);
+    if (overLimit) parts.push(`${overLimit} used up the usage limit`);
     if (coolingDown) parts.push(`${coolingDown} cooling down after an upstream rejection`);
+    if (keptForFable) parts.push(`${keptForFable} kept for Fable only`);
     const detail = parts.length ? ` (${live.length} accounts: ${parts.join(', ')})` : ` (${live.length} accounts)`;
     if (benched) {
       const retryAfterMs = Math.max(1, Math.min(...benches) - now);
@@ -251,8 +278,13 @@ export class AccountPool {
     // every Opus and Haiku turn ahead of a spare whose Fable was already
     // spent, burning the one budget only Fable turns can use.
     const diverts = (a: RuntimeAccount) => this.divertsOff(a, wantsFable, excluded) ? 1 : 0;
+    // A subscription in arrears (past_due, unpaid) still serves until upstream
+    // stops it, and when it does, it stops at once — mid-session, with the
+    // account's budget out of reach. So it is spent last: healthy accounts
+    // take new sessions first, and the arrears one is a reserve, not a home.
+    const arrears = (a: RuntimeAccount) => subscriptionHealthy(a.profile) ? 0 : 1;
     const ranked = (lastResort: boolean) => this.accounts.filter((a) => this.available(a, excluded, wantsFable, lastResort)).sort((a, b) => {
-      const tier = diverts(a) - diverts(b); if (tier) return tier;
+      const tier = diverts(a) - diverts(b) || arrears(a) - arrears(b); if (tier) return tier;
       if (a.priority !== null || b.priority !== null) return (a.priority ?? Number.MAX_SAFE_INTEGER) - (b.priority ?? Number.MAX_SAFE_INTEGER);
       return rank(a, b);
     });
@@ -284,6 +316,8 @@ export class AccountPool {
   // Whether a non-Fable request should leave this account for one that does
   // not reserve Fable — only when such an account can actually take it.
   private divertsOff(account: RuntimeAccount, wantsFable: boolean, excluded: Set<string>): boolean {
+    // A Fable turn leaves an ordinary account while a Fable-only account can take it.
+    if (wantsFable) return !account.fableOnly && this.accounts.some((a) => a.fableOnly && this.available(a, excluded, true));
     return !wantsFable && this.reservesFable(account) && this.accounts.some((a) => a !== account && !this.reservesFable(a) && this.available(a, excluded, false));
   }
 
@@ -296,7 +330,7 @@ export class AccountPool {
   // the next turn for nothing. Only a quota or forbidden cooldown evicts.
   private isHome(account: RuntimeAccount, wantsFable: boolean): boolean {
     if (account.cooldownReason === 'network') {
-      const still = account.enabled && !account.error && (account.usage === null || account.usage < this.threshold) && !(wantsFable && AccountPool.fableSpent(account, 1));
+      const still = account.enabled && !account.error && (account.usage === null || account.usage < this.threshold) && !(wantsFable && AccountPool.fableSpent(account, 1)) && !this.keptForFable(account, wantsFable);
       return still && !this.divertsOff(account, wantsFable, NO_EXCLUSIONS);
     }
     return this.availableIgnoringConcurrency(account, NO_EXCLUSIONS, wantsFable) && !this.divertsOff(account, wantsFable, NO_EXCLUSIONS);
@@ -337,11 +371,24 @@ export class AccountPool {
   release(account: RuntimeAccount): void { account.inflight = Math.max(0, account.inflight - 1); account.lastUsed = Date.now(); }
   updateQuota(account: RuntimeAccount, headers: Headers, body?: string): void {
     const quota = this.provider.readQuota(headers, body);
-    if (quota) { account.usage = quota.routingUsage; account.resetsAt = quota.routingResetsAt; account.windows = { ...account.windows, ...quota.windows }; }
+    if (quota) this.applyQuota(account, quota);
     // A live plan header is fresher than the one decoded from the token at
     // login, so a plan change shows up without re-authenticating.
     const plan = headers.get('x-codex-plan-type');
     if (plan && account.profile && account.profile.rateLimitTier !== plan) account.profile = { ...account.profile, rateLimitTier: plan };
+  }
+  private applyQuota(account: RuntimeAccount, quota: QuotaSnapshot): void {
+    // A Fable 429 marked the window spent (100%); a usage poll that then rounds the
+    // same window down to 99% would hand it back to Fable for one more 429 and push
+    // a fable-only account's other-model sessions off it again. Same window → keep it spent.
+    // Only a fable-only account (opt-in) holds the mark; others take the reading as is.
+    if (account.fableOnly) for (const [name, next] of Object.entries(quota.windows)) {
+      const prev = account.windows[name];
+      const sameWindow = prev?.resetsAt == null || next.resetsAt == null || Math.abs(next.resetsAt - prev.resetsAt) <= 5 * 60_000;
+      if (/^7d_[a-z0-9]+$/i.test(name) && prev?.usage != null && prev.usage >= 1 && next.usage !== null && next.usage >= 0.99 && sameWindow) quota.windows[name] = { ...next, usage: 1 };
+    }
+    account.usage = quota.routingUsage; account.resetsAt = quota.routingResetsAt; account.windows = { ...account.windows, ...quota.windows }; account.measuredAt = Date.now(); account.measureError = null;
+    if (quota.resetCredits !== undefined) account.resetCredits = quota.resetCredits;
   }
   cooldown(account: RuntimeAccount, ms: number, reason: 'network' | 'quota' | 'forbidden' = 'quota'): void { account.cooldownUntil = Date.now() + Math.max(1_000, ms); account.cooldownReason = reason; }
 
@@ -355,18 +402,40 @@ export class AccountPool {
     const name = Object.keys(account.windows).find((n) => /^7d_[a-z0-9]+$/i.test(n)) ?? '7d_oi';
     account.windows = { ...account.windows, [name]: { usage: 1, resetsAt } };
   }
-  fail(account: RuntimeAccount, message: string): void { account.error = message; }
+  private static clearError(account: RuntimeAccount): void { account.error = null; account.errorKind = null; }
+
+  // Upstream refuses OAuth for this account's organization (Anthropic does so
+  // while a subscription is past due). Retrying on a 30-minute cooldown failed
+  // a live request every half hour and showed nothing but `cooldown`; this
+  // benches the account as an error the dashboard names, until a usage read
+  // answers again (refreshUsage) or a probe succeeds.
+  markBlocked(account: RuntimeAccount): void {
+    account.error = 'organization refuses OAuth (subscription past due?) — benched until it answers again';
+    account.errorKind = 'blocked';
+  }
+
+  // A token refresh that did not go through, recorded with why. A token
+  // endpoint that never answered (a timeout, a dropped connection) is not a
+  // dead token: the account is benched while the relay retries on its own, and
+  // only a refusal is reported as needing a re-login. The dashboard draws the
+  // two apart — `retrying` and `error` — because both used to read as `error`
+  // and a network blip had the user re-logging for nothing (2026-11-21).
+  recordRefreshFailure(account: RuntimeAccount, error: unknown): RefreshErrorKind {
+    const kind: RefreshErrorKind = isUnreachable(error) ? 'unreachable' : 'refused';
+    account.error = kind === 'unreachable' ? `token refresh unreachable (${networkCause(error)}); retrying` : `token refresh failed: ${(error as Error).message}`;
+    account.errorKind = kind;
+    return kind;
+  }
 
   async refresh(account: RuntimeAccount, force = false): Promise<void> {
     if (!force && account.credential.expiresAt && account.credential.expiresAt > Date.now() + 5 * 60_000) return;
     const existing = this.refreshes.get(account.id);
     if (existing) return existing;
-    // A sync or re-login can replace the credential while this runs; that newer
-    // one stays, rather than being overwritten by a result for the old one.
+    // A new token does not lift an organization's OAuth block: only an answer does.
+    // A re-login can replace the credential while this runs; that newer one
+    // stays, rather than being overwritten by a result for the old one.
     const started = account.credential;
-    const rotate = (credential: OAuthCredential): Promise<OAuthCredential> => this.provider.refresh(credential);
-    const work = this.refreshVia ? this.refreshVia(account, rotate) : rotate(started);
-    const promise = work.then((next) => { if (account.credential === started) { account.credential = next; account.error = null; } }).finally(() => this.refreshes.delete(account.id));
+    const promise = this.provider.refresh(started).then((next) => { if (account.credential === started) { account.credential = next; if (account.errorKind !== 'blocked') AccountPool.clearError(account); } }).finally(() => this.refreshes.delete(account.id));
     this.refreshes.set(account.id, promise);
     return promise;
   }
@@ -381,14 +450,19 @@ export class AccountPool {
   // Sequential on purpose: after a long downtime the whole fleet can be due at
   // once, and firing every refresh together would burst the token endpoint into
   // a rate limit that errors accounts that were merely idle. One at a time.
-  async refreshLapsed(): Promise<{ healed: number; failed: number }> {
-    if (this.sweepInFlight) return { healed: 0, failed: 0 };
+  //
+  // `onlyUnreachable` narrows the sweep to accounts benched by a token endpoint
+  // that did not answer: the relay retries those sooner than the five-minute
+  // sweep, and a refused token must not be re-tried that often.
+  async refreshLapsed(options: { onlyUnreachable?: boolean } = {}): Promise<RefreshSweep> {
+    if (this.sweepInFlight) return { healed: 0, failed: 0, unreachable: 0, skipped: true, outcomes: [] };
     this.sweepInFlight = true;
     try {
       const now = Date.now();
-      const due = this.accounts.filter((a) => a.credential.refreshToken
-        && (a.error !== null || a.credential.expiresAt === null || a.credential.expiresAt < now + 5 * 60_000));
-      let healed = 0; let failed = 0;
+      const due = this.accounts.filter((a) => a.credential.refreshToken && (options.onlyUnreachable
+        ? a.errorKind === 'unreachable'
+        : (a.error !== null && a.errorKind !== 'blocked') || a.credential.expiresAt === null || a.credential.expiresAt < now + 5 * 60_000));
+      const sweep: RefreshSweep = { healed: 0, failed: 0, unreachable: 0, outcomes: [] };
       for (const account of due) {
         const started = account.credential;
         // Force when the account errored or its expiry is unknown: refresh()'s
@@ -401,10 +475,29 @@ export class AccountPool {
         // expired for a day, showing as active the whole time. An account whose
         // token cannot be renewed cannot serve, so it is benched here until a
         // later sweep — or a re-login adopted by adoptCredentials — heals it.
-        try { await this.refresh(account, account.error !== null || account.credential.expiresAt === null); healed++; }
-        catch (error) { failed++; if (account.credential === started) account.error = `token refresh failed: ${(error as Error).message}`; }
+        const wasError = account.error !== null && account.errorKind !== 'blocked';
+        try {
+          await this.refresh(account, wasError || account.credential.expiresAt === null); sweep.healed++;
+          // Only a recovery is worth naming; a routine renewal is counted.
+          if (wasError) sweep.outcomes.push({ label: account.label, kind: 'healed', message: 'token refreshed' });
+        }
+        //
+        // A refusal and an unreachable token endpoint are told apart: both bench
+        // the account, but only a refusal needs a re-login. On 2026-10-22 a
+        // network outage was reported as "re-login needed", the user re-logged
+        // for nothing, and the next sweep would have healed it on its own.
+        catch (error) {
+          // A blocked account keeps its block: recording the token failure over
+          // it would let the next successful refresh clear the error and route
+          // the account straight back into the organization's 403. A re-login
+          // adopted while this ran replaced the credential that failed.
+          if (account.errorKind === 'blocked' || account.credential !== started) continue;
+          const kind = this.recordRefreshFailure(account, error);
+          if (kind === 'unreachable') sweep.unreachable++; else sweep.failed++;
+          sweep.outcomes.push({ label: account.label, kind, message: account.error! });
+        }
       }
-      return { healed, failed };
+      return sweep;
     } finally {
       this.sweepInFlight = false;
     }
@@ -420,12 +513,62 @@ export class AccountPool {
     for (const account of this.accounts) {
       let changed = false;
       for (const [name, window] of Object.entries(account.windows)) {
-        if (window.resetsAt && window.resetsAt <= now) { delete account.windows[name]; changed = true; }
+        if (window.resetsAt && window.resetsAt <= now) { delete account.windows[name]; changed = true; continue; }
+        // A window with no reset, no recorded span and nothing used is a
+        // leftover from a limit upstream no longer reports (Claude dropped the
+        // 5-hour session window in favour of the weekly one); without a reset
+        // nothing would ever clear it, so it would sit in the dashboard forever.
+        if (!window.minutes && window.resetsAt == null && !((window.usage ?? 0) > 0)) { delete account.windows[name]; changed = true; }
       }
       if (account.resetsAt && account.resetsAt <= now) { account.usage = null; account.resetsAt = null; account.cooldownUntil = null; account.cooldownReason = null; changed = true; }
       if (changed) { this.warmupTries.delete(account.credentialId); swept++; }
     }
     return swept;
+  }
+
+  // Re-read quota from the provider's usage endpoint for every account whose
+  // last reading is older than maxAgeMs. Response headers only ever update the
+  // accounts this proxy routes to, so an account spent through another client
+  // on the same subscription kept its old figure until someone pressed R. The
+  // endpoint is not a model call and spends no quota, which is what makes a
+  // fleet-wide timer affordable where a probe was not. Busy accounts are read
+  // too: this takes no request slot. Returns the ids it measured, so a caller
+  // can fall back to probing only the rest.
+  //
+  // A read already running is waited out rather than skipped: R pressed during
+  // a timer read would otherwise see nothing measured and probe the whole fleet.
+  async refreshUsage(maxAgeMs: number): Promise<Set<string>> {
+    const measured = new Set<string>();
+    if (!this.provider.fetchUsage) return measured;
+    while (this.usageRead) await this.usageRead;
+    const read = (async () => {
+      const cutoff = Date.now() - maxAgeMs;
+      // A blocked account is read too: the usage endpoint costs nothing, and its
+      // answering again is how the block is seen to lift.
+      const due = this.accounts.filter((a) => (!a.error || a.errorKind === 'blocked') && (a.measuredAt ?? 0) <= cutoff);
+      await Promise.all(due.map(async (account) => {
+        try {
+          await this.refresh(account);
+          const started = Date.now();
+          const quota = await this.provider.fetchUsage!(account.credential, this.probeTemplate?.userAgent ?? null);
+          // A proxied response may have landed while this read was in flight;
+          // its headers are newer than this snapshot, so they are kept.
+          if (quota && (account.measuredAt ?? 0) < started) { this.applyQuota(account, quota); measured.add(account.id); }
+          // The tickets ride only on this read, never on response headers: keep them anyway.
+          else if (quota) { if (quota.resetCredits !== undefined) account.resetCredits = quota.resetCredits; measured.add(account.id); }
+          if (quota && account.errorKind === 'blocked') AccountPool.clearError(account);
+        } catch (error) {
+          // The old figures stay — they are the last known — but the read is
+          // marked failed, so they no longer pass for merely old. The account is
+          // still left to the probe fallback.
+          account.measureError = readFailure(error);
+          if ((error as { blocked?: boolean }).blocked) this.markBlocked(account);
+        }
+      }));
+    })();
+    this.usageRead = read;
+    try { await read; } finally { this.usageRead = null; }
+    return measured;
   }
 
   // Accounts worth a background probe: idle, not errored, and still without a
@@ -493,10 +636,10 @@ export class AccountPool {
       if (live) {
         // Config fields may have been edited (label, enabled, priority); runtime
         // fields and the possibly-refreshed credential stay as they are.
-        next.push(Object.assign(live, { label: account.label, enabled: account.enabled, priority: account.priority }));
+        next.push(Object.assign(live, { id: account.id, label: account.label, enabled: account.enabled, priority: account.priority, fableOnly: account.fableOnly }));
       } else {
         added++;
-        next.push({ ...account, credential: credentials[account.credentialId]!, usage: null, resetsAt: null, windows: {}, profile: null, cooldownUntil: null, cooldownReason: null, lastUsed: null, error: null, inflight: 0 });
+        next.push({ ...account, credential: credentials[account.credentialId]!, usage: null, resetsAt: null, windows: {}, profile: null, measuredAt: null, cooldownUntil: null, cooldownReason: null, lastUsed: null, error: null, errorKind: null, inflight: 0 });
       }
     }
     const dropped = this.accounts.filter((a) => !keep.has(a.credentialId));
@@ -535,29 +678,34 @@ export class AccountPool {
 
   hasProbe(): boolean { return this.probeTemplate !== null && Boolean(this.provider.probeRequest); }
 
-  // Force a fleet-wide quota re-measure (TUI 'R'). Replays the committed
-  // template against every idle account, including already-measured and
-  // throttled ones: an exhausted account's 429 still carries authoritative
-  // quota headers. Tokens are refreshed first — an idle account past its token
-  // lifetime is the main reason a refresh would otherwise measure nothing.
-  // Returns { targets, measured } so the TUI can report honest M/N.
+  // Force a fleet-wide quota re-measure (TUI 'R'). The usage endpoint reads
+  // every account first, busy ones included, at no quota cost; only accounts it
+  // could not read fall back to replaying the committed probe template. An
+  // exhausted account's 429 still carries authoritative quota headers, so the
+  // fallback covers throttled accounts too. Tokens are refreshed first — an
+  // idle account past its token lifetime is the main reason a read would
+  // otherwise measure nothing. Returns { targets, measured } so the TUI can
+  // report honest M/N.
   async probeAll(): Promise<{ targets: number; measured: number }> {
+    this.warmupTries.clear();
+    const viaUsage = await this.refreshUsage(0);
     // Fall back to the shape this provider knows its client sends. A pool whose
     // accounts are ALL exhausted never serves a request, so it can never capture
     // a template from live traffic — and would stay permanently unmeasurable,
     // which is exactly when the numbers matter most.
     if (!this.probeTemplate && this.provider.defaultProbe) this.probeTemplate = this.provider.defaultProbe();
-    if (!this.hasProbe() || this.probing) return { targets: 0, measured: 0 };
+    if (!this.hasProbe() || this.probing) return { targets: this.accounts.length, measured: viaUsage.size };
     this.probing = true;
     try {
-      this.warmupTries.clear();
       const targets = this.accounts.filter((a) => a.inflight === 0);
       await Promise.all(targets.map((a) => this.refresh(a).catch(() => { /* surfaced below */ })));
       // Re-check inflight after the await: a live request may have been routed
       // to an account while tokens were refreshing, and a probe does not go
       // through acquire/release, so probing it would exceed maxConcurrent.
-      const alive = targets.filter((a) => !a.error && a.inflight === 0);
-      const results = await Promise.all(alive.map((a) => this.probeOne(a)));
+      // A blocked account is probed too: the probe is how R sees a block lift
+      // when the usage endpoint still refuses but the model endpoint serves again.
+      const alive = targets.filter((a) => (!a.error || a.errorKind === 'blocked') && a.inflight === 0);
+      const results = await Promise.all(alive.filter((a) => !viaUsage.has(a.id)).map((a) => this.probeOne(a)));
       // Model-weekly (Fable) top-up: that window only appears on responses to
       // Fable-tier requests, so an account measured by an ordinary probe keeps
       // a blank Fbl bar forever. Re-probe those once with the Fable model.
@@ -566,7 +714,7 @@ export class AccountPool {
         const missing = alive.filter((a) => !Object.keys(a.windows).some((name) => /^7d_[a-z0-9]+$/i.test(name)));
         if (missing.length) await Promise.all(missing.map((a) => this.probeOne(a, fableModel)));
       }
-      return { targets: targets.length, measured: results.filter(Boolean).length };
+      return { targets: this.accounts.length, measured: viaUsage.size + results.filter(Boolean).length };
     } finally { this.probing = false; }
   }
 
@@ -583,16 +731,18 @@ export class AccountPool {
       // it read, so a header-less response (a 400/404, an upstream hiccup) is
       // reported as unmeasured instead of inflating the M/N the TUI shows.
       const quota = this.provider.readQuota(response.headers, text);
-      if (quota) { account.usage = quota.routingUsage; account.resetsAt = quota.routingResetsAt; account.windows = { ...account.windows, ...quota.windows }; }
-      if (response.ok) { account.error = null; account.cooldownUntil = null; account.cooldownReason = null; account.cooldownReason = null; }
+      if (quota) this.applyQuota(account, quota);
+      const failure = response.ok ? null : this.provider.classifyFailure(response.status, response.headers, text).kind;
+      if (response.ok) { AccountPool.clearError(account); account.cooldownUntil = null; account.cooldownReason = null; }
+      else if (failure === 'blocked') this.markBlocked(account);
       // A rejection that only names the model-weekly window says the account is
       // spent for the top model, not unusable: an ordinary probe (the default
       // model) still succeeds here. Clearing the bench on that reading is what
       // lets R recover an account parked for days by a Fable-only 429 — the
       // cooldown it was given was the weekly retry-after, which no other model
       // has to wait for.
-      else if (!modelOverride && this.provider.classifyFailure(response.status, response.headers, text).kind === 'model-quota') {
-        account.error = null; account.cooldownUntil = null; account.cooldownReason = null;
+      else if (!modelOverride && failure === 'model-quota') {
+        AccountPool.clearError(account); account.cooldownUntil = null; account.cooldownReason = null;
       }
       return quota !== null;
     } catch { return false; }
@@ -611,23 +761,9 @@ export class AccountPool {
     let adopted = 0;
     for (const account of this.accounts) {
       const fresh = latest[account.credentialId];
-      if (!fresh || fresh.expiresAt === null || (fresh.accessToken === account.credential.accessToken && fresh.refreshToken === account.credential.refreshToken)) continue;
-      // Only three things replace what this server holds: a login (a later
-      // loggedInAt), an import the user handed over (a later importedAt, never
-      // over a later login), and a newer credential for an account that is failing.
-      // A later expiry alone is not enough: disk can hold a chain this server
-      // already replaced (a token recovered from the cloud expires whenever the
-      // other machine minted it), and adopting it would bring a dead chain back.
-      // A failing account still takes only something newer: an older disk copy
-      // is a chain it already rotated past, and restoring it would lose the pair
-      // it holds now (a transient 503 after a successful rotation, for example).
-      // An earlier login is never newer, whatever its expiry.
-      const relogin = (fresh.loggedInAt ?? 0) > (account.credential.loggedInAt ?? 0);
-      const sameOrLaterLogin = (fresh.loggedInAt ?? 0) >= (account.credential.loggedInAt ?? 0);
-      const handedOver = sameOrLaterLogin && (fresh.importedAt ?? 0) > (account.credential.importedAt ?? 0);
-      const newerForFailing = account.error !== null && sameOrLaterLogin && (account.credential.expiresAt === null || fresh.expiresAt > account.credential.expiresAt);
-      if (!relogin && !handedOver && !newerForFailing) continue;
-      account.credential = fresh; account.error = null; adopted++;
+      if (!fresh || fresh.expiresAt === null || fresh.accessToken === account.credential.accessToken) continue;
+      if (account.credential.expiresAt !== null && fresh.expiresAt <= account.credential.expiresAt) continue;
+      account.credential = fresh; AccountPool.clearError(account); adopted++;
     }
     return adopted;
   }
@@ -649,8 +785,14 @@ export class AccountPool {
     return updated;
   }
 
+  // What `GET /usage` adds to the persisted state: in-flight requests and the
+  // reason behind a cooldown, which only this process knows.
+  liveStatus(): LiveAccountStatus[] {
+    return this.accounts.map((a) => ({ credentialId: a.credentialId, inflight: a.inflight, cooldownUntil: a.cooldownUntil, cooldownReason: a.cooldownReason }));
+  }
+
   exportState(target: PersistedState): void {
-    for (const a of this.accounts) target.accounts[a.credentialId] = { usage: a.usage, resetsAt: a.resetsAt, windows: a.windows, profile: a.profile, cooldownUntil: a.cooldownUntil, lastUsed: a.lastUsed, error: a.error };
+    for (const a of this.accounts) target.accounts[a.credentialId] = { usage: a.usage, resetsAt: a.resetsAt, windows: a.windows, profile: a.profile, measuredAt: a.measuredAt, resetCredits: a.resetCredits ?? null, cooldownUntil: a.cooldownUntil, lastUsed: a.lastUsed, error: a.error, errorKind: a.errorKind, measureError: a.measureError ?? null };
     if (this.probeTemplate) { target.probes ??= {}; target.probes[this.provider.id] = this.probeTemplate; }
   }
 }

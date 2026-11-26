@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -12,158 +12,171 @@ test('stores credentials separately with restrictive permissions and deduplicate
   const config = await storage.loadConfig(); assert.equal(config.accounts.length, 1); assert.equal(config.accounts[0]?.label, 'renamed');
   assert.equal((await readFile(storage.paths().config, 'utf8')).includes('new-secret'), false);
   assert.equal((await stat(storage.paths().credentials)).mode & 0o777, 0o600);
-  await storage.upsertAccounts('codex', [
-    { label: 'renamed-again', credential: { ...credential, accessToken: 'third-secret' } },
-    { label: 'second', credential: { ...credential, accessToken: 'second-secret', accountId: 'second' } },
-  ]);
-  const bulk = await storage.loadConfig(); assert.equal(bulk.accounts.length, 2); assert.equal(bulk.accounts[0]?.label, 'renamed-again');
   delete process.env.TEAMAI_HOME;
 });
 
-// A Codex account imported from codex-multi-auth is keyed by its workspace id,
-// while `teamai login codex` keys the same account by the token's
-// chatgpt_account_id. Both tokens carry that claim, so it is what names the account.
-test('a Codex login for an account imported under another id refreshes that account instead of adding a second one', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-identity-')); process.env.TEAMAI_HOME = root;
-  const storage = await import(`../src/storage.js?codex-identity=${Date.now()}`);
-  const jwt = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
-  const tokenFor = (account: string, n: number): string => jwt({ n, 'https://api.openai.com/auth': { chatgpt_account_id: account } });
-  await storage.upsertAccounts('codex', [{ label: 'one@example.com', credential: { accessToken: tokenFor('acct-one', 1), refreshToken: 'spent', expiresAt: 100, accountId: 'org-imported' } }]);
+const jwt = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+const member = (userId: string): string => jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'workspace', chatgpt_user_id: userId } });
 
-  const account = await storage.upsertAccount('codex', 'one@example.com', { accessToken: tokenFor('acct-one', 2), refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
-  await storage.upsertAccount('codex', 'other@example.com', { accessToken: tokenFor('acct-other', 1), refreshToken: 'other', expiresAt: 300, accountId: 'acct-other' });
+test('keeps two members of one Codex workspace as separate accounts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=${Date.now()}-members`);
+  await storage.upsertAccount('codex', 'a@corp.com', { accessToken: member('user-a'), refreshToken: 'ra', expiresAt: 1, accountId: 'workspace', userId: 'user-a' });
+  await storage.upsertAccount('codex', 'b@corp.com', { accessToken: member('user-b'), refreshToken: 'rb', expiresAt: 1, accountId: 'workspace', userId: 'user-b' });
+  await storage.upsertAccount('codex', 'a@corp.com', { accessToken: member('user-a'), refreshToken: 'ra2', expiresAt: 2, accountId: 'workspace', userId: 'user-a' });
+  const config = await storage.loadConfig(); const credentials = await storage.loadCredentials();
+  assert.deepEqual(config.accounts.map((a: { label: string }) => a.label), ['a@corp.com', 'b@corp.com']);
+  assert.equal(new Set(config.accounts.map((a: { credentialId: string }) => a.credentialId)).size, 2);
+  for (const account of config.accounts) assert.equal(credentials[account.credentialId].accountId, 'workspace');
+  delete process.env.TEAMAI_HOME;
+});
 
+test('upgrades a workspace-keyed Codex record for the same user and leaves it for another member', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=${Date.now()}-legacy`);
+  // A record written before the user joined the key: id is the bare workspace id.
+  await storage.upsertAccount('codex', 'a@corp.com', { accessToken: member('user-a'), refreshToken: 'ra', expiresAt: 1, accountId: 'workspace' });
+  const legacyId = (await storage.loadConfig()).accounts[0].credentialId;
+  await storage.upsertAccount('codex', 'renamed@corp.com', { accessToken: member('user-a'), refreshToken: 'ra2', expiresAt: 2, accountId: 'workspace', userId: 'user-a' });
+  let config = await storage.loadConfig();
+  assert.equal(config.accounts.length, 1); assert.equal(config.accounts[0].id, 'workspace:user-a'); assert.equal(config.accounts[0].credentialId, legacyId);
+  await storage.upsertAccount('codex', 'b@corp.com', { accessToken: member('user-b'), refreshToken: 'rb', expiresAt: 1, accountId: 'workspace', userId: 'user-b' });
+  config = await storage.loadConfig();
+  assert.equal(config.accounts.length, 2); assert.equal((await storage.loadCredentials())[legacyId].refreshToken, 'ra2');
+  delete process.env.TEAMAI_HOME;
+});
+
+test('does not merge workspace members that share a label because their tokens carry no email', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=${Date.now()}-nolabel`);
+  await storage.upsertAccount('codex', 'workspace', { accessToken: member('user-a'), refreshToken: 'ra', expiresAt: 1, accountId: 'workspace' });
+  await storage.upsertAccount('codex', 'workspace', { accessToken: member('user-b'), refreshToken: 'rb', expiresAt: 1, accountId: 'workspace', userId: 'user-b' });
+  assert.equal((await storage.loadConfig()).accounts.length, 2);
+  delete process.env.TEAMAI_HOME;
+});
+
+test('a credentials save is dropped when another process wrote the file after it was read', async () => {
+  // The 2026-10-22 failure: a save read the file, stalled for minutes, and
+  // landed after a re-login — writing the token that re-login replaced.
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=cas-${Date.now()}`);
+  const stale = { accessToken: 'stale', refreshToken: 'r', expiresAt: 1, accountId: 'a' };
+  await storage.saveCredentials({ 'claude:a': stale });
+  const snapshot = await storage.readCredentialsText();
+  await storage.saveCredentials({ 'claude:a': { ...stale, accessToken: 'relogged', expiresAt: 2 } });
+  assert.equal(await storage.saveCredentialsIfUnchanged({ 'claude:a': stale }, snapshot), false);
+  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'relogged', 'the re-login survives');
+  assert.deepEqual((await readdir(root)).filter((f) => f.endsWith('.tmp')), [], 'the vetoed temp file is removed');
+  // Unchanged since the read: the write goes through.
+  assert.equal(await storage.saveCredentialsIfUnchanged({ 'claude:a': stale }, await storage.readCredentialsText()), true);
+  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'stale');
+  delete process.env.TEAMAI_HOME;
+});
+
+test('a state save superseded by a later one is not written', async () => {
+  // A save that outlived its timeout must not land older usage over newer.
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=gen-${Date.now()}`);
+  await storage.saveState({ version: 1, accounts: {}, events: [{ at: 2, message: 'newer' }] });
+  assert.equal(await storage.saveState({ version: 1, accounts: {}, events: [{ at: 1, message: 'older' }] }, async () => false), false);
+  assert.equal((await storage.loadState()).events[0].message, 'newer');
+  assert.deepEqual((await readdir(root)).filter((f) => f.endsWith('.tmp')), []);
+  delete process.env.TEAMAI_HOME;
+});
+
+// Claude's profile and token endpoints: which organization each access token
+// belongs to, and what each refresh token renews to. A refresh token missing
+// from `renewals` is refused with invalid_grant; `offline` makes every call
+// fail the way an unreachable host does.
+function profileServer(orgOf: Record<string, string>, renewals: Record<string, string> = {}, offline = false): () => void {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (offline) throw new TypeError('fetch failed');
+    if (String(url).endsWith('/v1/oauth/token')) {
+      const refresh = JSON.parse(String(init?.body)).refresh_token as string;
+      const access = renewals[refresh];
+      return access ? new Response(JSON.stringify({ access_token: access, refresh_token: `${refresh}-rotated`, expires_in: 3600 })) : new Response('{"error":"invalid_grant"}', { status: 400 });
+    }
+    const token = String(new Headers(init?.headers).get('authorization')).replace('Bearer ', '');
+    const org = orgOf[token];
+    return org ? new Response(JSON.stringify({ account: { uuid: 'person', email: 'me@corp.com' }, organization: { uuid: org } })) : new Response('{}', { status: 401 });
+  }) as typeof fetch;
+  return () => { globalThis.fetch = original; };
+}
+
+// A record written before the organization joined the key: id is the bare account uuid.
+async function legacyRecord(storage: typeof import('../src/storage.js'), accessToken: string, refreshToken: string): Promise<string> {
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken, refreshToken, expiresAt: 1, accountId: 'person' });
+  return (await storage.loadConfig()).accounts[0]!.credentialId;
+}
+
+test('keeps a personal plan and a Team seat under one email as separate Claude accounts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=${Date.now()}-claude-orgs`);
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken: 'personal', refreshToken: 'rp', expiresAt: 1, accountId: 'person', organizationId: 'org-personal' });
+  await storage.upsertAccount('claude', 'me@corp.com (Team)', { accessToken: 'team', refreshToken: 'rt', expiresAt: 1, accountId: 'person', organizationId: 'org-team' });
+  const config = await storage.loadConfig(); const credentials = await storage.loadCredentials();
+  assert.deepEqual(config.accounts.map((a: { id: string }) => a.id), ['person:org-personal', 'person:org-team']);
+  assert.deepEqual(config.accounts.map((a: { credentialId: string }) => credentials[a.credentialId].refreshToken), ['rp', 'rt']);
+  delete process.env.TEAMAI_HOME;
+});
+
+test('upgrades a person-keyed Claude record for the same organization and leaves it for another', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  t.after(profileServer({ held: 'org-team' }));
+  const storage = await import(`../src/storage.js?test=${Date.now()}-claude-legacy`);
+  // A record written before the organization joined the key: id is the bare account uuid.
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken: 'held', refreshToken: 'r-team', expiresAt: 1, accountId: 'person' });
+  const legacyId = (await storage.loadConfig()).accounts[0].credentialId;
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken: 'personal', refreshToken: 'r-personal', expiresAt: 1, accountId: 'person', organizationId: 'org-personal' });
+  let config = await storage.loadConfig();
+  assert.equal(config.accounts.length, 2); assert.equal((await storage.loadCredentials())[legacyId].refreshToken, 'r-team');
+  await storage.upsertAccount('claude', 'me@corp.com (Team)', { accessToken: 'team2', refreshToken: 'r-team2', expiresAt: 2, accountId: 'person', organizationId: 'org-team' });
+  config = await storage.loadConfig();
+  assert.equal(config.accounts.length, 2);
+  const upgraded = config.accounts.find((a: { credentialId: string }) => a.credentialId === legacyId);
+  assert.equal(upgraded.id, 'person:org-team'); assert.equal(upgraded.label, 'me@corp.com (Team)');
+  delete process.env.TEAMAI_HOME;
+});
+
+test('renews an expired person-keyed Claude record to name its organization', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  t.after(profileServer({ renewed: 'org-team' }, { 'r-team': 'renewed' }));
+  const storage = await import(`../src/storage.js?test=${Date.now()}-claude-renew`);
+  const legacyId = await legacyRecord(storage, 'expired', 'r-team');
+  // Another organization: a row of its own, and the held record keeps the
+  // renewal, since the refresh token it was stored with is now spent.
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken: 'personal', refreshToken: 'r-personal', expiresAt: 1, accountId: 'person', organizationId: 'org-personal' });
+  assert.equal((await storage.loadConfig()).accounts.length, 2);
+  const held = (await storage.loadCredentials())[legacyId];
+  assert.equal(held.refreshToken, 'r-team-rotated'); assert.equal(held.organizationId, 'org-team');
+  // The same organization: adopted.
+  await storage.upsertAccount('claude', 'me@corp.com (Team)', { accessToken: 'team2', refreshToken: 'r-team2', expiresAt: 2, accountId: 'person', organizationId: 'org-team' });
   const config = await storage.loadConfig();
-  assert.deepEqual(config.accounts.map((a: { label: string }) => a.label), ['one@example.com', 'other@example.com']);
-  assert.equal(account.credentialId, 'codex:org-imported');
-  const credentials = await storage.loadCredentials();
-  assert.equal(credentials['codex:org-imported'].refreshToken, 'fresh');
-  assert.equal(credentials['codex:org-imported'].accountId, 'acct-one');
-  assert.equal(typeof credentials['codex:org-imported'].loggedInAt, 'number');
+  assert.equal(config.accounts.length, 2);
+  assert.equal(config.accounts.find((a: { credentialId: string }) => a.credentialId === legacyId).id, 'person:org-team');
+  assert.equal((await storage.loadCredentials())[legacyId].refreshToken, 'r-team2');
   delete process.env.TEAMAI_HOME;
 });
 
-test('workspaces that share one Codex token stay separate entries, on import and on login', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-workspaces-')); process.env.TEAMAI_HOME = root;
-  const storage = await import(`../src/storage.js?codex-workspaces=${Date.now()}`);
-  const shared = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } })).toString('base64url')}.s`;
-  const team = '0b0b0b0b-0000-4000-8000-000000000001';
-  await storage.upsertAccounts('codex', [
-    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r1', expiresAt: 100, accountId: 'org-personal' } },
-    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r2', expiresAt: 100, accountId: team } },
-  ]);
-  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-personal', team]);
-
-  // The team entry names its workspace, so the login renews the personal one only.
-  await storage.upsertAccount('codex', 'one@example.com', { accessToken: shared, refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
-  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-personal', team]);
-  const credentials = await storage.loadCredentials();
-  assert.equal(credentials['codex:org-personal'].refreshToken, 'fresh');
-  assert.equal(credentials[`codex:${team}`].refreshToken, 'r2');
+test('a re-login takes over a person-keyed Claude record whose token cannot be renewed', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  t.after(profileServer({}));
+  const storage = await import(`../src/storage.js?test=${Date.now()}-claude-lost`);
+  const legacyId = await legacyRecord(storage, 'expired', 'r-revoked');
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken: 'new', refreshToken: 'r-new', expiresAt: 1, accountId: 'person', organizationId: 'org-personal' });
+  const config = await storage.loadConfig();
+  assert.equal(config.accounts.length, 1); assert.equal(config.accounts[0].credentialId, legacyId); assert.equal(config.accounts[0].id, 'person:org-personal');
+  assert.equal((await storage.loadCredentials())[legacyId].refreshToken, 'r-new');
   delete process.env.TEAMAI_HOME;
 });
 
-test('a Codex login adds an entry when more than one imported entry carries its claim', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-ambiguous-')); process.env.TEAMAI_HOME = root;
-  const storage = await import(`../src/storage.js?codex-ambiguous=${Date.now()}`);
-  const shared = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } })).toString('base64url')}.s`;
-  await storage.upsertAccounts('codex', [
-    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r1', expiresAt: 100, accountId: 'org-first' } },
-    { label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'r2', expiresAt: 100, accountId: 'org-second' } },
-  ]);
-  await storage.upsertAccount('codex', 'one@example.com', { accessToken: shared, refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
-  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-first', 'org-second', 'acct-one']);
-  const credentials = await storage.loadCredentials();
-  assert.deepEqual([credentials['codex:org-first'].refreshToken, credentials['codex:org-second'].refreshToken], ['r1', 'r2']);
+test('does not overwrite a person-keyed Claude record when upstream cannot be reached', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  t.after(profileServer({}, {}, true));
+  const storage = await import(`../src/storage.js?test=${Date.now()}-claude-offline`);
+  const legacyId = await legacyRecord(storage, 'held', 'r-old');
+  await storage.upsertAccount('claude', 'me@corp.com', { accessToken: 'new', refreshToken: 'r-new', expiresAt: 1, accountId: 'person', organizationId: 'org-personal' });
+  assert.equal((await storage.loadConfig()).accounts.length, 2); assert.equal((await storage.loadCredentials())[legacyId].refreshToken, 'r-old');
   delete process.env.TEAMAI_HOME;
-});
-
-test('a Codex login never renews an entry stored under a different ChatGPT workspace id', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-team-')); process.env.TEAMAI_HOME = root;
-  const storage = await import(`../src/storage.js?codex-team=${Date.now()}`);
-  const shared = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } })).toString('base64url')}.s`;
-  const team = '0b0b0b0b-0000-4000-8000-000000000001';
-  await storage.upsertAccounts('codex', [{ label: 'one@example.com', credential: { accessToken: shared, refreshToken: 'team', expiresAt: 100, accountId: team } }]);
-  await storage.upsertAccount('codex', 'one@example.com', { accessToken: shared, refreshToken: 'fresh', expiresAt: 200, accountId: 'acct-one' });
-  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), [team, 'acct-one']);
-  assert.equal((await storage.loadCredentials())[`codex:${team}`].refreshToken, 'team');
-  delete process.env.TEAMAI_HOME;
-});
-
-// A Codex login reads the claim of every stored Codex token. A token whose
-// payload decodes to JSON null used to throw there, so one bad imported entry
-// broke every later `teamai login codex` until it was removed by hand.
-test('a stored Codex token whose payload is not an object does not break a later login', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-null-claim-')); process.env.TEAMAI_HOME = root;
-  const storage = await import(`../src/storage.js?codex-null-claim=${Date.now()}`);
-  const jwt = (claims: unknown): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
-  await storage.upsertAccounts('codex', [
-    { label: 'null-payload', credential: { accessToken: jwt(null), refreshToken: 'r0', expiresAt: 1, accountId: 'org-null' } },
-    { label: 'array-payload', credential: { accessToken: jwt([1]), refreshToken: 'r1', expiresAt: 1, accountId: 'org-array' } },
-  ]);
-  const login = { accessToken: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-one' } }), refreshToken: 'r2', expiresAt: 2, accountId: 'acct-one' };
-  await storage.upsertAccount('codex', 'one', login);
-  assert.deepEqual((await storage.loadConfig()).accounts.map((a: { id: string }) => a.id), ['org-null', 'org-array', 'acct-one']);
-  delete process.env.TEAMAI_HOME;
-});
-
-// `teamai import` wrote a later token for an account the running server held
-// without a login stamp. The server refused it as "not a login", and its next
-// save wrote the held token back over it, so the import was undone and the
-// account stayed on a chain that might already be spent (2026-10-30 review).
-test('an explicit import that replaces a held token is adopted by a running server', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-import-adopt-')); process.env.TEAMAI_HOME = root;
-  const storage = await import(`../src/storage.js?import-adopt=${Date.now()}`);
-  const { AccountPool } = await import('../src/account-pool.js');
-  const provider = {
-    id: 'claude', label: 'Claude', upstreamBase: 'https://example.test', normalizePath: (p: string) => p,
-    buildHeaders: (h: Headers) => h, rewriteBody: (b: Buffer) => b, readQuota: () => null,
-    classifyFailure: () => ({ kind: 'fatal', retryAfterMs: 0 }), refresh: async (c: unknown) => c,
-  };
-  const held = { accessToken: 'held', refreshToken: 'held-refresh', expiresAt: Date.now() + 60_000, accountId: 'a' };
-  await storage.upsertAccounts('claude', [{ label: 'a', credential: held }]);
-  const pool = new AccountPool(provider as never, (await storage.loadConfig()).accounts, await storage.loadCredentials(), { version: 1, accounts: {} });
-
-  const imported = { ...held, accessToken: 'imported', refreshToken: 'imported-refresh', expiresAt: held.expiresAt + 3_600_000 };
-  await storage.upsertAccounts('claude', [{ label: 'a', credential: imported }]);
-  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 1, 'the server takes the imported token');
-  assert.equal(pool.accounts[0]?.credential.accessToken, 'imported');
-
-  // Importing the token already held is not a hand-over: nothing is rewritten or re-stamped.
-  const stamped = (await storage.loadCredentials())['claude:a'];
-  await storage.upsertAccounts('claude', [{ label: 'a', credential: imported }]);
-  assert.deepEqual((await storage.loadCredentials())['claude:a'], stamped);
-  // An older copy still loses to what is held.
-  await storage.upsertAccounts('claude', [{ label: 'a', credential: { ...held, accessToken: 'older', expiresAt: held.expiresAt - 1 } }]);
-  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'imported');
-  // A second import, here a new refresh chain behind the same access token, is a hand-over too.
-  await new Promise((resolve) => setTimeout(resolve, 2));
-  const rechained = { ...imported, refreshToken: 'rechained-refresh', expiresAt: imported.expiresAt + 1 };
-  await storage.upsertAccounts('claude', [{ label: 'a', credential: rechained }]);
-  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 1, 'the server takes the new refresh chain');
-  assert.equal(pool.accounts[0]?.credential.refreshToken, 'rechained-refresh');
-
-  // A login outranks every import: a later import neither lands on disk nor reaches the server.
-  await storage.upsertAccount('claude', 'a', { ...held, accessToken: 'logged-in', expiresAt: held.expiresAt + 1 });
-  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 1);
-  await new Promise((resolve) => setTimeout(resolve, 2));
-  await storage.upsertAccounts('claude', [{ label: 'a', credential: { ...held, accessToken: 'after-login', expiresAt: held.expiresAt + 7_200_000 } }]);
-  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'logged-in');
-  assert.equal(pool.adoptCredentials(await storage.loadCredentials()), 0);
-  assert.equal(pool.accounts[0]?.credential.accessToken, 'logged-in');
-  delete process.env.TEAMAI_HOME;
-});
-
-test('the activity log appends, and rotates once a write would carry it past its cap', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-log-'));
-  const storage = await import(`../src/storage.js?log=${Date.now()}`);
-  const path = join(root, 'events.log');
-  await storage.appendLog(path, ['one', 'two'], 40);
-  assert.equal(await readFile(path, 'utf8'), 'one\ntwo\n');
-  await storage.appendLog(path, ['three'], 40);
-  assert.equal(await readFile(path, 'utf8'), 'one\ntwo\nthree\n');
-  await storage.appendLog(path, ['a much longer line that carries the file past the cap'], 40);
-  assert.equal(await readFile(path, 'utf8'), 'a much longer line that carries the file past the cap\n');
-  assert.equal(await readFile(`${path}.1`, 'utf8'), 'one\ntwo\nthree\n', 'the previous file is kept as .1');
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
 });

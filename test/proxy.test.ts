@@ -104,7 +104,7 @@ test('acquire-null 429 reports quota_exhausted when accounts are spent, not busy
     assert.equal(res.status, 429);
     assert.equal(res.headers.get('x-teamai-429-reason'), 'quota_exhausted');
     const body = JSON.parse(await res.text()) as { error: string };
-    assert.match(body.error, /1 used up the session window/);
+    assert.match(body.error, /1 used up the usage limit/);
   } finally { proxy.close(); }
 });
 
@@ -134,14 +134,14 @@ test('acquire-null 429 for a Fable request names the spent Fable budgets, the ea
     assert.equal(res.headers.get('x-teamai-429-reason'), 'quota_exhausted');
     assert.equal(res.headers.get('retry-after'), '540');
     const body = JSON.parse(await res.text()) as { error: string };
-    assert.match(body.error, /^No Claude account can serve Fable right now \(2 accounts: 1 spent the Fable weekly budget, 1 used up the session window\)\./);
-    assert.match(body.error, /Earliest reset in 9m: b@example\.com session\./);
+    assert.match(body.error, /^No Claude account can serve Fable right now \(2 accounts: 1 spent the Fable weekly budget, 1 used up the usage limit\)\./);
+    assert.match(body.error, /Earliest reset in 9m: b@example\.com usage limit\./);
     assert.match(body.error, /Other models are still served/);
     assert.ok(events.some((e) => /429 quota_exhausted \(fable\), next reset 9m/.test(e)), `activity log should record the 429: ${events.join(' | ')}`);
     // A non-Fable request is still routed to account a: it reaches the (unreachable)
     // upstream and fails over instead of being refused before dispatch.
     const opus = await call('claude-opus-5'); await opus.text();
-    assert.ok(events.some((e) => /→ a@example\.com network error; failover/.test(e)), `non-Fable request should have tried account a: ${events.join(' | ')}`);
+    assert.ok(events.some((e) => /→ a@example\.com network error \(.*\); failover/.test(e)), `non-Fable request should have tried account a: ${events.join(' | ')}`);
   } finally { proxy.close(); }
 });
 
@@ -178,6 +178,39 @@ test('a transient 429 fails over without cooling down the account', async () => 
     const a = pool.accounts.find((x) => x.id === 'a')!;
     assert.equal(a.cooldownUntil, null, 'a transient 429 must not cool the account down');
     assert.equal(pool.acquire('next', new Set(), false)?.id, 'a', 'account a stays selectable right after a transient 429');
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('a single account whose connection drops after the request went out answers 502 with the cause, and is not re-sent', async () => {
+  // Upstream (2026-10-14) re-sends a dropped request after the network
+  // cooldown. This fork does not: a socket closed after the body went out may
+  // already have run the request upstream, so re-sending could run it twice.
+  // The answer is a 502 that names the phase and cause, and the client decides.
+  let hits = 0;
+  const upstream = createServer(async (req, res) => {
+    req.resume(); await new Promise<void>((r) => req.once('end', r));
+    hits++;
+    if (hits === 1) { req.socket.destroy(); return; }
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n');
+  });
+  await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r)); const up = upstream.address(); assert(up && typeof up !== 'string');
+  const provider: Provider = {
+    id: 'codex', label: 'Codex', upstreamBase: `http://127.0.0.1:${up.port}`,
+    normalizePath: () => '/codex/responses', rewriteBody: (b) => b, readQuota: () => null, refresh: async (c) => c,
+    buildHeaders: (incoming, account) => { const h = new Headers(incoming); h.set('authorization', `Bearer ${account.credential.accessToken}`); return h; },
+    classifyFailure: () => ({ kind: 'fatal', retryAfterMs: 0 }),
+  };
+  const st: StoredAccount = { id: 'a', provider: 'codex', label: 'a', enabled: true, priority: 1, credentialId: 'a', createdAt: '' };
+  const pool = new AccountPool(provider, [st], { a: { accessToken: 's-a', refreshToken: null, expiresAt: null, accountId: 'a' } }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  try {
+    const res = await fetch(`http://127.0.0.1:${pa.port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(res.status, 502, `a request that may have run is not re-sent: ${events.join(' | ')}`); assert.match(await res.text(), /Upstream connection failed: upstream: /);
+    assert.equal(hits, 1, 'upstream saw the request once');
+    assert.ok(events.some((e) => /network error \(upstream: .+\); not re-sent/.test(e)), `the log names the phase and cause: ${events.join(' | ')}`);
+    assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
   } finally { proxy.close(); upstream.close(); }
 });
 
@@ -401,7 +434,7 @@ test('a connection failure is retried inside the relay, and a request that arriv
     const [one, two] = await Promise.all([first, second]);
     assert.equal(one.status, 200, `served once the upstream is back: ${events.join(' | ')}`); await one.text();
     assert.equal(two.status, 200, `the request that arrived during the pause is served too: ${events.join(' | ')}`); await two.text();
-    assert.ok(events.some((e) => /→ a network error; failover \(.*ECONNREFUSED/.test(e)), `the failure cause is on record: ${events.join(' | ')}`);
+    assert.ok(events.some((e) => /→ a network error \(.*ECONNREFUSED.*\); failover/.test(e)), `the failure cause is on record: ${events.join(' | ')}`);
     assert.ok(events.some((e) => /transient retry 1\/2/.test(e)), `the relay retried on its own: ${events.join(' | ')}`);
     assert.ok(events.some((e) => /upstream unreachable; waiting/.test(e)), `the second request waited out the bench: ${events.join(' | ')}`);
     assert.ok(!events.some((e) => /429/.test(e)), `nothing was answered with a 429: ${events.join(' | ')}`);
@@ -423,7 +456,7 @@ test('an upstream that stays unreachable is answered with 502 and the connection
     assert.match(body.error, /^Upstream connection failed: .*ECONNREFUSED/);
     assert.ok(Date.now() - started >= 4_000, 'two retry rounds were spent before giving up');
     assert.ok(events.some((e) => /502 upstream failure preserved/.test(e)), `the answer is on record: ${events.join(' | ')}`);
-    assert.equal(events.filter((e) => /network error; failover/.test(e)).length, 3, `one attempt plus one per retry round: ${events.join(' | ')}`);
+    assert.equal(events.filter((e) => /network error \(.*\); failover/.test(e)).length, 3, `one attempt plus one per retry round: ${events.join(' | ')}`);
   } finally { proxy.close(); }
 });
 
@@ -445,10 +478,10 @@ test('a bench too long to wait out is answered with 503 and a retry-after, not a
   } finally { proxy.close(); }
 });
 
-test('a connection that dies after the request went out is failed over but never retried, and the answer names the cause', async () => {
+test('a connection that dies after the request went out is not sent to another account, and the answer names the cause', async () => {
   // Upstream accepts the connection, reads the body, then drops the socket
-  // without headers. The request may have run there, so no retry round may
-  // send it again; failover to the next account is the pre-existing behaviour.
+  // without headers. The request may have run there: sending it to account b
+  // could run it twice, so the relay answers 502 at once and b is never tried.
   let hits = 0;
   const upstream = createServer((req) => { req.resume(); req.on('end', () => { hits++; req.socket.destroy(); }); });
   await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r)); const up = upstream.address(); assert(up && typeof up !== 'string');
@@ -460,55 +493,124 @@ test('a connection that dies after the request went out is failed over but never
     const started = Date.now();
     const res = await relayCall(pa.port);
     assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-teamai-502-reason'), 'may_have_run');
     const body = JSON.parse(await res.text()) as { error: string };
-    assert.match(body.error, /^Upstream connection failed: .*(other side closed|ECONNRESET)/);
+    assert.match(body.error, /^Upstream connection failed: upstream: .*(other side closed|ECONNRESET)/);
     assert.ok(Date.now() - started < 1_500, 'answered without a retry round');
-    assert.equal(hits, 2, 'each account was tried once');
-    assert.equal(events.filter((e) => /network error; failover \(.*not retried, the request may have reached upstream\)/.test(e)).length, 2, `both attempts are on record as unretried: ${events.join(' | ')}`);
+    assert.equal(hits, 1, 'the request reached the upstream exactly once');
+    assert.ok(events.some((e) => /→ a network error \(.*\); not re-sent: the request may have reached upstream/.test(e)), `the drop is on record: ${events.join(' | ')}`);
+    assert.ok(!events.some((e) => /→ b /.test(e)), `account b was never tried: ${events.join(' | ')}`);
     assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
   } finally { proxy.close(); upstream.close(); }
 });
 
-test('once an attempt may have delivered the request, a later connect refusal does not re-arm the retry rounds', async () => {
-  // Account a's connection dies after the body went out; the upstream then
-  // stops listening, so account b is refused outright. The refusal used to
-  // re-arm the transient retry and re-send to b what a may already have run.
+test('a connect refusal before a drop still fails over, and the drop then ends the request', async () => {
+  // a is refused outright (nothing was sent: safe to try b); b's connection
+  // dies after the body went out (it may have run: nothing more is sent).
   let hits = 0;
-  const upstream = createServer((req) => { req.resume(); req.on('end', () => { hits++; req.socket.destroy(); upstream.close(); }); });
+  const upstream = createServer((req) => { req.resume(); req.on('end', () => { hits++; req.socket.destroy(); }); });
   await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r)); const up = upstream.address(); assert(up && typeof up !== 'string');
-  const pool = new AccountPool(codexStub(up.port), [codexAccount('a', 1), codexAccount('b', 2)], { a: codexCredential('a'), b: codexCredential('b') }, { version: 1, accounts: {} });
+  const refused = await freePort();
+  const pool = new AccountPool(codexStub(up.port), [codexAccount('a', 1), codexAccount('b', 2), codexAccount('c', 3)], { a: codexCredential('a'), b: codexCredential('b'), c: codexCredential('c') }, { version: 1, accounts: {} });
+  // Account a points at a port nothing listens on.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    if (headers.get('authorization') === 'Bearer s-a') return realFetch(String(input).replace(`:${up.port}`, `:${refused}`), init);
+    return realFetch(input, init);
+  }) as typeof fetch;
   const events: string[] = [];
   const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
   await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
   try {
-    const started = Date.now();
-    const res = await relayCall(pa.port);
+    const res = await realFetch(`http://127.0.0.1:${pa.port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
     assert.equal(res.status, 502); await res.text();
-    assert.ok(Date.now() - started < 1_500, 'answered without a retry round');
-    assert.equal(hits, 1, 'the request reached the upstream exactly once');
-    assert.ok(events.some((e) => /→ b network error; failover \(.*ECONNREFUSED.*not retried/.test(e)), `the refusal on b is recorded as unretried: ${events.join(' | ')}`);
-    assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
-  } finally { proxy.close(); }
+    assert.equal(hits, 1, 'only b received the request');
+    assert.ok(events.some((e) => /→ a network error \(.*ECONNREFUSED.*\); failover$/.test(e)), `a's refusal failed over: ${events.join(' | ')}`);
+    assert.ok(events.some((e) => /→ b network error \(.*\); not re-sent/.test(e)), `b's drop ended the request: ${events.join(' | ')}`);
+    assert.ok(!events.some((e) => /→ c /.test(e)), `c was never tried: ${events.join(' | ')}`);
+  } finally { globalThis.fetch = realFetch; proxy.close(); upstream.close(); }
 });
 
-test('once an attempt may have delivered the request, a transient HTTP failure on the next account does not earn a retry either', async () => {
-  // Account a's connection dies after the body went out; account b answers
-  // 503. The 503 used to re-arm the retry rounds and send b, a second time,
-  // what a may already have run. The 503 is returned as the failure of record.
-  let hits = 0;
-  const upstream = createServer((req, res) => { req.resume(); req.on('end', () => { hits++; if (hits === 1) { req.socket.destroy(); return; } res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' }); res.end('{"error":"busy"}'); }); });
-  await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r)); const up = upstream.address(); assert(up && typeof up !== 'string');
-  const provider: Provider = { ...codexStub(up.port), classifyFailure: (status) => status >= 500 ? { kind: 'transient', retryAfterMs: 1_000 } : { kind: 'fatal', retryAfterMs: 0 } };
-  const pool = new AccountPool(provider, [codexAccount('a', 1), codexAccount('b', 2)], { a: codexCredential('a'), b: codexCredential('b') }, { version: 1, accounts: {} });
+test('a 403 from every account refuses the request without benching the fleet; a 403 another account serves is benched', async () => {
+  const refuseAll = { value: true };
+  const upstream = createServer(async (req, res) => {
+    const account = String(req.headers['chatgpt-account-id']);
+    req.resume(); await new Promise<void>((resolve) => req.once('end', resolve));
+    if (account === 'a' || refuseAll.value) { res.writeHead(403, { 'content-type': 'application/json' }); res.end('{"detail":"forbidden"}'); }
+    else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {"type":"response.completed"}\n\n'); }
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve)); const address = upstream.address(); assert(address && typeof address !== 'string');
+  const provider: Provider = { ...codexProvider, upstreamBase: `http://127.0.0.1:${address.port}`, refresh: async (c) => c,
+    buildHeaders(incoming, account) { const result = new Headers(incoming); result.delete('authorization'); result.set('chatgpt-account-id', account.id); return result; } };
+  const stored = (id: string, priority: number): StoredAccount => ({ id, provider: 'codex', label: id, enabled: true, priority, credentialId: id, createdAt: '' });
+  const credential = (id: string): OAuthCredential => ({ accessToken: `secret-${id}`, refreshToken: null, expiresAt: null, accountId: id });
+  const pool = new AccountPool(provider, [stored('a', 1), stored('b', 2)], { a: credential('a'), b: credential('b') }, { version: 1, accounts: {} });
   const events: string[] = [];
-  const proxy = createProxy(pool, 'local-secret', (e) => { if (e) events.push(e); });
-  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r)); const pa = proxy.address(); assert(pa && typeof pa !== 'string');
+  const proxy = createProxy(pool, 'local-secret', (event) => { if (event) events.push(event); }); await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve)); const proxyAddress = proxy.address(); assert(proxyAddress && typeof proxyAddress !== 'string');
+  const call = () => fetch(`http://127.0.0.1:${proxyAddress.port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
+  const cooled = (id: string) => Boolean(pool.accounts.find((x) => x.id === id)?.cooldownUntil);
   try {
-    const started = Date.now();
-    const res = await relayCall(pa.port);
-    assert.equal(res.status, 503, `the 503 is the failure of record: ${events.join(' | ')}`); await res.text();
-    assert.ok(Date.now() - started < 1_500, 'answered without a retry round');
-    assert.equal(hits, 2, 'each account was tried exactly once');
-    assert.ok(!events.some((e) => /transient retry/.test(e)), `no retry round ran: ${events.join(' | ')}`);
+    const refused = await call();
+    assert.equal(refused.status, 403); assert.match(await refused.text(), /forbidden/);
+    assert.equal(cooled('a'), false); assert.equal(cooled('b'), false);
+    assert(events.some((e) => /body: \{"detail":"forbidden"\}/.test(e)));
+    refuseAll.value = false;
+    const served = await call();
+    assert.equal(served.status, 200); await served.text();
+    assert.equal(cooled('a'), true); assert.equal(cooled('b'), false);
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('a 401 whose token refresh cannot reach the server benches the account as retrying, not as needing a re-login', async () => {
+  const upstream = createServer(async (req, res) => {
+    req.resume(); await new Promise<void>((resolve) => req.once('end', resolve));
+    if (req.headers['chatgpt-account-id'] === 'a') { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{}'); }
+    else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); }
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve)); const address = upstream.address(); assert(address && typeof address !== 'string');
+  const provider: Provider = {
+    id: 'codex', label: 'Codex', upstreamBase: `http://127.0.0.1:${address.port}`,
+    normalizePath: () => '/codex/responses', rewriteBody: (body) => body, readQuota: () => null,
+    refresh: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ETIMEDOUT' } }); },
+    buildHeaders(incoming, account) { const result = new Headers(incoming); result.set('chatgpt-account-id', account.id); return result; },
+    classifyFailure(status) { return { kind: status === 401 ? 'auth' : 'fatal', retryAfterMs: 0 }; },
+  };
+  const stored = (id: string, priority: number): StoredAccount => ({ id, provider: 'codex', label: id, enabled: true, priority, credentialId: id, createdAt: '' });
+  const credential = (id: string): OAuthCredential => ({ accessToken: `t-${id}`, refreshToken: 'r', expiresAt: Date.now() + 3_600_000, accountId: id });
+  const pool = new AccountPool(provider, [stored('a', 1), stored('b', 2)], { a: credential('a'), b: credential('b') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (event) => { if (event) events.push(event); }); await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve)); const proxyAddress = proxy.address(); assert(proxyAddress && typeof proxyAddress !== 'string');
+  try {
+    const response = await fetch(`http://127.0.0.1:${proxyAddress.port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(response.status, 200);
+    const a = pool.accounts.find((x) => x.id === 'a')!;
+    assert.equal(a.errorKind, 'unreachable');
+    assert.ok(events.some((e) => /a auth refresh unreachable; retrying/.test(e)));
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('a 403 naming the organization OAuth block benches that account at once and fails over', async () => {
+  const blockedBody = '{"type":"error","error":{"type":"permission_error","details":{"error_code":"oauth_not_allowed_for_organization"}}}';
+  const upstream = createServer(async (req, res) => {
+    const account = String(req.headers['x-test-account']);
+    req.resume(); await new Promise<void>((resolve) => req.once('end', resolve));
+    if (account === 'a') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(blockedBody); }
+    else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); }
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve)); const address = upstream.address(); assert(address && typeof address !== 'string');
+  const provider: Provider = { ...claudeProvider, upstreamBase: `http://127.0.0.1:${address.port}`, refresh: async (c) => c, normalizePath: () => '/v1/messages', rewriteBody: (b) => b,
+    buildHeaders(incoming, account) { const result = new Headers(incoming); result.delete('authorization'); result.set('x-test-account', account.id); return result; } };
+  const stored = (id: string, priority: number): StoredAccount => ({ id, provider: 'claude', label: id, enabled: true, priority, credentialId: id, createdAt: '' });
+  const credential = (id: string): OAuthCredential => ({ accessToken: `secret-${id}`, refreshToken: null, expiresAt: null, accountId: id });
+  const pool = new AccountPool(provider, [stored('a', 1), stored('b', 2)], { a: credential('a'), b: credential('b') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (event) => { if (event) events.push(event); }); await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve)); const proxyAddress = proxy.address(); assert(proxyAddress && typeof proxyAddress !== 'string');
+  try {
+    const served = await fetch(`http://127.0.0.1:${proxyAddress.port}/v1/messages`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(served.status, 200); await served.text();
+    const a = pool.accounts.find((x) => x.id === 'a')!;
+    assert.equal(a.errorKind, 'blocked'); assert.equal(a.cooldownUntil, null);
+    assert(events.some((e) => /a blocked: organization refuses OAuth/.test(e)));
   } finally { proxy.close(); upstream.close(); }
 });
