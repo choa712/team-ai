@@ -28,6 +28,10 @@ if (cmd === 'route' && sub === 'off') { if (process.env.STUB_ROUTE_FAIL) process
 // Code on the machine running the tests cannot change the outcome. RMTC_PS_FILE
 // replaces the listing outright, and RMTC_PS_EXIT makes it fail.
 const PS = `#!/bin/sh
+if [ -n "$RMTC_PS_SEQ" ]; then
+  n=$(( $(cat "$RMTC_PS_SEQ/count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$RMTC_PS_SEQ/count"
+  if [ -f "$RMTC_PS_SEQ/$n" ]; then cat "$RMTC_PS_SEQ/$n"; else cat "$RMTC_PS_SEQ/last"; fi; exit 0
+fi
 if [ -n "$RMTC_PS_FILE" ]; then cat "$RMTC_PS_FILE"; exit "\${RMTC_PS_EXIT:-0}"; fi
 out=$(${REAL_PS} "$@") || exit $?
 printf '%s\\n' "$out" | grep -F "$RMTC_ROOT" || true
@@ -289,6 +293,20 @@ test('notices a running server by its status page when its command line is not r
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, new RegExp(`TeamClaude is running \\(it answers on port ${port}\\)`));
   assert.match(r.stdout, /Not changed: sessions that may go through TeamClaude are running \(Claude Code pid 202\)/);
+});
+
+test('looks again right before stopping, and holds off when a session started meanwhile', { skip }, (t) => {
+  const box = sandbox(t, { route: null });
+  const seq = join(box.root, 'ps-seq');
+  mkdirSync(seq);
+  const server = '101 node /usr/local/lib/node_modules/teamclaude-cloud/src/index.js';
+  writeFileSync(join(seq, '1'), server + '\n');
+  writeFileSync(join(seq, 'last'), server + '\n102 claude --resume new\n');
+  const r = run(box, [], { RMTC_PS_SEQ: seq });
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stdout, /Not changed: sessions that may go through TeamClaude are running \(Claude Code pid 102\)/);
+  assert.equal(stubCalls(box), '', 'stop not called');
+  assert.ok(existsSync(box.pkg), 'package kept');
 });
 
 test('changes nothing when the processes cannot be listed, even with --force', { skip }, (t) => {

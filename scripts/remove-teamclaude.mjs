@@ -210,11 +210,11 @@ if (!procs) {
 }
 // Codex sessions count too, whatever config.toml says now: a session keeps the
 // address it started with, and it may have started from another CODEX_HOME.
-const dependents = serverRunning ? [
-  procs.claudes.length && `Claude Code pid ${pids(procs.claudes)}`,
-  procs.codexes.length && `Codex pid ${pids(procs.codexes)}`,
-].filter(Boolean) : [];
-if (dependents.length && !FORCE) {
+const dependentsOf = (p) => [
+  p.claudes.length && `Claude Code pid ${pids(p.claudes)}`,
+  p.codexes.length && `Codex pid ${pids(p.codexes)}`,
+].filter(Boolean);
+function refuseForSessions(dependents) {
   say('');
   say(`Not changed: sessions that may go through TeamClaude are running (${dependents.join('; ')}).`);
   say('Stopping TeamClaude would cut them off.');
@@ -222,6 +222,8 @@ if (dependents.length && !FORCE) {
   say('uses TeamClaude (for example they all run through taic or tax), run it with --force.');
   process.exit(DRY ? 0 : 3);
 }
+const dependents = serverRunning ? dependentsOf(procs) : [];
+if (dependents.length && !FORCE) refuseForSessions(dependents);
 
 const unfinished = [];
 const teamclaude = (...args) => {
@@ -232,6 +234,14 @@ const teamclaude = (...args) => {
 const where = (list) => (list?.length ? `pid ${pids(list)}` : `port ${port}`);
 if (serverRunning) {
   if (entry) {
+    // Look again right before stopping: a session may have started since the first
+    // listing (the status probe alone can take two seconds). A session started in
+    // the moment between this look and the stop cannot be seen from outside.
+    if (!FORCE && !DRY) {
+      const now = teamclaudeProcesses();
+      if (!now) refuseForSessions(['the running processes could not be listed again']);
+      else if (dependentsOf(now).length) refuseForSessions(dependentsOf(now));
+    }
     teamclaude('stop');
     // A stopping server can take a moment to finish in-flight requests. It is gone
     // only when neither its process nor its status page is left.
