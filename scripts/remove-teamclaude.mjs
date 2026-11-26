@@ -71,8 +71,10 @@ const token = (tail) => `(?:"[^"]*${tail}"|(?:[^"\\s]*[\\\\/])?${tail})`;
 const NODE = token('node(?:\\.exe)?');
 const TEAMCLAUDE_SCRIPT = token('(?:teamclaude-cloud[\\\\/]src[\\\\/]index\\.js|@karpeleslab[\\\\/]teamclaude[\\\\/]src[\\\\/]index\\.js|teamclaude)');
 // The teamclaude program itself, as a server or as a `teamclaude run` session.
-const TEAMCLAUDE = new RegExp(`^${NODE}\\s+${TEAMCLAUDE_SCRIPT}(?=\\s|$)`, 'i');
-const RUN = new RegExp(`^${NODE}\\s+${TEAMCLAUDE_SCRIPT}\\s+run(?:\\s|$)`, 'i');
+// Node options may sit between node and the script (node --enable-source-maps …).
+const NODE_OPTIONS = '(?:\\s+-[^\\s"]*)*';
+const TEAMCLAUDE = new RegExp(`^${NODE}${NODE_OPTIONS}\\s+${TEAMCLAUDE_SCRIPT}(?=\\s|$)`, 'i');
+const RUN = new RegExp(`^${NODE}${NODE_OPTIONS}\\s+${TEAMCLAUDE_SCRIPT}\\s+run(?:\\s|$)`, 'i');
 // Claude Code and Codex sessions: their word anywhere. Matching too much only makes
 // the removal wait, so these stay broad. Case-sensitive, so the desktop apps
 // (Claude, Codex) do not count.
@@ -151,7 +153,8 @@ function teamclaudeSkillFiles() {
 
 const procs = teamclaudeProcesses();
 const strayCommand = installed.length ? null : teamclaudeOnPath();
-traces = Boolean(installed.length || strayCommand || configExisted || skillPresent() || procs?.servers.length || procs?.runs.length);
+// The account file does not count: this script keeps it on purpose.
+traces = Boolean(installed.length || strayCommand || skillPresent() || procs?.servers.length || procs?.runs.length);
 // Inside Claude Code (CLAUDECODE=1) the variable comes from settings.json, which
 // is already covered above, not from the user's shell.
 const shellRouted = sameUrl(process.env.ANTHROPIC_BASE_URL) && !process.env.CLAUDECODE;
