@@ -77,6 +77,8 @@ const NETWORK_COOLDOWN_MS = 2_000;
 const CONNECT_FAILURE_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EAI_FAIL', 'EAI_NODATA', 'EAI_NONAME', 'ENETUNREACH', 'EHOSTUNREACH', 'ENETDOWN', 'EHOSTDOWN', 'EADDRNOTAVAIL', 'UND_ERR_CONNECT_TIMEOUT']);
 export function requestNeverSent(error: unknown): boolean {
   const cause = (error as { cause?: unknown } | null)?.cause;
+  // fetch refuses a port on its blocklist before connecting at all.
+  if (cause instanceof Error && cause.message === 'bad port' && !(cause as { code?: unknown }).code) return true;
   const codes = cause instanceof AggregateError ? cause.errors.map((e) => (e as { code?: unknown } | null)?.code) : [(cause as { code?: unknown } | null)?.code];
   return codes.length > 0 && codes.every((code) => typeof code === 'string' && CONNECT_FAILURE_CODES.has(code));
 }
@@ -106,24 +108,17 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
   let retryRounds = 0;
   let retryWaitMs = 0;
   let nextRetryAt = 0;
-  // Set once an attempt may have delivered the request (a connection that
-  // died after the body went out). From then on the request is never
-  // re-sent by a retry round, whatever later attempts report: a connect
-  // refusal on the next account would otherwise re-arm the rounds and send
-  // to it what the first account may already have run.
-  let maybeDelivered = false;
   while (!res.destroyed) {
     const account = pool.acquire(session, excluded, wantsFable);
     if (!account) {
       // Exhausting this request's candidates does not mean exhausting quota.
       // Only retry explicit pre-stream transient HTTP failures; never replay a
       // successful/partially streamed response. Keep retries in the relay.
-      // Once an attempt may have delivered the request (maybeDelivered), no
-      // failure of any kind earns a retry: a 503 from the next account used to
-      // re-arm the rounds and re-send what the first account may have run.
+      // A request that may have run upstream never gets here: it is answered
+      // at once (see the network-error branch below).
       if (lastFailure) {
         const delay = Math.max(1000 * 2 ** retryRounds, nextRetryAt - Date.now()) + Math.floor(Math.random() * 200);
-        if (lastFailure.transient && transientAccounts.size && !maybeDelivered && retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
+        if (lastFailure.transient && transientAccounts.size && retryRounds < 2 && delay <= 10_000 && retryWaitMs + delay <= 20_000) {
           retryRounds++; retryWaitMs += delay;
           onChange(`${pool.provider.label} transient retry ${retryRounds}/2 after ${delay}ms`);
           await waitForRetry(delay, res);
@@ -197,22 +192,19 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       const detail = `${phase}: ${describeFetchError(error)}`;
       const failure = { response: new Response(null, { status: 502, headers: { 'content-type': 'application/json' } }), body: JSON.stringify({ error: `Upstream connection failed: ${detail}` }) };
       pool.release(account); pool.cooldown(account, NETWORK_COOLDOWN_MS, 'network'); excluded.add(account.id);
-      if ((phase === 'token refresh' || requestNeverSent(error)) && !maybeDelivered) {
+      if (phase === 'token refresh' || requestNeverSent(error)) {
         lastFailure = { ...failure, transient: true }; transientAccounts.add(account.id);
         nextRetryAt = Math.max(nextRetryAt, Date.now() + NETWORK_COOLDOWN_MS + 50);
         onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error (${detail}); failover`);
         continue;
       }
-      // The connection was made and died later (or an earlier attempt's did):
-      // whether upstream ran the request is unknown, so no retry round may
-      // re-send it — a retry already earned by an earlier connect failure is
-      // forfeited, and a later connect failure does not earn one back.
-      // Failover to the next account is unchanged; once every account has
-      // been tried the 502 is final and the client decides.
-      maybeDelivered = true;
-      lastFailure = { ...failure, transient: false }; transientAccounts.clear();
-      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error (${detail}); failover, not retried: the request may have reached upstream`);
-      continue;
+      // The connection was made and died later: whether upstream ran the
+      // request is unknown. Sending it again, by a retry round or to the next
+      // account, could run it twice, so it is not sent anywhere else. The 502
+      // names the cause and the client decides (Claude Code retries a 502 on
+      // its own).
+      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error (${detail}); not re-sent: the request may have reached upstream`);
+      return json(res, 502, { error: `Upstream connection failed: ${detail}` }, { 'x-teamai-502-reason': 'may_have_run' });
     }
     pool.updateQuota(account, response.headers);
     if (!response.ok) {
