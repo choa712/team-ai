@@ -71,9 +71,11 @@ const token = (tail) => `(?:"[^"]*${tail}"|(?:[^"\\s]*[\\\\/])?${tail})`;
 const NODE = token('node(?:\\.exe)?');
 const TEAMCLAUDE_SCRIPT = token('(?:teamclaude-cloud[\\\\/]src[\\\\/]index\\.js|@karpeleslab[\\\\/]teamclaude[\\\\/]src[\\\\/]index\\.js|teamclaude)');
 // The teamclaude program itself, as a server or as a `teamclaude run` session.
-// Node options, with or without values, may sit between node and the script
-// (node --require x.cjs …). The status probe below backs this match up.
-const NODE_OPTIONS = '(?:\\s+(?:"[^"]*"|[^\\s"]+))*?';
+// Flag-style Node options may sit between node and the script (node
+// --enable-source-maps …). Options that take a separate value are not parsed, so
+// that a session's own arguments can never complete the match; the status probe
+// below finds a server started that way.
+const NODE_OPTIONS = '(?:\\s+-[^\\s"]*)*';
 const TEAMCLAUDE = new RegExp(`^${NODE}${NODE_OPTIONS}\\s+${TEAMCLAUDE_SCRIPT}(?=\\s|$)`, 'i');
 const RUN = new RegExp(`^${NODE}${NODE_OPTIONS}\\s+${TEAMCLAUDE_SCRIPT}\\s+run(?:\\s|$)`, 'i');
 // Claude Code and Codex sessions: their word anywhere. Matching too much only makes
@@ -95,8 +97,10 @@ function teamclaudeProcesses() {
   return {
     servers: teamclaude.filter((p) => !RUN.test(p.cmd)),
     runs: teamclaude.filter((p) => RUN.test(p.cmd)),
-    claudes: others.filter((p) => CLAUDE.test(p.cmd) && !TEAMCLAUDE.test(p.cmd) && !HELPER.test(p.cmd)),
-    codexes: others.filter((p) => CODEX.test(p.cmd) && !TEAMCLAUDE.test(p.cmd) && !CLAUDE.test(p.cmd)),
+    // A session stays protected whatever the server match says about it: real
+    // TeamClaude processes never match CLAUDE or CODEX in the first place.
+    claudes: others.filter((p) => CLAUDE.test(p.cmd) && !HELPER.test(p.cmd)),
+    codexes: others.filter((p) => CODEX.test(p.cmd) && !CLAUDE.test(p.cmd)),
   };
 }
 

@@ -235,11 +235,10 @@ test('counts Claude Code sessions, but not the Chrome bridge, an MCP server or t
     '105 /Applications/Claude.app/Contents/MacOS/Claude',
     '108 "C:\\Program Files\\nodejs\\node.exe" "C:\\npm\\node_modules\\@karpeleslab\\teamclaude\\src\\index.js"',
     '114 node --enable-source-maps /opt/lib/node_modules/teamclaude-cloud/src/index.js server',
-    '115 node --require /opt/hooks/preload.cjs /opt/lib/node_modules/teamclaude-cloud/src/index.js server',
   ];
   const quiet = run(box, ['--dry-run'], fakeProcesses(box, helpers));
   assert.equal(quiet.status, 0, quiet.stdout + quiet.stderr);
-  assert.match(quiet.stdout, /TeamClaude is running \(pid 101, 108, 114, 115\)/);
+  assert.match(quiet.stdout, /TeamClaude is running \(pid 101, 108, 114\)/);
   assert.match(quiet.stdout, /1 'teamclaude run' session\(s\) are open \(pid 102\)/);
   assert.match(quiet.stdout, /would run: teamclaude stop/);
 
@@ -253,10 +252,14 @@ test('counts Claude Code sessions, but not the Chrome bridge, an MCP server or t
     // Mentioning TeamClaude's script does not make a session a TeamClaude server.
     '112 claude -p "inspect /tmp/teamclaude-cloud/src/index.js"',
     '113 claude -p "try node /tmp/teamclaude-cloud/src/index.js run"',
+    '116 node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js -p teamclaude',
+    '117 node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js -p "see /x/teamclaude-cloud/src/index.js"',
+    // Matches the server pattern and is a Claude session as well: it stays protected.
+    '118 node /opt/lib/node_modules/teamclaude-cloud/src/index.js claude',
   ];
   const busy = run(box, ['--dry-run'], fakeProcesses(box, [...helpers, ...sessions]));
-  assert.match(busy.stdout, /TeamClaude is running \(pid 101, 108, 114, 115\)/);
-  assert.match(busy.stdout, /Not changed: sessions that may go through TeamClaude are running \(Claude Code pid 106, 107, 109, 110, 111, 112, 113\)/);
+  assert.match(busy.stdout, /TeamClaude is running \(pid 101, 108, 114, 118\)/);
+  assert.match(busy.stdout, /Not changed: sessions that may go through TeamClaude are running \(Claude Code pid 106, 107, 109, 110, 111, 112, 113, 116, 117, 118\)/);
   assert.doesNotMatch(busy.stdout, /would run/);
 });
 
