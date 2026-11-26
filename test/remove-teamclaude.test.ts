@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'remove-teamclaude.mjs');
-const skip = process.platform === 'win32' ? 'uses the POSIX npm global layout' : false;
+const skip = process.platform === 'win32' ? 'uses the POSIX npm global layout and ps' : false;
 const URL = 'http://localhost:3499';
+const REAL_PS = ['/bin/ps', '/usr/bin/ps'].find((p) => existsSync(p)) ?? '/bin/ps';
 
 // A stand-in for teamclaude-cloud: `server` idles, `stop` ends it and clears the
 // route the way the real one does, `route off` clears the route. Calls are logged.
@@ -23,9 +24,18 @@ if (cmd === 'stop') { process.kill(Number(readFileSync(process.env.STUB_PID, 'ut
 if (cmd === 'route' && sub === 'off') clearRoute();
 `;
 
+// The script sees only this sandbox's processes, so a real TeamClaude or Claude
+// Code on the machine running the tests cannot change the outcome. RMTC_PS_FILE
+// replaces the listing outright, and RMTC_PS_EXIT makes it fail.
+const PS = `#!/bin/sh
+if [ -n "$RMTC_PS_FILE" ]; then cat "$RMTC_PS_FILE"; exit "\${RMTC_PS_EXIT:-0}"; fi
+out=$(${REAL_PS} "$@") || exit $?
+printf '%s\\n' "$out" | grep -F "$RMTC_ROOT" || true
+`;
+
 interface Box { root: string; env: NodeJS.ProcessEnv; pkg: string; skill: string; settings: string; log: string; accounts: string }
 
-function sandbox(t: TestContext, { installed = true, route = true, skill = true } = {}): Box {
+function sandbox(t: TestContext, { installed = true, route = URL as string | null, skill = true, config = true, name = 'teamclaude-cloud' } = {}): Box {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'teamai-rmtc-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const home = join(root, 'home');
@@ -33,19 +43,22 @@ function sandbox(t: TestContext, { installed = true, route = true, skill = true 
   mkdirSync(join(home, '.claude'), { recursive: true });
   mkdirSync(join(home, '.config'));
   mkdirSync(bin);
-  // Only node and npm on PATH, so a real teamclaude elsewhere stays out of sight.
+  // Only node, npm and the ps wrapper ahead of the system tools, so a real
+  // teamclaude elsewhere on PATH stays out of sight.
   const npm = join(dirname(process.execPath), 'npm');
   assert.ok(existsSync(npm), `npm next to node: ${npm}`);
   symlinkSync(process.execPath, join(bin, 'node'));
   symlinkSync(realpathSync(npm), join(bin, 'npm'));
+  writeFileSync(join(bin, 'ps'), PS);
+  chmodSync(join(bin, 'ps'), 0o755);
   const settings = join(home, '.claude', 'settings.json');
-  writeFileSync(settings, JSON.stringify({ env: route ? { FOO: '1', ANTHROPIC_BASE_URL: URL } : { FOO: '1' } }, null, 2) + '\n');
+  writeFileSync(settings, JSON.stringify({ env: route ? { FOO: '1', ANTHROPIC_BASE_URL: route } : { FOO: '1' } }, null, 2) + '\n');
   const accounts = join(home, '.config', 'teamclaude.json');
-  writeFileSync(accounts, JSON.stringify({ proxy: { port: 3499 }, accounts: [] }) + '\n');
-  const pkg = join(root, 'npm', 'lib', 'node_modules', 'teamclaude-cloud');
+  if (config) writeFileSync(accounts, JSON.stringify({ proxy: { port: 3499 }, accounts: [] }) + '\n');
+  const pkg = join(root, 'npm', 'lib', 'node_modules', ...name.split('/'));
   if (installed) {
     mkdirSync(join(pkg, 'src'), { recursive: true });
-    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'teamclaude-cloud', version: '9.9.9', type: 'module' }));
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name, version: '9.9.9', type: 'module' }));
     writeFileSync(join(pkg, 'src', 'index.js'), STUB);
   }
   const skillDir = join(home, '.claude', 'skills', 'teamclaude');
@@ -55,15 +68,22 @@ function sandbox(t: TestContext, { installed = true, route = true, skill = true 
     writeFileSync(join(skillDir, 'route.mjs'), '');
   }
   const env = {
-    PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, HOME: home, XDG_CONFIG_HOME: join(home, '.config'),
+    PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), RMTC_ROOT: root,
     npm_config_prefix: join(root, 'npm'), STUB_LOG: join(root, 'stub.log'), STUB_PID: join(root, 'server.pid'),
   };
   return { root, env, pkg, skill: skillDir, settings, log: env.STUB_LOG, accounts };
 }
 
-const run = (box: Box, ...args: string[]) => spawnSync(process.execPath, [SCRIPT, ...args], { env: box.env, encoding: 'utf8', timeout: 120000 });
+const run = (box: Box, args: string[] = [], extra: NodeJS.ProcessEnv = {}) =>
+  spawnSync(process.execPath, [SCRIPT, ...args], { env: { ...box.env, ...extra }, encoding: 'utf8', timeout: 120000 });
 const stubCalls = (box: Box) => (existsSync(box.log) ? readFileSync(box.log, 'utf8') : '');
 const baseUrl = (box: Box) => JSON.parse(readFileSync(box.settings, 'utf8')).env.ANTHROPIC_BASE_URL;
+
+function fakeProcesses(box: Box, lines: string[]): NodeJS.ProcessEnv {
+  const file = join(box.root, `ps-${lines.length}.txt`);
+  writeFileSync(file, lines.join('\n') + '\n');
+  return { RMTC_PS_FILE: file };
+}
 
 function idle(t: TestContext, box: Box, file: string, args: string[] = []) {
   const child = spawn(process.execPath, [file, ...args], { env: box.env, stdio: 'ignore' });
@@ -72,15 +92,24 @@ function idle(t: TestContext, box: Box, file: string, args: string[] = []) {
 }
 
 test('says so when TeamClaude is not there', { skip }, (t) => {
-  const box = sandbox(t, { installed: false, route: false, skill: false });
+  const box = sandbox(t, { installed: false, route: null, skill: false });
   const r = run(box);
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /nothing to remove/);
 });
 
+test('leaves a localhost address alone when nothing else of TeamClaude is there', { skip }, (t) => {
+  // TeamAI's own default port is 3456 as well.
+  const box = sandbox(t, { installed: false, route: 'http://localhost:3456', skill: false, config: false });
+  const r = run(box);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /nothing to remove/);
+  assert.equal(baseUrl(box), 'http://localhost:3456');
+});
+
 test('--check lists what is left and changes nothing', { skip }, (t) => {
   const box = sandbox(t);
-  const r = run(box, '--check');
+  const r = run(box, ['--check']);
   assert.equal(r.status, 10, r.stdout + r.stderr);
   assert.match(r.stdout, /sends Claude Code to http:\/\/localhost:3499/);
   assert.equal(baseUrl(box), URL);
@@ -99,8 +128,17 @@ test('clears a leftover route, removes the skill and the package, keeps the acco
   assert.ok(existsSync(box.accounts), 'accounts kept');
 });
 
+test('removes the package under its old name, @karpeleslab/teamclaude', { skip }, (t) => {
+  const box = sandbox(t, { name: '@karpeleslab/teamclaude' });
+  const r = run(box);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /@karpeleslab\/teamclaude 9\.9\.9 is installed/);
+  assert.equal(stubCalls(box), 'route off\n');
+  assert.ok(!existsSync(box.pkg), 'package removed');
+});
+
 test('leaves a skill folder that holds files TeamClaude did not write', { skip }, (t) => {
-  const box = sandbox(t, { route: false });
+  const box = sandbox(t, { route: null });
   writeFileSync(join(box.skill, 'notes.md'), 'mine');
   const r = run(box);
   assert.equal(r.status, 3, r.stdout + r.stderr);
@@ -109,7 +147,7 @@ test('leaves a skill folder that holds files TeamClaude did not write', { skip }
 });
 
 test('reports a leftover Codex block without editing it, and keeps the package for `teamclaude codex off`', { skip }, (t) => {
-  const box = sandbox(t, { route: false });
+  const box = sandbox(t, { route: null });
   const codex = join(box.env.HOME!, '.codex', 'config.toml');
   mkdirSync(dirname(codex));
   const text = '# >>> teamclaude: route Codex through the TeamClaude proxy (teamclaude codex on|off) >>>\nmodel_provider = "teamclaude"\n# <<< teamclaude <<<\n';
@@ -119,6 +157,40 @@ test('reports a leftover Codex block without editing it, and keeps the package f
   assert.match(r.stdout, /teamclaude codex off/);
   assert.equal(readFileSync(codex, 'utf8'), text);
   assert.ok(existsSync(box.pkg), 'package kept');
+});
+
+test('counts Claude Code sessions, but not the Chrome bridge, an MCP server or the desktop app', { skip }, (t) => {
+  const box = sandbox(t);
+  const helpers = [
+    '101 node /usr/local/lib/node_modules/teamclaude-cloud/src/index.js',
+    '102 node /usr/local/bin/teamclaude run',
+    '103 /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe --chrome-native-host',
+    '104 claude mcp serve',
+    '105 /Applications/Claude.app/Contents/MacOS/Claude',
+    '108 "C:\\Program Files\\nodejs\\node.exe" "C:\\npm\\node_modules\\@karpeleslab\\teamclaude\\src\\index.js"',
+  ];
+  const quiet = run(box, ['--dry-run'], fakeProcesses(box, helpers));
+  assert.equal(quiet.status, 0, quiet.stdout + quiet.stderr);
+  assert.match(quiet.stdout, /TeamClaude is running \(pid 101, 108\)/);
+  assert.match(quiet.stdout, /1 'teamclaude run' session\(s\) are open \(pid 102\)/);
+  assert.match(quiet.stdout, /would run: teamclaude stop/);
+
+  const busy = run(box, ['--dry-run'], fakeProcesses(box, [...helpers, '106 claude --resume abc', '107 node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js']));
+  assert.match(busy.stdout, /Not changed: 2 Claude Code process\(es\) are running \(pid 106, 107\)/);
+  assert.doesNotMatch(busy.stdout, /would run/);
+});
+
+test('changes nothing when the processes cannot be listed, even with --force', { skip }, (t) => {
+  const box = sandbox(t);
+  const failing = { ...fakeProcesses(box, []), RMTC_PS_EXIT: '1' };
+  const check = run(box, ['--check'], failing);
+  assert.equal(check.status, 10, check.stdout + check.stderr);
+  assert.match(check.stdout, /could not be listed/);
+  const forced = run(box, ['--force'], failing);
+  assert.equal(forced.status, 3, forced.stdout + forced.stderr);
+  assert.equal(stubCalls(box), '');
+  assert.equal(baseUrl(box), URL);
+  assert.ok(existsSync(box.pkg) && existsSync(box.skill));
 });
 
 test('does not stop a running server while Claude Code runs, unless --force', { skip }, async (t) => {
@@ -132,11 +204,11 @@ test('does not stop a running server while Claude Code runs, unless --force', { 
 
   const refused = run(box);
   assert.equal(refused.status, 3, refused.stdout + refused.stderr);
-  assert.match(refused.stdout, /Claude Code process/);
+  assert.match(refused.stdout, /Not changed: 1 Claude Code process/);
   assert.equal(stubCalls(box), '');
   assert.equal(server.exitCode, null, 'server still running');
 
-  const forced = run(box, '--force');
+  const forced = run(box, ['--force']);
   assert.equal(forced.status, 0, forced.stdout + forced.stderr);
   assert.equal(stubCalls(box), 'stop\n');
   assert.equal(baseUrl(box), undefined);

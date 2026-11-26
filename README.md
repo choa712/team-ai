@@ -70,8 +70,8 @@ Both also check for TeamClaude. `install.sh --remove-teamclaude`
 skill, and uninstalls the `teamclaude-cloud` package. That settings line matters:
 it overrides the address `taic` passes, so TeamAI sessions would otherwise reach
 TeamClaude, or a dead port once it stops. TeamClaude's account file
-(`~/.config/teamclaude.json`) is kept. The removal refuses while any Claude Code
-process runs, because stopping TeamClaude cuts off the sessions that go through
+(`~/.config/teamclaude.json`) is kept. It does not stop a running TeamClaude while
+any Claude Code process runs, because that cuts off the sessions that go through
 it; `node scripts/remove-teamclaude.mjs --force` goes ahead when none of them
 does. A Codex block TeamClaude left in `~/.codex/config.toml` is reported, not
 edited: run `teamclaude codex off`, then the removal again.
