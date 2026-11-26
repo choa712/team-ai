@@ -25,7 +25,7 @@ Usage: install.sh [--no-shell] [--with-shell] [--remove-teamclaude] [--dry-run]
   --remove-teamclaude  also stop and uninstall TeamClaude and clear the
                        address it left in ~/.claude/settings.json
                        (scripts/remove-teamclaude.mjs; will not stop a
-                       running TeamClaude while Claude Code runs)
+                       running TeamClaude while sessions using it run)
   --dry-run            print what would happen, change nothing
 
 When npm cannot link into its global prefix, the commands are linked into

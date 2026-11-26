@@ -63,18 +63,26 @@ function listProcesses() {
   return r.stdout.split('\n').map((line) => line.match(/^\s*(\d+)\s+(.*)$/)).filter(Boolean).map((m) => ({ pid: Number(m[1]), cmd: m[2] }));
 }
 
-// The teamclaude program itself: "node …/teamclaude-cloud/src/index.js run" or
-// "node /usr/local/bin/teamclaude" — not any command line that mentions the word.
-const TEAMCLAUDE = /(teamclaude-cloud|@karpeleslab[\\/]teamclaude)[\\/]src[\\/]index\.js|^"?\S*node(\.exe)?"?\s+"?\S*[\\/]teamclaude"?(\s|$)/i;
-const RUN = /(index\.js|teamclaude(\.cmd|\.ps1)?)"?\s+run(\s|$)/i;
-// Claude Code itself: a claude or claude.exe word, or the npm package's cli.js.
-// Case-sensitive, so the Claude desktop app (Claude, Claude.exe) does not count.
+// Command lines are matched from their start: the executable, then the script or
+// first argument. A prompt that only mentions a path or a word (claude -p "look at
+// teamclaude-cloud/src/index.js") must not turn a session into something else.
+// A token is either "quoted with spaces" or unquoted without spaces.
+const token = (tail) => `(?:"[^"]*${tail}"|(?:[^"\\s]*[\\\\/])?${tail})`;
+const NODE = token('node(?:\\.exe)?');
+const TEAMCLAUDE_SCRIPT = token('(?:teamclaude-cloud[\\\\/]src[\\\\/]index\\.js|@karpeleslab[\\\\/]teamclaude[\\\\/]src[\\\\/]index\\.js|teamclaude)');
+// The teamclaude program itself, as a server or as a `teamclaude run` session.
+const TEAMCLAUDE = new RegExp(`^${NODE}\\s+${TEAMCLAUDE_SCRIPT}(?=\\s|$)`, 'i');
+const RUN = new RegExp(`^${NODE}\\s+${TEAMCLAUDE_SCRIPT}\\s+run(?:\\s|$)`, 'i');
+// Claude Code and Codex sessions: their word anywhere. Matching too much only makes
+// the removal wait, so these stay broad. Case-sensitive, so the desktop apps
+// (Claude, Codex) do not count.
 const CLAUDE = /(^|[\s\\/"])claude(\.exe)?("|\s|$)|claude-code[\\/]cli\.js/;
+const CODEX = /(^|[\s\\/"])codex(\.exe|\.js)?("|\s|$)/;
 // Helpers that stay up after every Claude Code window is closed and make no model
-// requests: the Chrome extension bridge and `claude mcp serve`. The helper word
-// must be the first argument after the claude executable, so a prompt that merely
-// mentions it (`claude -p "explain mcp serve"`) still counts as a session.
-const HELPER = /(^|[\s\\/"])claude(\.exe)?"?\s+(--chrome-native-host|mcp\s+serve)(\s|$)/;
+// requests: the Chrome extension bridge and `claude mcp serve`, as the first
+// argument right after the claude executable (or after node and Claude's script).
+const CLAUDE_EXE = `(?:${NODE}\\s+)?${token('(?:claude(?:\\.exe)?|cli\\.js)')}`;
+const HELPER = new RegExp(`^${CLAUDE_EXE}\\s+(?:--chrome-native-host|mcp\\s+serve)(?:\\s|$)`);
 
 function teamclaudeProcesses() {
   const list = listProcesses();
@@ -85,6 +93,7 @@ function teamclaudeProcesses() {
     servers: teamclaude.filter((p) => !RUN.test(p.cmd)),
     runs: teamclaude.filter((p) => RUN.test(p.cmd)),
     claudes: others.filter((p) => CLAUDE.test(p.cmd) && !TEAMCLAUDE.test(p.cmd) && !HELPER.test(p.cmd)),
+    codexes: others.filter((p) => CODEX.test(p.cmd) && !TEAMCLAUDE.test(p.cmd) && !CLAUDE.test(p.cmd)),
   };
 }
 
@@ -124,15 +133,19 @@ const sameUrl = (value) => traces && typeof value === 'string' && value.replace(
 const claudeRouted = () => sameUrl(readJson(settingsPath)?.env?.ANTHROPIC_BASE_URL);
 const codexRouted = () => readText(codexPath).includes('# >>> teamclaude:');
 const skillPresent = () => existsSync(skillDir);
-// The files postinstall copies (and their .prev backups), each a regular file, in
-// a real directory: then they are the folder's whole content. Returns their names,
-// or null when anything else is there.
+// The folder is removed only when it holds nothing but regular files that are
+// byte-identical to the ones an installed TeamClaude package ships. An edited file
+// or a .prev backup (postinstall keeps the user's earlier copy there) stays.
+// Returns the file names, or null when anything else is there.
 function teamclaudeSkillFiles() {
   try {
     if (!lstatSync(skillDir).isDirectory()) return null;
     const files = readdirSync(skillDir);
-    const own = files.every((f) => /^(SKILL\.md|route\.mjs)(\.prev)?$/.test(f) && lstatSync(join(skillDir, f)).isFile());
-    return own && /^name:\s*teamclaude\s*$/m.test(readText(join(skillDir, 'SKILL.md'))) ? files : null;
+    const shipped = (f) => installed.some((p) => {
+      try { return readFileSync(join(p.dir, 'skills', 'teamclaude', f)).equals(readFileSync(join(skillDir, f))); } catch { return false; }
+    });
+    const own = files.length > 0 && files.every((f) => /^(SKILL\.md|route\.mjs)$/.test(f) && lstatSync(join(skillDir, f)).isFile() && shipped(f));
+    return own ? files : null;
   } catch { return null; }
 }
 
@@ -172,12 +185,17 @@ if (!procs) {
   say('Not changed: the running processes could not be listed, so a running TeamClaude cannot be ruled out.');
   process.exit(DRY ? 0 : 3);
 }
-if (procs.servers.length && procs.claudes.length && !FORCE) {
+// Codex sessions depend on the server too while TeamClaude routes Codex.
+const dependents = procs.servers.length ? [
+  procs.claudes.length && `Claude Code pid ${pids(procs.claudes)}`,
+  codexRouted() && procs.codexes.length && `Codex pid ${pids(procs.codexes)}`,
+].filter(Boolean) : [];
+if (dependents.length && !FORCE) {
   say('');
-  say(`Not changed: ${procs.claudes.length} Claude Code process(es) are running (pid ${pids(procs.claudes)}).`);
-  say('Stopping TeamClaude would cut off every Claude session that goes through it.');
-  say('Close all Claude Code windows and run this again. If none of them uses');
-  say('TeamClaude (for example they all run through taic), run it with --force.');
+  say(`Not changed: sessions that may go through TeamClaude are running (${dependents.join('; ')}).`);
+  say('Stopping TeamClaude would cut them off.');
+  say('Close all Claude Code and Codex windows and run this again. If none of them');
+  say('uses TeamClaude (for example they all run through taic or tax), run it with --force.');
   process.exit(DRY ? 0 : 3);
 }
 

@@ -17,7 +17,7 @@ execution policy is. Idempotent: re-run it to upgrade.
   -RemoveTeamClaude
                    also stop and uninstall TeamClaude and clear the address it
                    left in ~/.claude/settings.json (scripts\remove-teamclaude.mjs;
-                   will not stop a running TeamClaude while Claude Code runs)
+                   will not stop a running TeamClaude while sessions using it run)
 
 This file is ASCII on purpose: Windows PowerShell 5.1 reads a script without a
 byte order mark in the system code page.

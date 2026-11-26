@@ -33,6 +33,9 @@ out=$(${REAL_PS} "$@") || exit $?
 printf '%s\\n' "$out" | grep -F "$RMTC_ROOT" || true
 `;
 
+const SKILL_MD = '---\nname: teamclaude\n---\n';
+const ROUTE_MJS = '// route\n';
+
 interface Box { root: string; env: NodeJS.ProcessEnv; pkg: string; skill: string; settings: string; log: string; accounts: string }
 
 function sandbox(t: TestContext, { installed = true, route = URL as string | null, skill = true, config = true, name = 'teamclaude-cloud' } = {}): Box {
@@ -60,12 +63,16 @@ function sandbox(t: TestContext, { installed = true, route = URL as string | nul
     mkdirSync(join(pkg, 'src'), { recursive: true });
     writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name, version: '9.9.9', type: 'module' }));
     writeFileSync(join(pkg, 'src', 'index.js'), STUB);
+    // The skill files the package ships; the copies in ~/.claude must match them.
+    mkdirSync(join(pkg, 'skills', 'teamclaude'), { recursive: true });
+    writeFileSync(join(pkg, 'skills', 'teamclaude', 'SKILL.md'), SKILL_MD);
+    writeFileSync(join(pkg, 'skills', 'teamclaude', 'route.mjs'), ROUTE_MJS);
   }
   const skillDir = join(home, '.claude', 'skills', 'teamclaude');
   if (skill) {
     mkdirSync(skillDir, { recursive: true });
-    writeFileSync(join(skillDir, 'SKILL.md'), '---\nname: teamclaude\n---\n');
-    writeFileSync(join(skillDir, 'route.mjs'), '');
+    writeFileSync(join(skillDir, 'SKILL.md'), SKILL_MD);
+    writeFileSync(join(skillDir, 'route.mjs'), ROUTE_MJS);
   }
   const env = {
     PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), RMTC_ROOT: root,
@@ -156,6 +163,36 @@ test('leaves a skill folder whose backup-named entry is a folder of its own', { 
   assert.equal(readFileSync(join(box.skill, 'route.mjs.prev', 'mine.txt'), 'utf8'), 'mine');
 });
 
+test('keeps a skill folder whose files were edited or backed up', { skip }, (t) => {
+  const cases: Array<[string, string]> = [['SKILL.md', SKILL_MD + 'my note\n'], ['route.mjs.prev', 'my earlier copy\n']];
+  for (const [file, text] of cases) {
+    const box = sandbox(t, { route: null });
+    writeFileSync(join(box.skill, file), text);
+    const r = run(box);
+    assert.equal(r.status, 3, `${file}: ${r.stdout}${r.stderr}`);
+    assert.equal(readFileSync(join(box.skill, file), 'utf8'), text);
+  }
+});
+
+test('does not stop the server while Codex sessions run and TeamClaude routes Codex', { skip }, async (t) => {
+  const box = sandbox(t, { route: null });
+  const codexConfig = join(box.env.HOME!, '.codex', 'config.toml');
+  mkdirSync(dirname(codexConfig));
+  writeFileSync(codexConfig, '# >>> teamclaude: route Codex through the TeamClaude proxy (teamclaude codex on|off) >>>\nmodel_provider = "teamclaude"\n# <<< teamclaude <<<\n');
+  const server = idle(t, box, join(box.pkg, 'src', 'index.js'), ['server']);
+  writeFileSync(box.env.STUB_PID!, String(server.pid));
+  const codex = join(box.root, 'codex');
+  writeFileSync(codex, 'setInterval(() => {}, 1000);\n');
+  idle(t, box, codex);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const r = run(box);
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stdout, /Not changed: sessions that may go through TeamClaude are running \(Codex pid \d+\)/);
+  assert.equal(stubCalls(box), '');
+  assert.equal(server.exitCode, null, 'server still running');
+});
+
 test('keeps the package when the route cannot be cleared, so `teamclaude route off` can be retried', { skip }, (t) => {
   const box = sandbox(t);
   const r = run(box, [], { STUB_ROUTE_FAIL: '1' });
@@ -201,9 +238,14 @@ test('counts Claude Code sessions, but not the Chrome bridge, an MCP server or t
     // Only mentioning a helper word does not make a session a helper.
     '109 claude -p "explain mcp serve"',
     '110 /usr/local/bin/claude --resume x --chrome-native-host',
+    '111 claude -p "explain claude mcp serve now"',
+    // Mentioning TeamClaude's script does not make a session a TeamClaude server.
+    '112 claude -p "inspect /tmp/teamclaude-cloud/src/index.js"',
+    '113 claude -p "try node /tmp/teamclaude-cloud/src/index.js run"',
   ];
   const busy = run(box, ['--dry-run'], fakeProcesses(box, [...helpers, ...sessions]));
-  assert.match(busy.stdout, /Not changed: 4 Claude Code process\(es\) are running \(pid 106, 107, 109, 110\)/);
+  assert.match(busy.stdout, /TeamClaude is running \(pid 101, 108\)/);
+  assert.match(busy.stdout, /Not changed: sessions that may go through TeamClaude are running \(Claude Code pid 106, 107, 109, 110, 111, 112, 113\)/);
   assert.doesNotMatch(busy.stdout, /would run/);
 });
 
@@ -231,7 +273,7 @@ test('does not stop a running server while Claude Code runs, unless --force', { 
 
   const refused = run(box);
   assert.equal(refused.status, 3, refused.stdout + refused.stderr);
-  assert.match(refused.stdout, /Not changed: 1 Claude Code process/);
+  assert.match(refused.stdout, /Not changed: sessions that may go through TeamClaude are running \(Claude Code pid \d+\)/);
   assert.equal(stubCalls(box), '');
   assert.equal(server.exitCode, null, 'server still running');
 
