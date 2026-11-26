@@ -165,7 +165,10 @@ async function unbindLocked(): Promise<string> {
   const state = await bindingState();
   if (!state) throw new Error('Codex App is not bound to TeamAI');
   const contents = await optionalText(state.configPath);
-  if (!contents.includes(BEGIN) && state.phase === 'prepared') { await rm(paths().codexAppBinding, { force: true }); return state.configPath; }
+  // No managed block: the config is already as it was before binding (bind
+  // never got to write it, or an earlier unbind restored it and stopped before
+  // removing the state). Only the state is left to clear.
+  if (!contents.includes(BEGIN)) { await rm(paths().codexAppBinding, { force: true }); return state.configPath; }
   await atomicWriteText(state.configPath, unbindCodexAppConfig(contents, state));
   await rm(paths().codexAppBinding, { force: true });
   return state.configPath;

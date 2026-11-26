@@ -62,8 +62,9 @@ function Get-SessionPolicy {
 function Remove-UserBin {
   if (Test-Path $UserBinDir) {
     foreach ($name in $Commands) {
-      $file = Join-Path $UserBinDir "$name.cmd"
-      if (Test-Path $file) { if ($DryRun) { Note "would remove $file" } else { Remove-Item -Force $file } }
+      foreach ($file in (Join-Path $UserBinDir "$name.cmd"), (Join-Path $UserBinDir "$name.mjs")) {
+        if (Test-Path $file) { if ($DryRun) { Note "would remove $file" } else { Remove-Item -Force $file } }
+      }
     }
     if (-not $DryRun -and -not (Get-ChildItem $UserBinDir -Force | Select-Object -First 1)) { Remove-Item -Force $UserBinDir }
   }
@@ -117,11 +118,18 @@ if ($UserBin) {
   $linkedInto = $UserBinDir
   $targets = @{ 'teamai' = 'dist\src\cli.js' }
   foreach ($name in $Launchers) { $targets[$name] = "dist\src\bin\$name.js" }
-  if ($DryRun) { Note "would write $($Commands.Count) .cmd files to $UserBinDir" } else {
+  # Each command is <name>.cmd running <name>.mjs beside it, and the .mjs imports
+  # the entry file by its file:// URL. Both files are plain ASCII whatever the
+  # repository path is: the URL percent-encodes it, and %~dp0 is expanded by
+  # cmd.exe itself. A path written into the .cmd would pass through the console
+  # code page and break on a profile such as C:\Users\<Korean name>. The launcher
+  # name reaches the CLI as the .mjs file name.
+  if ($DryRun) { Note "would write $($Commands.Count) commands to $UserBinDir" } else {
     New-Item -ItemType Directory -Force -Path $UserBinDir | Out-Null
     foreach ($name in $Commands) {
-      $target = Join-Path $RepoRoot $targets[$name]
-      Set-Content -Path (Join-Path $UserBinDir "$name.cmd") -Encoding Ascii -Value "@node `"$target`" %*"
+      $url = ([Uri](Join-Path $RepoRoot $targets[$name])).AbsoluteUri
+      Set-Content -Path (Join-Path $UserBinDir "$name.mjs") -Encoding Ascii -Value "import '$url';"
+      Set-Content -Path (Join-Path $UserBinDir "$name.cmd") -Encoding Ascii -Value "@node `"%~dp0$name.mjs`" %*"
     }
   }
   $entries = Split-PathList (Get-UserPath)

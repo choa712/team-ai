@@ -107,6 +107,31 @@ test('Codex App bind and unbind wait for the binding lock, so they cannot interl
   }
 });
 
+test('an unbind that stopped after restoring the config is finished by the next one, and bind works again', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-app-resume-')); const teamaiHome = join(root, 'teamai'); const codexHome = join(root, 'codex');
+  const oldTeamai = process.env.TEAMAI_HOME; const oldCodex = process.env.CODEX_HOME;
+  process.env.TEAMAI_HOME = teamaiHome; process.env.CODEX_HOME = codexHome;
+  await mkdir(codexHome, { recursive: true });
+  const original = 'model_provider = "openai"\n';
+  await writeFile(join(codexHome, 'config.toml'), original);
+  await saveConfig(config());
+  try {
+    await bindCodexApp();
+    // The process stopped between restoring config.toml and removing the state.
+    await writeFile(join(codexHome, 'config.toml'), original);
+    assert.equal(JSON.parse(await readFile(paths().codexAppBinding, 'utf8')).phase, 'bound');
+    assert.equal(await unbindCodexApp(), join(codexHome, 'config.toml'));
+    await assert.rejects(access(paths().codexAppBinding), 'the leftover state is cleared');
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original);
+    await bindCodexApp();
+    assert.equal((await codexAppStatus()).bound, true, 'bind is not blocked by the earlier interruption');
+    await unbindCodexApp();
+  } finally {
+    if (oldTeamai === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = oldTeamai;
+    if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
+  }
+});
+
 test('Codex App binding recognises a quoted model_provider key instead of adding a second one', () => {
   for (const key of ['"model_provider"', "'model_provider'"]) {
     const original = `${key} = "openai"\n`;
