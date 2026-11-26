@@ -13,15 +13,18 @@ END='# <<< team-ai <<<'
 RC="${ZDOTDIR:-$HOME}/.zshrc"
 ACTION=install
 DRY_RUN=false
+PATH_DIR=
 
 usage() {
   cat <<'USAGE'
-Usage: install-shell.sh [--uninstall] [--dry-run] [--rc <path>]
+Usage: install-shell.sh [--uninstall] [--dry-run] [--rc <path>] [--path <dir>]
 
   (default)     install or upgrade the team-ai block in ~/.zshrc
   --uninstall   remove the block
   --dry-run     print what would change, write nothing
   --rc <path>   operate on a different rc file
+  --path <dir>  also put <dir> on PATH (where install.sh linked the commands
+                when npm could not link into its global prefix)
 USAGE
 }
 
@@ -30,6 +33,7 @@ while [ $# -gt 0 ]; do
     --uninstall) ACTION=uninstall ;;
     --dry-run)   DRY_RUN=true ;;
     --rc)        shift; RC="${1:?--rc needs a path}" ;;
+    --path)      shift; PATH_DIR="${1:?--path needs a directory}" ;;
     -h|--help)   usage; exit 0 ;;
     *)           echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -52,12 +56,16 @@ else
   PREAMBLE=""
 fi
 
+PATH_LINE=""
+if [ -n "$PATH_DIR" ]; then PATH_LINE="export PATH=\"$PATH_DIR:\$PATH\""; fi
+
 block() {
   cat <<BLOCK
 $BEGIN
 # Managed by team-ai scripts/install-shell.sh — edits here are overwritten.
 # cl = Claude Code via the team-ai pool, co = Codex via the team-ai pool.
 # Either one starts the relay first if it is not already running.
+$PATH_LINE
 $PREAMBLE
 cl() { $LAUNCH claude "\$@"; }
 co() { $LAUNCH codex  "\$@"; }
@@ -77,7 +85,13 @@ $END
 BLOCK
 }
 
-[ -f "$RC" ] || { echo "no such file: $RC" >&2; exit 1; }
+# A new Mac has no ~/.zshrc until something creates one; installing creates
+# it, and there is nothing to remove from a file that is not there.
+if [ ! -f "$RC" ]; then
+  if [ "$ACTION" = uninstall ]; then echo "No $RC; nothing to remove"; exit 0; fi
+  if [ "$DRY_RUN" = true ]; then echo "would create $RC"; else : > "$RC"; fi
+fi
+SRC="$RC"; [ -f "$RC" ] || SRC=/dev/null
 
 # Rewrite with awk rather than sed -i: portable, and it round-trips the file
 # untouched when the block is absent.
@@ -87,7 +101,7 @@ awk -v b="$BEGIN" -v e="$END" '
   $0 == b { skip = 1; next }
   $0 == e { skip = 0; next }
   !skip   { print }
-' "$RC" > "$tmp"
+' "$SRC" > "$tmp"
 
 # Trim TRAILING blank lines only, so repeated install/uninstall cycles cannot
 # pile them up where the block used to sit. Blank lines elsewhere in the file
@@ -106,7 +120,7 @@ fi
 
 if [ "$DRY_RUN" = true ]; then
   echo "--- would write $RC ---"
-  diff -u "$RC" "$tmp" || true
+  diff -u "$SRC" "$tmp" || true
   exit 0
 fi
 
