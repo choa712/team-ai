@@ -29,3 +29,22 @@ test('a lock left by a process that exited is taken over, a live holder is waite
   await assert.rejects(withFileLock(lock, async () => 'ran', 300), /held by another TeamAI process/);
   assert.equal(JSON.parse(await readFile(lock, 'utf8')).pid, process.pid, 'someone else\'s lock is left in place');
 });
+
+test('waiters that find the same abandoned lock still get in one at a time', { timeout: 20_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamai-lock-race-')); const lock = join(dir, 'x.lock');
+  const gone = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await new Promise((r) => gone.once('exit', r));
+  for (let round = 0; round < 20; round++) {
+    await writeFile(lock, JSON.stringify({ pid: gone.pid, at: new Date(Date.now() - 60_000).toISOString() }));
+    let inside = 0; let most = 0; let ran = 0;
+    await Promise.all(Array.from({ length: 5 }, () => withFileLock(lock, async () => {
+      inside++; most = Math.max(most, inside); ran++;
+      await new Promise((r) => setTimeout(r, 5));
+      inside--;
+    }, 5_000)));
+    assert.equal(most, 1, `round ${round}: one holder at a time`);
+    assert.equal(ran, 5);
+  }
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual(await readdir(dir), [], 'no lock or moved-aside file is left behind');
+});

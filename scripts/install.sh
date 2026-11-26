@@ -123,7 +123,9 @@ fi
 if [ "$DRY_RUN" != true ] && command -v lsof >/dev/null; then
   PORTS="$(node -e 'const fs=require("fs"),os=require("os"),p=require("path");const h=process.env.TEAMAI_HOME||p.join(process.env.XDG_CONFIG_HOME||p.join(os.homedir(),".config"),"teamai");let c={};try{c=JSON.parse(fs.readFileSync(p.join(h,"config.json"),"utf8")).proxy||{}}catch{}console.log([c.claudePort||3456,c.codexPort||3457].join(" "))')"
   for port in $PORTS; do
-    owner="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpc 2>/dev/null | awk '/^p/{pid=substr($0,2)} /^c/{print substr($0,2)" (pid "pid")"; exit}')"
+    # lsof exits 1 when nothing listens, the normal case: under pipefail that
+    # would end the install here, so a free port is an empty owner, not a failure.
+    owner="$({ lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fpc 2>/dev/null || true; } | awk '/^p/{pid=substr($0,2)} /^c/{print substr($0,2)" (pid "pid")"; exit}')"
     [ -n "$owner" ] || continue
     pid="${owner##*pid }"; pid="${pid%)}"
     if ps -o command= -p "$pid" 2>/dev/null | grep -qiE 'teamai|team-ai'; then continue; fi

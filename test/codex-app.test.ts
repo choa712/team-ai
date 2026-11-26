@@ -68,25 +68,38 @@ test('Codex App bind and unbind use restrictive files without touching unrelated
   }
 });
 
-test('Codex App bind and unbind run at once never leave a managed block without its restore state', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-app-race-')); const teamaiHome = join(root, 'teamai'); const codexHome = join(root, 'codex');
+test('Codex App bind and unbind wait for the binding lock, so they cannot interleave', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-app-lock-')); const teamaiHome = join(root, 'teamai'); const codexHome = join(root, 'codex');
   const oldTeamai = process.env.TEAMAI_HOME; const oldCodex = process.env.CODEX_HOME;
   process.env.TEAMAI_HOME = teamaiHome; process.env.CODEX_HOME = codexHome;
   await mkdir(codexHome, { recursive: true });
-  await writeFile(join(codexHome, 'config.toml'), 'model_provider = "openai"\n');
+  const original = 'model_provider = "openai"\n';
+  await writeFile(join(codexHome, 'config.toml'), original);
   await saveConfig(config());
+  const lock = `${paths().codexAppBinding}.lock`;
+  const { rm } = await import('node:fs/promises');
   try {
-    for (let round = 0; round < 5; round++) {
-      await bindCodexApp();
-      await Promise.allSettled([unbindCodexApp(), bindCodexApp(), unbindCodexApp()]);
-      const contents = await readFile(join(codexHome, 'config.toml'), 'utf8');
-      const managed = contents.includes('# >>> teamai codex app >>>');
-      const state = await readFile(paths().codexAppBinding, 'utf8').then(() => true, () => false);
-      assert.equal(managed, state, `round ${round}: a managed block has its restore state and none is left without one`);
-      if (state) await unbindCodexApp();
-      assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), 'model_provider = "openai"\n');
-    }
+    await bindCodexApp();
+    const bound = await readFile(join(codexHome, 'config.toml'), 'utf8');
+    // Another bind or unbind holds the lock (a live holder that took it just now).
+    await writeFile(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+    const unbinding = unbindCodexApp();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), bound, 'unbind waits while the lock is held');
+    assert.equal(JSON.parse(await readFile(paths().codexAppBinding, 'utf8')).phase, 'bound');
+    await rm(lock);
+    await unbinding;
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original, 'and finishes once it is released');
+    await writeFile(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+    const binding = bindCodexApp();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original, 'bind waits too');
+    await rm(lock);
+    await binding;
+    assert.equal((await codexAppStatus()).bound, true);
+    await unbindCodexApp();
   } finally {
+    await rm(lock, { force: true });
     if (oldTeamai === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = oldTeamai;
     if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
   }
