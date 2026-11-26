@@ -68,6 +68,30 @@ test('Codex App bind and unbind use restrictive files without touching unrelated
   }
 });
 
+test('Codex App bind and unbind run at once never leave a managed block without its restore state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamai-codex-app-race-')); const teamaiHome = join(root, 'teamai'); const codexHome = join(root, 'codex');
+  const oldTeamai = process.env.TEAMAI_HOME; const oldCodex = process.env.CODEX_HOME;
+  process.env.TEAMAI_HOME = teamaiHome; process.env.CODEX_HOME = codexHome;
+  await mkdir(codexHome, { recursive: true });
+  await writeFile(join(codexHome, 'config.toml'), 'model_provider = "openai"\n');
+  await saveConfig(config());
+  try {
+    for (let round = 0; round < 5; round++) {
+      await bindCodexApp();
+      await Promise.allSettled([unbindCodexApp(), bindCodexApp(), unbindCodexApp()]);
+      const contents = await readFile(join(codexHome, 'config.toml'), 'utf8');
+      const managed = contents.includes('# >>> teamai codex app >>>');
+      const state = await readFile(paths().codexAppBinding, 'utf8').then(() => true, () => false);
+      assert.equal(managed, state, `round ${round}: a managed block has its restore state and none is left without one`);
+      if (state) await unbindCodexApp();
+      assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), 'model_provider = "openai"\n');
+    }
+  } finally {
+    if (oldTeamai === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = oldTeamai;
+    if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
+  }
+});
+
 test('Codex App binding recognises a quoted model_provider key instead of adding a second one', () => {
   for (const key of ['"model_provider"', "'model_provider'"]) {
     const original = `${key} = "openai"\n`;

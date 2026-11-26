@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { processCommandLine, startedBy } from './process-identity.js';
 import { writeFile, readFile, rm, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Server } from 'node:http';
@@ -316,46 +316,10 @@ async function healthPid(config: TeamAIConfig, timeoutMs = 1_000): Promise<numbe
   } catch { return null; }
 }
 
-// Another process's command line, or null when it cannot be read.
-export function processCommandLine(pid: number, platform: NodeJS.Platform = process.platform): string | null {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const result = platform === 'win32'
-      ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: 'utf8', timeout: 10_000, windowsHide: true })
-      : spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 });
-    const line = result.status === 0 ? result.stdout.trim() : '';
-    return line || null;
-  } catch { return null; }
-}
-
 // Every relay server is `node <...>/dist/src/cli.js server`, whoever started it
 // (a launcher, the TUI, the supervisor or a LaunchAgent).
 export function isServerCommandLine(line: string | null): boolean {
   return line !== null && /[\\/]dist[\\/]src[\\/]cli\.js["']?\s+server(?:\s|$)/.test(line);
-}
-
-// When another process started (ms since epoch), or null when it cannot be read.
-// `ps -o lstart` is whole seconds in local time; Win32_Process.CreationDate is exact.
-export function processStartTime(pid: number, platform: NodeJS.Platform = process.platform): number | null {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const result = platform === 'win32'
-      ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o') }`], { encoding: 'utf8', timeout: 10_000, windowsHide: true })
-      : spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000, env: { ...process.env, LC_ALL: 'C' } });
-    const at = result.status === 0 ? Date.parse(result.stdout.trim()) : NaN;
-    return Number.isFinite(at) ? at : null;
-  } catch { return null; }
-}
-
-// Whether a live pid is the process that wrote a record at recordedAt. A pid is
-// only reused after its process has exited, which is after it wrote the record,
-// so the process holding it now started after recordedAt. null: not decidable
-// (no timestamp in the record, or the start time cannot be read).
-export function startedBy(pid: number, recordedAt: unknown): boolean | null {
-  const at = typeof recordedAt === 'string' ? Date.parse(recordedAt) : NaN;
-  if (!Number.isFinite(at)) return null;
-  const started = processStartTime(pid);
-  return started === null ? null : started <= at;
 }
 
 // Whether a pid recorded in server.json is this relay, before anything signals

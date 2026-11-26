@@ -3,6 +3,7 @@ import { parse } from 'smol-toml';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWrite, atomicWriteText, loadConfig, paths } from './storage.js';
+import { withFileLock } from './process-identity.js';
 import type { TeamAIConfig } from './types.js';
 
 const BEGIN = '# >>> teamai codex app >>>';
@@ -123,7 +124,14 @@ async function bindingState(): Promise<CodexAppBindingState | null> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 }
 
-export async function bindCodexApp(): Promise<string> {
+// bind and unbind each read the Codex config and the restore state and write
+// both back. One lock covers the whole of either, so a bind and an unbind run
+// at once cannot leave a managed block with its restore state deleted.
+const bindingLock = (): string => `${paths().codexAppBinding}.lock`;
+export async function bindCodexApp(): Promise<string> { return withFileLock(bindingLock(), bindLocked); }
+export async function unbindCodexApp(): Promise<string> { return withFileLock(bindingLock(), unbindLocked); }
+
+async function bindLocked(): Promise<string> {
   const target = configPath();
   let contents = await optionalText(target);
   const previous = await bindingState();
@@ -153,7 +161,7 @@ export async function bindCodexApp(): Promise<string> {
   return target;
 }
 
-export async function unbindCodexApp(): Promise<string> {
+async function unbindLocked(): Promise<string> {
   const state = await bindingState();
   if (!state) throw new Error('Codex App is not bound to TeamAI');
   const contents = await optionalText(state.configPath);

@@ -85,11 +85,13 @@ test('supervisor sends one SIGTERM so a draining server can finish its final sav
     import { appendFileSync, readFileSync } from 'node:fs';
     import { createServer } from 'node:http';
     const config = JSON.parse(readFileSync(process.env.TEAMAI_HOME + '/config.json', 'utf8'));
+    // Count every SIGTERM and take a while to exit, like a server draining a stream.
+    // Registered before the pid is announced: a SIGTERM sent the moment the test
+    // sees the pid would otherwise meet no handler and kill the process outright.
+    process.on('SIGTERM', () => { appendFileSync(process.env.TEAMAI_TEST_TERM_LOG, 'T\\n'); setTimeout(() => process.exit(0), 400); });
     appendFileSync(process.env.TEAMAI_TEST_PID_LOG, String(process.pid) + '\\n');
     const server = createServer((req, res) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'ok', pid: process.pid })));
     server.listen(config.proxy.controlPort, config.proxy.host);
-    // Count every SIGTERM and take a while to exit, like a server draining a stream.
-    process.on('SIGTERM', () => { appendFileSync(process.env.TEAMAI_TEST_TERM_LOG, 'T\\n'); setTimeout(() => process.exit(0), 400); });
   `);
   const names = ['TEAMAI_HOME', 'TEAMAI_TEST_PID_LOG', 'TEAMAI_TEST_TERM_LOG', 'TEAMAI_SUPERVISOR_INTERVAL_MS', 'TEAMAI_SUPERVISOR_STARTUP_GRACE_MS'];
   const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));

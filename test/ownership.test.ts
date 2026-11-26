@@ -5,7 +5,8 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { isServerCommandLine, ownsServerPid, startedBy } from '../src/runtime.js';
+import { startedBy } from '../src/process-identity.js';
+import { isServerCommandLine, ownsServerPid } from '../src/runtime.js';
 import { defaultConfig, paths } from '../src/storage.js';
 
 test('a relay server command line is recognized however it was started', () => {

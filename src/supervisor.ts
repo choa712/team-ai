@@ -1,8 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { loadConfig, paths } from './storage.js';
-import { ownsServerPid, probeServer, processCommandLine, recordedServerPid, releaseServerFile, startedBy } from './runtime.js';
+import { ownsServerPid, probeServer, recordedServerPid, releaseServerFile } from './runtime.js';
+import { processAlive, processCommandLine, startedBy, withFileLock } from './process-identity.js';
 
 const numberFromEnv = (name: string, fallback: number): number => {
   const parsed = Number(process.env[name]);
@@ -47,7 +48,7 @@ async function terminate(child: ChildProcess, graceMs: number): Promise<void> {
   if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await closed(child); }
 }
 
-const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const alive = processAlive;
 
 // A server started earlier by a launcher holds the ports, so a supervised child
 // would die on EADDRINUSE over and over while the unsupervised one could hang
@@ -100,23 +101,14 @@ export async function recordedSupervisorPid(): Promise<number | null> {
   return (started ?? isSupervisorCommandLine(processCommandLine(record.pid))) ? record.pid : null;
 }
 
-// A short-lived lock around taking over a stale record, so two supervisors that
-// both judged the same record stale cannot each remove it and create their own.
-// A lock left by a process that died inside this step is old after 10 s.
-async function takeReclaimLock(path: string): Promise<boolean> {
-  try { await writeFile(path, String(process.pid), { flag: 'wx', mode: 0o600 }); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-  try { if (Date.now() - (await stat(path)).mtimeMs > 10_000) await rm(path, { force: true }); } catch { /* gone meanwhile */ }
-  return false;
-}
-
 // Take supervisor.json for this supervisor, or throw when another one holds it.
 // The record is created exclusively ('wx'), so two supervisors starting at once
 // cannot both see it absent and both run. A stale record (dead or foreign pid)
-// is replaced only under the reclaim lock and only while it still reads as it
+// is replaced only under a lock (supervisor.json.lock) and only while it still reads as it
 // did when judged. One that does not parse yet is being written and is given a
 // moment before it counts as stale.
 export async function claimSupervisorRecord(pid: number = process.pid): Promise<void> {
-  const path = paths().supervisor; const lock = `${path}.lock`;
+  const path = paths().supervisor;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const body = JSON.stringify({ pid, startedAt: new Date().toISOString() });
   const exclusive = async (): Promise<boolean> => {
@@ -131,11 +123,13 @@ export async function claimSupervisorRecord(pid: number = process.pid): Promise<
     const holder = await recordedSupervisorPid();
     if (holder) throw new Error(`TeamAI supervisor already running (pid ${holder})`);
     if (Date.now() > deadline + 15_000) throw new Error(`Could not take ${path}; another supervisor may be starting`);
-    if (!await takeReclaimLock(lock)) { await wait(50); continue; }
-    try {
+    const reclaimed = await withFileLock(`${path}.lock`, async () => {
       const again = await readRecord();
-      if (again && again.raw === record.raw && !await recordedSupervisorPid()) { await rm(path, { force: true }); if (await exclusive()) return; }
-    } finally { await rm(lock, { force: true }); }
+      if (!again || again.raw !== record.raw || await recordedSupervisorPid()) return false;
+      await rm(path, { force: true });
+      return exclusive();
+    }, 5_000);
+    if (reclaimed) return;
   }
 }
 
