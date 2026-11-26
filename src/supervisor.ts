@@ -75,9 +75,10 @@ export async function takeOverServer(graceMs: number): Promise<number | null> {
   return pid;
 }
 
-// A supervisor runs as `node <...>/dist/src/cli.js supervise` (by hand or from a LaunchAgent).
+// A supervisor runs as `node <...>/dist/src/cli.js supervise` (a LaunchAgent) or
+// `node <bin>/teamai supervise` (by hand through the npm link).
 export function isSupervisorCommandLine(line: string | null): boolean {
-  return line !== null && /[\\/]dist[\\/]src[\\/]cli\.js["']?\s+supervise(?:\s|$)/.test(line);
+  return line !== null && /(?:^|[\s"'\\/])(?:dist[\\/]src[\\/]cli\.js|teamai(?:\.js)?)["']?\s+supervise(?:\s|$)/.test(line);
 }
 
 // supervisor.json as stored: its text, and the pid and timestamp when it parses.

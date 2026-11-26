@@ -228,6 +228,8 @@ test('a supervisor command line is recognized, other commands are not', () => {
   assert.equal(isSupervisorCommandLine('/usr/local/bin/node /Users/me/team-ai/dist/src/cli.js supervise'), true);
   assert.equal(isSupervisorCommandLine('"C:\\nodejs\\node.exe" "C:\\team-ai\\dist\\src\\cli.js" supervise'), true);
   assert.equal(isSupervisorCommandLine('node /Users/me/team-ai/dist/src/cli.js server'), false);
+  assert.equal(isSupervisorCommandLine('/usr/local/bin/node /usr/local/bin/teamai supervise'), true, '`teamai supervise` through the npm link');
+  assert.equal(isSupervisorCommandLine('node /usr/local/bin/teamai server'), false);
   assert.equal(isSupervisorCommandLine('node -e setTimeout(()=>{},1e6)'), false);
   assert.equal(isSupervisorCommandLine(null), false);
 });

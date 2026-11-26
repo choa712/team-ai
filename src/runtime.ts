@@ -316,10 +316,11 @@ async function healthPid(config: TeamAIConfig, timeoutMs = 1_000): Promise<numbe
   } catch { return null; }
 }
 
-// Every relay server is `node <...>/dist/src/cli.js server`, whoever started it
-// (a launcher, the TUI, the supervisor or a LaunchAgent).
+// Every relay server is `node <...>/dist/src/cli.js server` (a launcher, the
+// TUI, the supervisor, a LaunchAgent) or `node <bin>/teamai server` (by hand
+// through the npm link).
 export function isServerCommandLine(line: string | null): boolean {
-  return line !== null && /[\\/]dist[\\/]src[\\/]cli\.js["']?\s+server(?:\s|$)/.test(line);
+  return line !== null && /(?:^|[\s"'\\/])(?:dist[\\/]src[\\/]cli\.js|teamai(?:\.js)?)["']?\s+server(?:\s|$)/.test(line);
 }
 
 // Whether a pid recorded in server.json is this relay, before anything signals

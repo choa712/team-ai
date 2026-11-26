@@ -76,30 +76,32 @@ test('Codex App bind and unbind wait for the binding lock, so they cannot interl
   const original = 'model_provider = "openai"\n';
   await writeFile(join(codexHome, 'config.toml'), original);
   await saveConfig(config());
-  const lock = `${paths().codexAppBinding}.lock`;
+  const lockDir = `${paths().codexAppBinding}.lock.d`; const held = join(lockDir, '1000');
   const { rm } = await import('node:fs/promises');
+  // Another bind or unbind holds the lock: a live holder that took it just now.
+  const hold = async (): Promise<void> => { await mkdir(lockDir, { recursive: true }); await writeFile(held, JSON.stringify({ pid: process.pid, at: new Date().toISOString() })); };
+  const release = (): Promise<void> => writeFile(`${held}.released`, '');
   try {
     await bindCodexApp();
     const bound = await readFile(join(codexHome, 'config.toml'), 'utf8');
-    // Another bind or unbind holds the lock (a live holder that took it just now).
-    await writeFile(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+    await hold();
     const unbinding = unbindCodexApp();
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), bound, 'unbind waits while the lock is held');
     assert.equal(JSON.parse(await readFile(paths().codexAppBinding, 'utf8')).phase, 'bound');
-    await rm(lock);
+    await release();
     await unbinding;
     assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original, 'and finishes once it is released');
-    await writeFile(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+    await rm(lockDir, { recursive: true, force: true }); await hold();
     const binding = bindCodexApp();
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(await readFile(join(codexHome, 'config.toml'), 'utf8'), original, 'bind waits too');
-    await rm(lock);
+    await release();
     await binding;
     assert.equal((await codexAppStatus()).bound, true);
     await unbindCodexApp();
   } finally {
-    await rm(lock, { force: true });
+    await rm(lockDir, { recursive: true, force: true });
     if (oldTeamai === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = oldTeamai;
     if (oldCodex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldCodex;
   }

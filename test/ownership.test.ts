@@ -16,6 +16,9 @@ test('a relay server command line is recognized however it was started', () => {
   assert.equal(isServerCommandLine('node /Users/me/team-ai/dist/src/cli.js status'), false, 'a CLI command is not the server');
   assert.equal(isServerCommandLine('node /Users/me/team-ai/dist/src/cli.js serverless'), false);
   assert.equal(isServerCommandLine('/usr/bin/python3 -m http.server'), false);
+  assert.equal(isServerCommandLine('/opt/homebrew/bin/node /opt/homebrew/bin/teamai server'), true, '`teamai server` through the npm link');
+  assert.equal(isServerCommandLine('node dist/src/cli.js server'), true, 'a relative path');
+  assert.equal(isServerCommandLine('node /x/notteamai server'), false);
   assert.equal(isServerCommandLine(null), false);
 });
 
