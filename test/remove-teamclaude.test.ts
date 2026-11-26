@@ -21,7 +21,7 @@ const settings = process.env.HOME + '/.claude/settings.json';
 const clearRoute = () => { const j = JSON.parse(readFileSync(settings, 'utf8')); delete j.env.ANTHROPIC_BASE_URL; writeFileSync(settings, JSON.stringify(j, null, 2) + '\\n'); };
 if (cmd === 'server') setInterval(() => {}, 1000);
 if (cmd === 'stop') { process.kill(Number(readFileSync(process.env.STUB_PID, 'utf8')), 'SIGTERM'); clearRoute(); }
-if (cmd === 'route' && sub === 'off') clearRoute();
+if (cmd === 'route' && sub === 'off') { if (process.env.STUB_ROUTE_FAIL) process.exit(1); clearRoute(); }
 `;
 
 // The script sees only this sandbox's processes, so a real TeamClaude or Claude
@@ -146,6 +146,26 @@ test('leaves a skill folder that holds files TeamClaude did not write', { skip }
   assert.ok(existsSync(join(box.skill, 'notes.md')));
 });
 
+test('leaves a skill folder whose backup-named entry is a folder of its own', { skip }, (t) => {
+  const box = sandbox(t, { route: null });
+  mkdirSync(join(box.skill, 'route.mjs.prev'));
+  writeFileSync(join(box.skill, 'route.mjs.prev', 'mine.txt'), 'mine');
+  const r = run(box);
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.match(r.stdout, /did not put there/);
+  assert.equal(readFileSync(join(box.skill, 'route.mjs.prev', 'mine.txt'), 'utf8'), 'mine');
+});
+
+test('keeps the package when the route cannot be cleared, so `teamclaude route off` can be retried', { skip }, (t) => {
+  const box = sandbox(t);
+  const r = run(box, [], { STUB_ROUTE_FAIL: '1' });
+  assert.equal(r.status, 3, r.stdout + r.stderr);
+  assert.equal(stubCalls(box), 'route off\n');
+  assert.match(r.stdout, /teamclaude route off/);
+  assert.equal(baseUrl(box), URL);
+  assert.ok(existsSync(box.pkg), 'package kept');
+});
+
 test('reports a leftover Codex block without editing it, and keeps the package for `teamclaude codex off`', { skip }, (t) => {
   const box = sandbox(t, { route: null });
   const codex = join(box.env.HOME!, '.codex', 'config.toml');
@@ -175,8 +195,15 @@ test('counts Claude Code sessions, but not the Chrome bridge, an MCP server or t
   assert.match(quiet.stdout, /1 'teamclaude run' session\(s\) are open \(pid 102\)/);
   assert.match(quiet.stdout, /would run: teamclaude stop/);
 
-  const busy = run(box, ['--dry-run'], fakeProcesses(box, [...helpers, '106 claude --resume abc', '107 node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js']));
-  assert.match(busy.stdout, /Not changed: 2 Claude Code process\(es\) are running \(pid 106, 107\)/);
+  const sessions = [
+    '106 claude --resume abc',
+    '107 node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js',
+    // Only mentioning a helper word does not make a session a helper.
+    '109 claude -p "explain mcp serve"',
+    '110 /usr/local/bin/claude --resume x --chrome-native-host',
+  ];
+  const busy = run(box, ['--dry-run'], fakeProcesses(box, [...helpers, ...sessions]));
+  assert.match(busy.stdout, /Not changed: 4 Claude Code process\(es\) are running \(pid 106, 107, 109, 110\)/);
   assert.doesNotMatch(busy.stdout, /would run/);
 });
 

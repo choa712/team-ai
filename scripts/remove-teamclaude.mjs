@@ -20,7 +20,7 @@
 // left), 10 --check found something, 2 bad option.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
@@ -71,8 +71,10 @@ const RUN = /(index\.js|teamclaude(\.cmd|\.ps1)?)"?\s+run(\s|$)/i;
 // Case-sensitive, so the Claude desktop app (Claude, Claude.exe) does not count.
 const CLAUDE = /(^|[\s\\/"])claude(\.exe)?("|\s|$)|claude-code[\\/]cli\.js/;
 // Helpers that stay up after every Claude Code window is closed and make no model
-// requests: the Chrome extension bridge and `claude mcp serve`.
-const HELPER = /\s--chrome-native-host(\s|$)|\smcp\s+serve(\s|$)/;
+// requests: the Chrome extension bridge and `claude mcp serve`. The helper word
+// must be the first argument after the claude executable, so a prompt that merely
+// mentions it (`claude -p "explain mcp serve"`) still counts as a session.
+const HELPER = /(^|[\s\\/"])claude(\.exe)?"?\s+(--chrome-native-host|mcp\s+serve)(\s|$)/;
 
 function teamclaudeProcesses() {
   const list = listProcesses();
@@ -122,13 +124,16 @@ const sameUrl = (value) => traces && typeof value === 'string' && value.replace(
 const claudeRouted = () => sameUrl(readJson(settingsPath)?.env?.ANTHROPIC_BASE_URL);
 const codexRouted = () => readText(codexPath).includes('# >>> teamclaude:');
 const skillPresent = () => existsSync(skillDir);
-// Only the files postinstall copies (and their .prev backups), never a symlink.
-function skillIsTeamclaudes() {
+// The files postinstall copies (and their .prev backups), each a regular file, in
+// a real directory: then they are the folder's whole content. Returns their names,
+// or null when anything else is there.
+function teamclaudeSkillFiles() {
   try {
-    if (lstatSync(skillDir).isSymbolicLink()) return false;
-    return readdirSync(skillDir).every((f) => /^(SKILL\.md|route\.mjs)(\.prev)?$/.test(f))
-      && /^name:\s*teamclaude\s*$/m.test(readText(join(skillDir, 'SKILL.md')));
-  } catch { return false; }
+    if (!lstatSync(skillDir).isDirectory()) return null;
+    const files = readdirSync(skillDir);
+    const own = files.every((f) => /^(SKILL\.md|route\.mjs)(\.prev)?$/.test(f) && lstatSync(join(skillDir, f)).isFile());
+    return own && /^name:\s*teamclaude\s*$/m.test(readText(join(skillDir, 'SKILL.md'))) ? files : null;
+  } catch { return null; }
 }
 
 const procs = teamclaudeProcesses();
@@ -198,9 +203,17 @@ if (procs.servers.length) {
 }
 
 if (!unfinished.length) {
+  // When the line cannot be cleared, keep the package too, so `teamclaude route off`
+  // is still there to retry.
+  let routeLeft = false;
   if (claudeRouted()) {
     if (entry) teamclaude('route', 'off');
-    if (DRY ? !entry : claudeRouted()) unfinished.push(`remove the ANTHROPIC_BASE_URL line from the "env" block of ${settingsPath}`);
+    routeLeft = DRY ? !entry : claudeRouted();
+    if (routeLeft) {
+      unfinished.push(entry
+        ? `${settingsPath} still sends Claude Code to ${teamclaudeUrl}: run \`teamclaude route off\` (or delete that ANTHROPIC_BASE_URL line), then run this again`
+        : `delete the ANTHROPIC_BASE_URL line from the "env" block of ${settingsPath}`);
+    }
   }
   // TeamAI never edits ~/.codex (AGENTS.md). A graceful `teamclaude stop` takes
   // its block out; if one is left, keep the package so the user can run
@@ -212,14 +225,19 @@ if (!unfinished.length) {
       : `${codexPath} still sends Codex to TeamClaude: delete its "# >>> teamclaude" blocks`);
   }
   if (skillPresent()) {
-    if (!skillIsTeamclaudes()) unfinished.push(`${skillDir} holds files TeamClaude did not put there; left as is`);
+    const files = teamclaudeSkillFiles();
+    if (!files) unfinished.push(`${skillDir} holds something TeamClaude did not put there; left as is`);
     else if (DRY) say(`would remove ${skillDir}`);
     else {
-      try { rmSync(skillDir, { recursive: true, force: true }); say(`removed ${skillDir}`); }
-      catch (err) { unfinished.push(`could not remove ${skillDir}: ${err.message}`); }
+      // File by file, then the now-empty folder: nothing is removed recursively.
+      try {
+        for (const f of files) unlinkSync(join(skillDir, f));
+        rmdirSync(skillDir);
+        say(`removed ${skillDir}`);
+      } catch (err) { unfinished.push(`could not remove ${skillDir}: ${err.message}`); }
     }
   }
-  const keepPackage = Boolean(codexLeft && entry);
+  const keepPackage = Boolean((codexLeft || routeLeft) && entry);
   let uninstallFailed = false;
   if (installed.length && !keepPackage) {
     if (DRY) say(`would run: npm rm -g ${packageNames}`);
