@@ -115,6 +115,13 @@ export function unbindCodexAppConfig(contents: string, state: CodexAppBindingSta
 
 function configPath(): string { return join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'config.toml'); }
 
+// The binding lock keeps TeamAI commands apart, but the Codex app or an editor
+// can save config.toml at any time. A write goes ahead only while the file still
+// reads as it did when this command read it; otherwise nothing is written and
+// the user runs the command again on the new contents.
+const unchangedSince = (path: string, read: string) => async (): Promise<boolean> => await optionalText(path) === read;
+const changedMeanwhile = (path: string, action: string): Error => new Error(`${path} changed while TeamAI was ${action} it; nothing was written. Run the command again.`);
+
 async function optionalText(path: string): Promise<string> {
   try { return await readFile(path, 'utf8'); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error; }
 }
@@ -133,7 +140,8 @@ export async function unbindCodexApp(): Promise<string> { return withFileLock(bi
 
 async function bindLocked(): Promise<string> {
   const target = configPath();
-  let contents = await optionalText(target);
+  const read = await optionalText(target);
+  let contents = read;
   const previous = await bindingState();
   if (previous) {
     if (previous.configPath !== target) throw new Error(`TeamAI is already bound to a different Codex config: ${previous.configPath}`);
@@ -145,7 +153,7 @@ async function bindLocked(): Promise<string> {
   await atomicWrite(paths().codexAppBinding, result.state);
   let written = false;
   try {
-    await atomicWriteText(target, result.contents);
+    if (!await atomicWriteText(target, result.contents, unchangedSince(target, read))) throw changedMeanwhile(target, 'binding');
     written = true;
     await atomicWrite(paths().codexAppBinding, { ...result.state, phase: 'bound' });
   } catch (error) {
@@ -169,7 +177,7 @@ async function unbindLocked(): Promise<string> {
   // never got to write it, or an earlier unbind restored it and stopped before
   // removing the state). Only the state is left to clear.
   if (!contents.includes(BEGIN)) { await rm(paths().codexAppBinding, { force: true }); return state.configPath; }
-  await atomicWriteText(state.configPath, unbindCodexAppConfig(contents, state));
+  if (!await atomicWriteText(state.configPath, unbindCodexAppConfig(contents, state), unchangedSince(state.configPath, contents))) throw changedMeanwhile(state.configPath, 'unbinding');
   await rm(paths().codexAppBinding, { force: true });
   return state.configPath;
 }

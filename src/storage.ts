@@ -51,13 +51,16 @@ export async function atomicWrite(path: string, value: unknown, commit?: () => P
   } finally { await rm(temp, { force: true }); }
 }
 
-// Text files that are not JSON (the Codex config.toml): same temp-and-rename.
-export async function atomicWriteText(path: string, contents: string): Promise<void> {
+// Text files that are not JSON (the Codex config.toml): same temp-and-rename,
+// and the same veto as atomicWrite (asked right before the rename).
+export async function atomicWriteText(path: string, contents: string, commit?: () => Promise<boolean>): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.${++tempSeq}.tmp`;
   try {
     await writeFile(temp, contents, { mode: 0o600 });
+    if (commit && !await commit()) return false;
     await rename(temp, path);
+    return true;
   } finally { await rm(temp, { force: true }); }
 }
 
