@@ -3,7 +3,7 @@ import './threadpool.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, open, readFile, rm, writeFile, lstat, symlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { connect } from 'node:net';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
@@ -19,11 +19,10 @@ import { recordedServerPid, releaseServerFile, runServer, runningPid } from './r
 import { dataDir, loadConfig, loadState, paths, providerPort, saveConfig, upsertAccount } from './storage.js';
 import { recordedSupervisorPid, runSupervisor } from './supervisor.js';
 import { runTui } from './tui.js';
+import { resolveInvocation } from './invocation.js';
 import { PROVIDER_IDS, type ProviderId, type TeamAIConfig } from './types.js';
 
-const invokedAs = basename(process.argv[1] || 'teamai');
-const inputArgs = process.argv.slice(2);
-const invocation = invokedAs === 'tai' ? ['start', ...inputArgs] : invokedAs === 'taic' ? ['run', 'claude', ...inputArgs] : invokedAs === 'tax' ? ['run', 'codex', ...inputArgs] : invokedAs === 'tag' ? ['run', 'grok', ...inputArgs] : inputArgs;
+const invocation = resolveInvocation(process.argv[1], process.argv.slice(2));
 const [command = 'help', ...args] = invocation;
 
 function provider(value?: string): ProviderId { const id = PROVIDER_IDS.find((x) => x === value); if (!id) throw new Error(`Provider must be ${PROVIDER_IDS.join(', ')}`); return id; }
