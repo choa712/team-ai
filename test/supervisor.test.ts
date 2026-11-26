@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { defaultConfig, paths } from '../src/storage.js';
-import { HealthFailureWindow, runSupervisor } from '../src/supervisor.js';
+import { claimSupervisorRecord, HealthFailureWindow, isSupervisorCommandLine, recordedSupervisorPid, runSupervisor } from '../src/supervisor.js';
 
 test('supervisor ignores startup misses and restarts after consecutive health failures', () => {
   const health = new HealthFailureWindow(3, 5_000, 1_000);
@@ -220,4 +220,47 @@ test('supervisor leaves a process that reused a recorded pid alone and only clea
     for (const name of names) { const value = previous[name]; if (value === undefined) delete process.env[name]; else process.env[name] = value; }
     for (const pid of [...seen, stranger.pid]) { try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
   }
+});
+
+test('a supervisor command line is recognized, other commands are not', () => {
+  assert.equal(isSupervisorCommandLine('/usr/local/bin/node /Users/me/team-ai/dist/src/cli.js supervise'), true);
+  assert.equal(isSupervisorCommandLine('"C:\\nodejs\\node.exe" "C:\\team-ai\\dist\\src\\cli.js" supervise'), true);
+  assert.equal(isSupervisorCommandLine('node /Users/me/team-ai/dist/src/cli.js server'), false);
+  assert.equal(isSupervisorCommandLine('node -e setTimeout(()=>{},1e6)'), false);
+  assert.equal(isSupervisorCommandLine(null), false);
+});
+
+async function withHome<T>(prefix: string, body: (home: string) => Promise<T>): Promise<T> {
+  const home = await mkdtemp(join(tmpdir(), prefix)); const previous = process.env.TEAMAI_HOME;
+  process.env.TEAMAI_HOME = home;
+  try { return await body(home); } finally { if (previous === undefined) delete process.env.TEAMAI_HOME; else process.env.TEAMAI_HOME = previous; }
+}
+
+test('a supervisor record naming a pid another program reused is not a running supervisor, and is taken over', { timeout: 10_000 }, async () => {
+  await withHome('teamai-supervisor-record-', async (home) => {
+    const { spawn } = await import('node:child_process');
+    const stranger = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+      await writeFile(join(home, 'supervisor.json'), JSON.stringify({ pid: stranger.pid }));
+      assert.equal(await recordedSupervisorPid(), null, 'launchers do not wait for it');
+      await claimSupervisorRecord();
+      assert.equal(JSON.parse(await readFile(join(home, 'supervisor.json'), 'utf8')).pid, process.pid);
+      assert.equal(stranger.exitCode, null, 'the other program is left alone');
+    } finally { stranger.kill('SIGKILL'); }
+  });
+});
+
+test('two supervisors claiming at once: exactly one gets the record', async () => {
+  await withHome('teamai-supervisor-race-', async (home) => {
+    // Both claimers are live supervisors (this process stands in for each), so
+    // only the exclusive create decides; neither record can look stale.
+    const results = await Promise.allSettled([claimSupervisorRecord(), claimSupervisorRecord()]);
+    const won = results.filter((r) => r.status === 'fulfilled').length;
+    const record = JSON.parse(await readFile(join(home, 'supervisor.json'), 'utf8')) as { pid: number };
+    assert.equal(won, 1, `one claim wins: ${results.map((r) => r.status).join(', ')}`);
+    const loser = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    assert.equal(record.pid, process.pid);
+    assert.match(String(loser.reason), /already running \(pid \d+\)/);
+  });
 });

@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { readFile, rm } from 'node:fs/promises';
-import { atomicWrite, loadConfig, paths } from './storage.js';
-import { ownsServerPid, probeServer, recordedServerPid, releaseServerFile } from './runtime.js';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import { loadConfig, paths } from './storage.js';
+import { ownsServerPid, probeServer, processCommandLine, recordedServerPid, releaseServerFile } from './runtime.js';
 
 const numberFromEnv = (name: string, fallback: number): number => {
   const parsed = Number(process.env[name]);
@@ -73,13 +74,51 @@ export async function takeOverServer(graceMs: number): Promise<number | null> {
   return pid;
 }
 
+// A supervisor runs as `node <...>/dist/src/cli.js supervise` (by hand or from a LaunchAgent).
+export function isSupervisorCommandLine(line: string | null): boolean {
+  return line !== null && /[\\/]dist[\\/]src[\\/]cli\.js["']?\s+supervise(?:\s|$)/.test(line);
+}
+
+// supervisor.json as stored: its text, and the pid when it parses.
+async function readRecord(): Promise<{ raw: string; pid: number | null } | null> {
+  let raw: string;
+  try { raw = await readFile(paths().supervisor, 'utf8'); } catch { return null; }
+  try { const value = JSON.parse(raw) as { pid?: unknown }; return { raw, pid: Number.isInteger(value.pid) ? value.pid as number : null }; } catch { return { raw, pid: null }; }
+}
+
+// The running supervisor, or null. A live pid is not enough: after a crash the
+// OS can hand it to another program, and then `supervise` would refuse to start
+// and every launcher would wait for a supervisor that is not there. The pid has
+// to be this process or have a supervisor's command line.
 export async function recordedSupervisorPid(): Promise<number | null> {
-  try {
-    const value = JSON.parse(await readFile(paths().supervisor, 'utf8')) as { pid?: number };
-    if (!value.pid) return null;
-    process.kill(value.pid, 0);
-    return value.pid;
-  } catch { return null; }
+  const record = await readRecord();
+  if (!record?.pid || !alive(record.pid)) return null;
+  if (record.pid === process.pid) return record.pid;
+  return isSupervisorCommandLine(processCommandLine(record.pid)) ? record.pid : null;
+}
+
+// Take supervisor.json for this supervisor, or throw when another one holds it.
+// The record is created exclusively ('wx'), so two supervisors starting at once
+// cannot both see it absent and both run. A stale record (dead or foreign pid)
+// is removed only while it still reads as it did when judged, so a record
+// another supervisor has just written stays; one that does not parse yet is
+// being written and is given a moment before it counts as stale.
+export async function claimSupervisorRecord(pid: number = process.pid): Promise<void> {
+  const path = paths().supervisor;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const body = JSON.stringify({ pid, startedAt: new Date().toISOString() });
+  const deadline = Date.now() + 2_000;
+  for (;;) {
+    try { await writeFile(path, body, { flag: 'wx', mode: 0o600 }); return; } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    const record = await readRecord();
+    if (!record) continue;
+    if (record.pid === null && Date.now() < deadline) { await wait(50); continue; }
+    const holder = await recordedSupervisorPid();
+    if (holder) throw new Error(`TeamAI supervisor already running (pid ${holder})`);
+    const again = await readRecord();
+    if (again && again.raw === record.raw) await rm(path, { force: true });
+    if (Date.now() > deadline + 5_000) throw new Error(`Could not take ${path}; another supervisor may be starting`);
+  }
 }
 
 async function removeOwnRecord(): Promise<void> {
@@ -98,9 +137,7 @@ export async function runSupervisor(cliPath: string, options: { signal?: AbortSi
   const stopGraceMs = numberFromEnv('TEAMAI_SUPERVISOR_STOP_GRACE_MS', 12_000);
   const initialBackoffMs = numberFromEnv('TEAMAI_SUPERVISOR_BACKOFF_MS', 1_000);
   const maxBackoffMs = numberFromEnv('TEAMAI_SUPERVISOR_MAX_BACKOFF_MS', 30_000);
-  const existing = await recordedSupervisorPid();
-  if (existing && existing !== process.pid) throw new Error(`TeamAI supervisor already running (pid ${existing})`);
-  await atomicWrite(paths().supervisor, { pid: process.pid, startedAt: new Date().toISOString() });
+  await claimSupervisorRecord();
   try {
     const taken = await takeOverServer(stopGraceMs);
     if (taken) console.error(`[TeamAI] supervisor took over from unsupervised server pid=${taken}`);
