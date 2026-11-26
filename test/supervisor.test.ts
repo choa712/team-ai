@@ -264,3 +264,29 @@ test('two supervisors claiming at once: exactly one gets the record', async () =
     assert.match(String(loser.reason), /already running \(pid \d+\)/);
   });
 });
+
+test('a supervisor started through an npm link is recognized by its start time', { timeout: 15_000 }, async () => {
+  await withHome('teamai-supervisor-linked-', async (home) => {
+    const { spawn } = await import('node:child_process');
+    // `node /usr/local/bin/teamai supervise`: no dist/src/cli.js on the command line.
+    const linked = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)', 'supervise'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 1_200));
+      await writeFile(join(home, 'supervisor.json'), JSON.stringify({ pid: linked.pid, startedAt: new Date().toISOString() }));
+      assert.equal(await recordedSupervisorPid(), linked.pid);
+      await assert.rejects(claimSupervisorRecord(), /already running/);
+    } finally { linked.kill('SIGKILL'); }
+  });
+});
+
+test('a stale record judged by two supervisors at once is taken over by exactly one', async () => {
+  await withHome('teamai-supervisor-reclaim-', async (home) => {
+    const { spawn } = await import('node:child_process');
+    const dead = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+    await new Promise((r) => dead.once('exit', r));
+    await writeFile(join(home, 'supervisor.json'), JSON.stringify({ pid: dead.pid, startedAt: new Date(Date.now() - 60_000).toISOString() }));
+    const results = await Promise.allSettled([claimSupervisorRecord(), claimSupervisorRecord(), claimSupervisorRecord()]);
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1, `one claim wins: ${results.map((r) => r.status).join(', ')}`);
+    assert.equal(JSON.parse(await readFile(join(home, 'supervisor.json'), 'utf8')).pid, process.pid);
+  });
+});

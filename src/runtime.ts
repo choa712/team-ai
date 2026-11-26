@@ -334,11 +334,40 @@ export function isServerCommandLine(line: string | null): boolean {
   return line !== null && /[\\/]dist[\\/]src[\\/]cli\.js["']?\s+server(?:\s|$)/.test(line);
 }
 
+// When another process started (ms since epoch), or null when it cannot be read.
+// `ps -o lstart` is whole seconds in local time; Win32_Process.CreationDate is exact.
+export function processStartTime(pid: number, platform: NodeJS.Platform = process.platform): number | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const result = platform === 'win32'
+      ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o') }`], { encoding: 'utf8', timeout: 10_000, windowsHide: true })
+      : spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000, env: { ...process.env, LC_ALL: 'C' } });
+    const at = result.status === 0 ? Date.parse(result.stdout.trim()) : NaN;
+    return Number.isFinite(at) ? at : null;
+  } catch { return null; }
+}
+
+// Whether a live pid is the process that wrote a record at recordedAt. A pid is
+// only reused after its process has exited, which is after it wrote the record,
+// so the process holding it now started after recordedAt. null: not decidable
+// (no timestamp in the record, or the start time cannot be read).
+export function startedBy(pid: number, recordedAt: unknown): boolean | null {
+  const at = typeof recordedAt === 'string' ? Date.parse(recordedAt) : NaN;
+  if (!Number.isFinite(at)) return null;
+  const started = processStartTime(pid);
+  return started === null ? null : started <= at;
+}
+
 // Whether a pid recorded in server.json is this relay, before anything signals
-// it. A server that answers names itself through authenticated /health; a hung
-// one answers nothing, so its command line has to show it. A pid the OS handed
-// to another program after the server died is neither, and must not be killed.
+// it. A server that answers names itself through authenticated /health. A hung
+// one answers nothing: then it is ours if it started before it wrote server.json
+// (however it was launched: `teamai server`, a launcher, a LaunchAgent), and for
+// a record without a timestamp, if its command line is the relay server's. A pid
+// the OS handed to another program after the server died is none of these.
 export async function ownsServerPid(pid: number, config?: TeamAIConfig): Promise<boolean> {
-  try { if (await healthPid(config ?? await loadConfig()) === pid) return true; } catch { /* unreadable config: fall back to the command line */ }
-  return isServerCommandLine(processCommandLine(pid));
+  try { if (await healthPid(config ?? await loadConfig()) === pid) return true; } catch { /* unreadable config: judge by the record */ }
+  let recordedAt: unknown;
+  try { const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: unknown; startedAt?: unknown }; if (value.pid === pid) recordedAt = value.startedAt; } catch { /* no record */ }
+  const started = startedBy(pid, recordedAt);
+  return started ?? isServerCommandLine(processCommandLine(pid));
 }
