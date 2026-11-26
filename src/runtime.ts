@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { writeFile, readFile, rm, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Server } from 'node:http';
@@ -302,4 +303,42 @@ export async function runningPid(): Promise<number | null> {
   const pid = await recordedServerPid();
   if (!pid) return null;
   try { return await probeServer(await loadConfig(), pid) ? pid : null; } catch { return null; }
+}
+
+// The pid an authenticated /health answer names, healthy or degraded (503); null when nothing answers.
+async function healthPid(config: TeamAIConfig, timeoutMs = 1_000): Promise<number | null> {
+  try {
+    const port = config.proxy.controlPort ?? config.proxy.claudePort + 100;
+    const response = await fetch(`http://${config.proxy.host}:${port}/health`, { headers: { authorization: `Bearer ${config.proxy.clientToken}` }, signal: AbortSignal.timeout(timeoutMs) });
+    if (response.status !== 200 && response.status !== 503) return null;
+    const value = await response.json() as { pid?: unknown };
+    return Number.isInteger(value.pid) ? value.pid as number : null;
+  } catch { return null; }
+}
+
+// Another process's command line, or null when it cannot be read.
+export function processCommandLine(pid: number, platform: NodeJS.Platform = process.platform): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const result = platform === 'win32'
+      ? spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: 'utf8', timeout: 10_000, windowsHide: true })
+      : spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 });
+    const line = result.status === 0 ? result.stdout.trim() : '';
+    return line || null;
+  } catch { return null; }
+}
+
+// Every relay server is `node <...>/dist/src/cli.js server`, whoever started it
+// (a launcher, the TUI, the supervisor or a LaunchAgent).
+export function isServerCommandLine(line: string | null): boolean {
+  return line !== null && /[\\/]dist[\\/]src[\\/]cli\.js["']?\s+server(?:\s|$)/.test(line);
+}
+
+// Whether a pid recorded in server.json is this relay, before anything signals
+// it. A server that answers names itself through authenticated /health; a hung
+// one answers nothing, so its command line has to show it. A pid the OS handed
+// to another program after the server died is neither, and must not be killed.
+export async function ownsServerPid(pid: number, config?: TeamAIConfig): Promise<boolean> {
+  try { if (await healthPid(config ?? await loadConfig()) === pid) return true; } catch { /* unreadable config: fall back to the command line */ }
+  return isServerCommandLine(processCommandLine(pid));
 }

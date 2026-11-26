@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readFile, rm } from 'node:fs/promises';
 import { atomicWrite, loadConfig, paths } from './storage.js';
-import { probeServer, recordedServerPid } from './runtime.js';
+import { ownsServerPid, probeServer, recordedServerPid, releaseServerFile } from './runtime.js';
 
 const numberFromEnv = (name: string, fallback: number): number => {
   const parsed = Number(process.env[name]);
@@ -50,19 +50,25 @@ const alive = (pid: number): boolean => { try { process.kill(pid, 0); return tru
 
 // A server started earlier by a launcher holds the ports, so a supervised child
 // would die on EADDRINUSE over and over while the unsupervised one could hang
-// unnoticed. Take it over: ask it to stop (it drains and saves its tokens), wait,
-// and refuse to start if it will not go.
+// unnoticed. Take it over: ask it to stop (it drains and saves its tokens),
+// wait, kill it if it will not go, and refuse to start if even that fails. A
+// hung server is taken over as well: leaving it would keep the ports taken.
 export async function takeOverServer(graceMs: number): Promise<number | null> {
   const pid = await recordedServerPid();
   if (!pid || pid === process.pid || !alive(pid)) return null;
   // Signal only a process that proves it is this relay (authenticated health
-  // naming the same pid); a recycled pid belongs to someone else.
-  let ours = false;
-  try { ours = await probeServer(await loadConfig(), pid); } catch { ours = false; }
-  if (!ours) return null;
+  // naming the same pid, or a server command line when it answers nothing); a
+  // recycled pid belongs to someone else and only loses the stale record.
+  if (!await ownsServerPid(pid)) { await releaseServerFile(paths().server, pid); return null; }
   try { process.kill(pid, 'SIGTERM'); } catch { return null; }
   const deadline = Date.now() + graceMs;
   while (alive(pid) && Date.now() < deadline) await wait(100);
+  if (alive(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* gone just now */ }
+    const killDeadline = Date.now() + 2_000;
+    while (alive(pid) && Date.now() < killDeadline) await wait(50);
+    if (!alive(pid)) await releaseServerFile(paths().server, pid);
+  }
   if (alive(pid)) throw new Error(`An unsupervised TeamAI server (pid ${pid}) did not stop within ${Math.round(graceMs / 1000)} s; stop it and start the supervisor again`);
   return pid;
 }

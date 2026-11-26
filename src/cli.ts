@@ -15,7 +15,7 @@ import { relayedCodexConfig } from './codex-config.js';
 import { launchCommand } from './launch.js';
 import { isRedactLevel } from './redact.js';
 import { buildUsageReport, formatUsageTable, type UsageReport } from './usage.js';
-import { recordedServerPid, releaseServerFile, runServer, runningPid } from './runtime.js';
+import { ownsServerPid, recordedServerPid, releaseServerFile, runServer, runningPid } from './runtime.js';
 import { dataDir, loadConfig, loadState, paths, providerPort, saveConfig, upsertAccount } from './storage.js';
 import { recordedSupervisorPid, runSupervisor } from './supervisor.js';
 import { runTui } from './tui.js';
@@ -117,6 +117,9 @@ async function status(): Promise<void> {
 const STOP_WAIT_MS = 20_000;
 async function stop(quiet = false): Promise<void> {
   const pid = await recordedServerPid(); if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; }
+  // server.json can outlive its server, and the OS can hand that pid to another
+  // program: such a pid gets no signal, only its stale record removed.
+  if (!await ownsServerPid(pid)) { await releaseServerFile(paths().server, pid); if (!quiet) console.log(`TeamAI server is not running (server.json named pid ${pid}, which is not a TeamAI server; record cleared)`); return; }
   // Wait on this pid, not on whatever server.json names: a supervisor may have
   // started a replacement meanwhile, and that one is not ours to kill.
   const alive = (): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };

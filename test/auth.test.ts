@@ -18,6 +18,22 @@ test('imports all OAuth accounts from TeamClaude config without modifying it', a
   assert.equal(await readFile(path, 'utf8'), fixture);
 });
 
+test('codex-multi-auth members of one workspace stay two accounts, keyed by their user', async () => {
+  const jwt = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  const token = (user: string): string => jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'workspace-shared', chatgpt_user_id: user } });
+  const dir = await mkdtemp(join(tmpdir(), 'teamai-codex-multi-auth-members-')); const path = join(dir, 'openai-codex-accounts.json');
+  await writeFile(path, JSON.stringify({ version: 1, accounts: [
+    { email: 'a@corp.com', accessToken: token('user-a'), refreshToken: 'ra', expiresAt: 1, accountId: 'workspace-shared' },
+    { email: 'b@corp.com', accessToken: token('user-b'), refreshToken: 'rb', expiresAt: 1, accountId: 'workspace-shared' },
+    { email: 'a@corp.com', accessToken: token('user-a'), refreshToken: 'ra2', expiresAt: 2, accountId: 'workspace-shared' },
+  ] }));
+  const imported = await importAuth('codex', path);
+  assert.deepEqual(imported.map((row) => [row.label, row.credential.accountId, row.credential.userId]), [
+    ['a@corp.com', 'workspace-shared', 'user-a'],
+    ['b@corp.com', 'workspace-shared', 'user-b'],
+  ], 'a second member is not dropped, and a repeated member is one account');
+});
+
 test('imports every codex-multi-auth account and preserves its selected workspace', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamai-codex-multi-auth-import-')); const path = join(dir, 'openai-codex-accounts.json');
   const fixture = JSON.stringify({

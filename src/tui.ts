@@ -5,8 +5,8 @@ import { captureDashboard } from './capture.js';
 import { copyImageToClipboard, revealInFolder } from './desktop.js';
 import { buildFrame, color, DISPLAY_ITEMS, displayOrder, ESC, remeasured, SPINNER, toggleShown, visibleProviders, type FrameMode, type RemeasureView } from './frame.js';
 import type { RedactLevel } from './redact.js';
-import { recordedServerPid, runningPid } from './runtime.js';
-import { loadConfig, loadState, removeAccount, saveConfig, upsertAccount } from './storage.js';
+import { ownsServerPid, recordedServerPid, releaseServerFile, runningPid } from './runtime.js';
+import { loadConfig, loadState, paths, removeAccount, saveConfig, upsertAccount } from './storage.js';
 import { recordedSupervisorPid } from './supervisor.js';
 import type { PersistedState, ProviderId, StoredAccount, TeamAIConfig } from './types.js';
 import type { UsageAccountReport, UsageReport } from './usage.js';
@@ -166,7 +166,9 @@ export async function runTui(): Promise<void> {
 
 async function restartDaemon(): Promise<void> {
   const supervised = await recordedSupervisorPid();
-  const pid = await recordedServerPid(); if (pid) { try { process.kill(pid, 'SIGTERM'); } catch { /* stale */ } for (let i = 0; i < 30 && await recordedServerPid(); i++) await new Promise((resolve) => setTimeout(resolve, 100)); }
+  const recorded = await recordedServerPid(); const pid = recorded && await ownsServerPid(recorded) ? recorded : null;
+  if (recorded && !pid) await releaseServerFile(paths().server, recorded);
+  if (pid) { try { process.kill(pid, 'SIGTERM'); } catch { /* stale */ } for (let i = 0; i < 30 && await recordedServerPid(); i++) await new Promise((resolve) => setTimeout(resolve, 100)); }
   // Under a supervisor the replacement is its to start, however long its
   // backoff runs: a server started here would take the port from its child.
   if (supervised) { for (let i = 0; i < 400 && !(await runningPid()); i++) await new Promise((resolve) => setTimeout(resolve, 100)); return; }

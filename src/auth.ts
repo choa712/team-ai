@@ -51,15 +51,19 @@ export async function importAuth(provider: ProviderId, from?: string): Promise<A
       const accountId = typeof selected?.id === 'string' ? selected.id : typeof data.accountId === 'string' ? data.accountId : null;
       if (!accountId) return [];
       const label = typeof data.email === 'string' ? data.email : typeof data.accountLabel === 'string' ? data.accountLabel : accountId;
+      // Members of one Business/Team workspace share its id; the user in the
+      // token tells them apart, as for every other Codex import (accountKey).
+      const userId = codexUserId(data.accessToken, typeof data.idToken === 'string' ? data.idToken : undefined);
       return [{ label, credential: {
         accessToken: data.accessToken,
         refreshToken: typeof data.refreshToken === 'string' ? data.refreshToken : null,
         expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : null,
         accountId,
+        ...(userId ? { userId } : {}),
       } }];
     });
     if (!accounts.length) throw new Error('No OAuth accounts found in codex-multi-auth config');
-    return [...new Map(accounts.map((account) => [account.credential.accountId, account])).values()];
+    return [...new Map(accounts.map((account) => [`${account.credential.accountId}:${account.credential.userId ?? ''}`, account])).values()];
   }
   const tokens = (raw.tokens || raw) as Record<string, unknown>;
   if (typeof tokens.access_token !== 'string') throw new Error('Codex access_token is missing');

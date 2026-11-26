@@ -145,3 +145,79 @@ test('supervisor takes over a healthy unsupervised server instead of fighting it
     for (const pid of [...seen, orphan.pid]) { try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
   }
 });
+
+test('supervisor takes over a hung unsupervised server, killing it when it ignores SIGTERM', { timeout: 20_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'teamai-supervisor-hung-')); const log = join(home, 'pids.log'); const script = join(home, 'fake-server.mjs');
+  const config = defaultConfig(); config.proxy.controlPort = await freePort();
+  await writeFile(join(home, 'config.json'), JSON.stringify(config));
+  await writeFile(script, `
+    import { appendFileSync, readFileSync } from 'node:fs';
+    import { createServer } from 'node:http';
+    const config = JSON.parse(readFileSync(process.env.TEAMAI_HOME + '/config.json', 'utf8'));
+    appendFileSync(process.env.TEAMAI_TEST_PID_LOG, String(process.pid) + '\\n');
+    const server = createServer((req, res) => {
+      if (req.headers.authorization !== 'Bearer ' + config.proxy.clientToken) { res.writeHead(401).end(); return; }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'ok', pid: process.pid }));
+    });
+    server.listen(config.proxy.controlPort, config.proxy.host);
+    const stop = () => server.close(() => process.exit(0));
+    process.once('SIGTERM', stop); process.once('SIGINT', stop);
+  `);
+  // A hung relay started earlier: the server command line, no /health answer,
+  // and it ignores SIGTERM. Leaving it would keep the ports taken.
+  const hungCli = join(home, 'dist', 'src', 'cli.js');
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(join(home, 'dist', 'src'), { recursive: true });
+  await writeFile(hungCli, "process.on('SIGTERM', () => {}); setTimeout(() => {}, 60_000);\n");
+  const names = ['TEAMAI_HOME', 'TEAMAI_TEST_PID_LOG', 'TEAMAI_SUPERVISOR_INTERVAL_MS', 'TEAMAI_SUPERVISOR_STARTUP_GRACE_MS', 'TEAMAI_SUPERVISOR_STOP_GRACE_MS'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, { TEAMAI_HOME: home, TEAMAI_TEST_PID_LOG: log, TEAMAI_SUPERVISOR_INTERVAL_MS: '50', TEAMAI_SUPERVISOR_STARTUP_GRACE_MS: '10000', TEAMAI_SUPERVISOR_STOP_GRACE_MS: '500' });
+  const { spawn } = await import('node:child_process');
+  const hung = spawn(process.execPath, [hungCli, 'server'], { stdio: 'ignore', env: process.env });
+  const exited = new Promise<boolean>((r) => hung.once('exit', () => r(true)));
+  await writeFile(join(home, 'server.json'), JSON.stringify({ pid: hung.pid }));
+  const controller = new AbortController(); let seen: number[] = [];
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    const supervising = runSupervisor(script, { signal: controller.signal });
+    seen = await pids(log, 1);
+    assert.notEqual(seen[0], hung.pid, 'the supervisor started its own server');
+    assert.equal(await Promise.race([exited, new Promise((r) => setTimeout(() => r(false), 3_000))]), true, 'the hung server was killed');
+    controller.abort(); await supervising;
+  } finally {
+    controller.abort();
+    for (const name of names) { const value = previous[name]; if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    for (const pid of [...seen, hung.pid]) { try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+  }
+});
+
+test('supervisor leaves a process that reused a recorded pid alone and only clears the record', { timeout: 15_000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'teamai-supervisor-stranger-')); const log = join(home, 'pids.log'); const script = join(home, 'fake-server.mjs');
+  const config = defaultConfig(); config.proxy.controlPort = await freePort();
+  await writeFile(join(home, 'config.json'), JSON.stringify(config));
+  await writeFile(script, `
+    import { appendFileSync } from 'node:fs';
+    appendFileSync(process.env.TEAMAI_TEST_PID_LOG, String(process.pid) + '\\n');
+    setTimeout(() => {}, 60_000);
+    process.once('SIGTERM', () => process.exit(0));
+  `);
+  const names = ['TEAMAI_HOME', 'TEAMAI_TEST_PID_LOG', 'TEAMAI_SUPERVISOR_INTERVAL_MS', 'TEAMAI_SUPERVISOR_STARTUP_GRACE_MS', 'TEAMAI_SUPERVISOR_STOP_GRACE_MS'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  Object.assign(process.env, { TEAMAI_HOME: home, TEAMAI_TEST_PID_LOG: log, TEAMAI_SUPERVISOR_INTERVAL_MS: '50', TEAMAI_SUPERVISOR_STARTUP_GRACE_MS: '10000', TEAMAI_SUPERVISOR_STOP_GRACE_MS: '500' });
+  const { spawn } = await import('node:child_process');
+  const stranger = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' });
+  await writeFile(join(home, 'server.json'), JSON.stringify({ pid: stranger.pid }));
+  const controller = new AbortController(); let seen: number[] = [];
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    const supervising = runSupervisor(script, { signal: controller.signal });
+    seen = await pids(log, 1);
+    assert.equal(stranger.exitCode, null, 'the unrelated process is still running');
+    assert.equal(stranger.signalCode, null);
+    controller.abort(); await supervising;
+  } finally {
+    controller.abort();
+    for (const name of names) { const value = previous[name]; if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    for (const pid of [...seen, stranger.pid]) { try { if (pid) process.kill(pid, 'SIGKILL'); } catch { /* already stopped */ } }
+  }
+});
