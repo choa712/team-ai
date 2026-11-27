@@ -39,6 +39,8 @@ scripts\install.cmd
 
 두 스크립트는 TeamClaude 가 남아 있는지도 봅니다. `install.sh --remove-teamclaude`(Windows 는 `scripts\install.cmd -RemoveTeamClaude`)를 붙이면 TeamClaude 를 끄고, 그것이 `~/.claude/settings.json` 에 써 둔 `ANTHROPIC_BASE_URL` 줄과 `/teamclaude` 스킬을 지우고, `teamclaude-cloud` 패키지를 제거합니다. 이 설정 줄은 `taic` 가 넘기는 주소보다 우선합니다. 그래서 남겨 두면 TeamAI 세션이 TeamClaude 로 가거나, TeamClaude 가 꺼진 뒤에는 닫힌 포트로 갑니다. TeamClaude 계정 파일(`~/.config/teamclaude.json`)은 남깁니다. TeamClaude 가 켜져 있는데 Claude Code 나 Codex 가 하나라도 실행 중이면 아무것도 바꾸지 않습니다. TeamClaude 를 끄면 그것을 거치는 세션이 끊기기 때문입니다. 그 세션들이 TeamClaude 를 거치지 않는다면 `node scripts/remove-teamclaude.mjs --force` 로 진행합니다. TeamClaude 가 `~/.codex/config.toml` 에 남긴 Codex 블록은 고치지 않고 알려만 줍니다. `teamclaude codex off` 를 실행한 뒤 제거를 다시 실행합니다.
 
+두 스크립트는 Claude Code 의 백그라운드 서비스도 멈춥니다(`claude daemon stop --any --keep-workers`, 돌고 있던 백그라운드 세션은 그대로 둡니다). 이 서비스는 세션 목록(`claude agents`, 또는 세션 안에서 왼쪽 화살표) 뒤에서 돌고, 자신을 처음 띄운 셸의 환경 변수를 그대로 갖습니다. 그냥 `claude` 로 띄운 서비스에는 릴레이 주소가 없습니다. 그래서 `taic` 로 만든 세션을 목록에서 열면 `No LLM gateway` 로 멈춥니다. 목록은 TeamAI 로 여세요(`taic agents`, 또는 `taic` 세션 안에서 왼쪽 화살표). 나중에 같은 문구가 나오면 위 명령을 실행하고 다시 엽니다.
+
 수동으로 하려면:
 
 ```bash

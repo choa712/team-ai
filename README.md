@@ -75,6 +75,16 @@ any Claude Code or Codex process runs, because that cuts off the sessions that g
 `node scripts/remove-teamclaude.mjs --force` goes ahead when none of them does. A Codex block TeamClaude left in `~/.codex/config.toml` is reported, not
 edited: run `teamclaude codex off`, then the removal again.
 
+Both also stop Claude Code's background service (`claude daemon stop --any
+--keep-workers`; background sessions keep running). That service sits behind the
+sessions list (`claude agents`, or the left arrow in a session) and keeps the
+variables of the shell that started it. One started by a plain `claude` has no
+relay address, and a session made through `taic` then stops with `No LLM
+gateway` when it is opened from the list. Open the list through TeamAI
+(`taic agents`, or the left arrow inside a `taic` session) so the service starts
+with the relay address; if the message appears later, run the same command and
+reopen.
+
 To do the same by hand:
 
 ```bash
