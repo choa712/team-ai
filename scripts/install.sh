@@ -143,6 +143,23 @@ else
   esac
 fi
 
+# Claude Code keeps one background service behind its sessions list (`claude
+# agents`, or the left arrow in a session), and that service keeps the variables
+# of the shell that started it. One started by a plain `claude` has no relay
+# address, so a session made through taic and opened from the list stops with
+# "No LLM gateway". Stopping it is safe to repeat: background sessions keep
+# running, and the next list opened through taic starts a new service.
+if command -v claude >/dev/null; then
+  step "Stopping the Claude Code background service"
+  if [ "$DRY_RUN" = true ]; then
+    echo "   would run: claude daemon stop --any --keep-workers"
+  elif daemon_out="$(claude daemon stop --any --keep-workers </dev/null 2>&1)"; then
+    echo "   ${daemon_out%%$'\n'*}; open the sessions list through taic (taic agents) from now on"
+  else
+    echo "   skipped: this Claude Code did not accept 'daemon stop'"
+  fi
+fi
+
 # TeamClaude listened on the same Claude port (3456). A relay still running
 # there makes every TeamAI start fail with "port in use", so say so now.
 if [ "$DRY_RUN" != true ] && command -v lsof >/dev/null; then

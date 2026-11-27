@@ -220,6 +220,25 @@ if ($RemoveTeamClaude) {
   }
 }
 
+# Claude Code keeps one background service behind its sessions list ("claude
+# agents", or the left arrow in a session), and that service keeps the variables
+# of the shell that started it. One started by a plain "claude" has no relay
+# address, so a session made through taic and opened from the list stops with
+# "No LLM gateway". Stopping it is safe to repeat: background sessions keep
+# running, and the next list opened through taic starts a new service.
+if (Get-Command claude -ErrorAction SilentlyContinue) {
+  Step 'Stopping the Claude Code background service'
+  if ($DryRun) { Note 'would run: claude daemon stop --any --keep-workers' } else {
+    # Through cmd.exe: it joins the two output streams itself, which Windows
+    # PowerShell 5.1 turns into a terminating error under ErrorActionPreference Stop.
+    $daemonOut = @(& cmd.exe /d /c 'claude daemon stop --any --keep-workers 2>&1 <nul')
+    if ($LASTEXITCODE -eq 0) {
+      $first = $daemonOut | Where-Object { "$_".Trim() } | Select-Object -First 1
+      Note "$first; open the sessions list through taic (taic agents) from now on"
+    } else { Note "skipped: this Claude Code did not accept 'daemon stop'" }
+  }
+}
+
 # TeamClaude listened on the same Claude port (3456). A relay still running
 # there makes every TeamAI start fail with "port in use", so say so now.
 if (-not $DryRun) {
