@@ -226,12 +226,17 @@ if ($RemoveTeamClaude) {
 # address, so a session made through taic and opened from the list stops with
 # "No LLM gateway". Stopping it is safe to repeat: background sessions keep
 # running, and the next list opened through taic starts a new service.
-if (Get-Command claude -ErrorAction SilentlyContinue) {
+if (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue) {
   Step 'Stopping the Claude Code background service'
   if ($DryRun) { Note 'would run: claude daemon stop --any --keep-workers' } else {
     # Through cmd.exe: it joins the two output streams itself, which Windows
     # PowerShell 5.1 turns into a terminating error under ErrorActionPreference Stop.
-    $daemonOut = @(& cmd.exe /d /c 'claude daemon stop --any --keep-workers 2>&1 <nul')
+    # cmd.exe looks in the current folder before PATH; this variable turns that
+    # off, so only the claude found on PATH above can run.
+    $hadNoCwd = $env:NoDefaultCurrentDirectoryInExePath
+    $env:NoDefaultCurrentDirectoryInExePath = '1'
+    try { $daemonOut = @(& cmd.exe /d /c 'claude daemon stop --any --keep-workers 2>&1 <nul') }
+    finally { $env:NoDefaultCurrentDirectoryInExePath = $hadNoCwd }
     if ($LASTEXITCODE -eq 0) {
       $first = $daemonOut | Where-Object { "$_".Trim() } | Select-Object -First 1
       Note "$first; open the sessions list through taic (taic agents) from now on"
